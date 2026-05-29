@@ -1,0 +1,15 @@
+build/
+codec_vis_cli
+codec_vis_gui
+codec_vis_run*
+codec_vis_asan
+vaapi_av1_probe
+view_av2.sh
+test_*_vaapi_uvg*
+test_small*_vaapi_uvg
+test_large*_vaapi_uvg
+a.out
+*.av1
+*.av2
+*.h265
+*.h266

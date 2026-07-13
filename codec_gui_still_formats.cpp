@@ -63,15 +63,40 @@ int sample_bytes(PixelFormat format) {
 }
 
 bool is_gray(PixelFormat format) {
-	return format == PixelFormat::Gray8 || format == PixelFormat::Gray10LE;
+	return format == PixelFormat::Gray8 || format == PixelFormat::Gray10LE ||
+	       format == PixelFormat::Gray12LE || format == PixelFormat::Gray14LE;
 }
 
 bool is_420(PixelFormat format) {
-	return format == PixelFormat::YUV420P8 || format == PixelFormat::YUV420P10LE;
+	return format == PixelFormat::YUV420P8 || format == PixelFormat::YUV420P10LE ||
+	       format == PixelFormat::YUV420P12LE || format == PixelFormat::YUV420P14LE;
 }
 
 bool is_422(PixelFormat format) {
-	return format == PixelFormat::YUV422P8 || format == PixelFormat::YUV422P10LE;
+	return format == PixelFormat::YUV422P8 || format == PixelFormat::YUV422P10LE ||
+	       format == PixelFormat::YUV422P12LE || format == PixelFormat::YUV422P14LE;
+}
+
+int format_bit_depth(PixelFormat format) {
+	switch (format) {
+		case PixelFormat::YUV420P8:
+		case PixelFormat::YUV422P8:
+		case PixelFormat::YUV444P8:
+		case PixelFormat::Gray8: return 8;
+		case PixelFormat::YUV420P10LE:
+		case PixelFormat::YUV422P10LE:
+		case PixelFormat::YUV444P10LE:
+		case PixelFormat::Gray10LE: return 10;
+		case PixelFormat::YUV420P12LE:
+		case PixelFormat::YUV422P12LE:
+		case PixelFormat::YUV444P12LE:
+		case PixelFormat::Gray12LE: return 12;
+		case PixelFormat::YUV420P14LE:
+		case PixelFormat::YUV422P14LE:
+		case PixelFormat::YUV444P14LE:
+		case PixelFormat::Gray14LE: return 14;
+	}
+	throw std::invalid_argument("unsupported raw pixel format");
 }
 
 std::string value_to_cli_string(const ParamValue& value) {
@@ -111,6 +136,168 @@ uint16_t load_sample(const ImagePlane& plane, int x, int y, int bytesPerSample, 
 
 uint8_t clamp_u8(double value) {
 	return static_cast<uint8_t>(std::clamp<int>(static_cast<int>(std::lround(value)), 0, 255));
+}
+
+struct MatrixWeights {
+	double kr;
+	double kb;
+};
+
+MatrixWeights matrix_weights(MatrixCoefficients matrix) {
+	switch (matrix) {
+		case MatrixCoefficients::BT709: return {0.2126, 0.0722};
+		case MatrixCoefficients::BT601: return {0.2990, 0.1140};
+		case MatrixCoefficients::BT2020NonConstant: return {0.2627, 0.0593};
+		default:
+			throw std::invalid_argument("JPEG XL RGB conversion does not support the selected YCbCr matrix; select BT.709, BT.601, or BT.2020 non-constant explicitly");
+	}
+}
+
+void validate_jxl_plane(const RawImage& image, int plane, int width, int height, int bytesPerSample) {
+	const ImagePlane& source = image.planes[plane];
+	if (source.strideBytes < width * bytesPerSample ||
+	    source.bytes.size() < static_cast<std::size_t>(source.strideBytes) * static_cast<std::size_t>(height)) {
+		throw std::invalid_argument("JPEG XL input plane " + std::to_string(plane) + " is missing or shorter than its declared dimensions");
+	}
+}
+
+double sample_plane_bilinear(const ImagePlane& plane, double x, double y, int width, int height, int bytesPerSample) {
+	x = std::clamp(x, 0.0, static_cast<double>(std::max(0, width - 1)));
+	y = std::clamp(y, 0.0, static_cast<double>(std::max(0, height - 1)));
+	const int x0 = static_cast<int>(std::floor(x));
+	const int y0 = static_cast<int>(std::floor(y));
+	const int x1 = std::min(x0 + 1, width - 1);
+	const int y1 = std::min(y0 + 1, height - 1);
+	const double tx = x - x0;
+	const double ty = y - y0;
+	const double a = load_sample(plane, x0, y0, bytesPerSample, 0);
+	const double b = load_sample(plane, x1, y0, bytesPerSample, 0);
+	const double c = load_sample(plane, x0, y1, bytesPerSample, 0);
+	const double d = load_sample(plane, x1, y1, bytesPerSample, 0);
+	return (a + (b - a) * tx) + ((c + (d - c) * tx) - (a + (b - a) * tx)) * ty;
+}
+
+struct JxlInputPixels {
+	std::vector<uint8_t> bytes;
+	int bitDepth = 8;
+	uint32_t channels = 3;
+	JxlDataType dataType = JXL_TYPE_UINT8;
+};
+
+JxlInputPixels raw_to_jxl_pixels(const RawImage& image) {
+	if (image.width <= 0 || image.height <= 0) {
+		throw std::invalid_argument("JPEG XL image dimensions must be positive");
+	}
+	JxlInputPixels result;
+	result.bitDepth = format_bit_depth(image.format);
+	result.channels = is_gray(image.format) ? 1u : 3u;
+	result.dataType = result.bitDepth == 8 ? JXL_TYPE_UINT8 : JXL_TYPE_UINT16;
+	const int bytesPerSample = result.bitDepth == 8 ? 1 : 2;
+	const int chromaWidth = (is_420(image.format) || is_422(image.format)) ? (image.width + 1) / 2 : image.width;
+	const int chromaHeight = is_420(image.format) ? (image.height + 1) / 2 : image.height;
+	validate_jxl_plane(image, 0, image.width, image.height, bytesPerSample);
+	if (!is_gray(image.format)) {
+		validate_jxl_plane(image, 1, chromaWidth, chromaHeight, bytesPerSample);
+		validate_jxl_plane(image, 2, chromaWidth, chromaHeight, bytesPerSample);
+	}
+
+	const double maximum = static_cast<double>((1u << result.bitDepth) - 1u);
+	const double scale = static_cast<double>(1u << (result.bitDepth - 8));
+	const double yOffset = image.color.range == ColorRange::Full ? 0.0 : 16.0 * scale;
+	const double yScale = image.color.range == ColorRange::Full ? maximum : 219.0 * scale;
+	const double cOffset = static_cast<double>(1u << (result.bitDepth - 1));
+	const double cScale = image.color.range == ColorRange::Full ? maximum : 224.0 * scale;
+	const MatrixWeights weights = is_gray(image.format) ? MatrixWeights{0.2126, 0.0722} : matrix_weights(image.color.matrix);
+	const double kg = 1.0 - weights.kr - weights.kb;
+	result.bytes.resize(static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height) * result.channels * bytesPerSample);
+
+	auto store = [&](std::size_t sampleIndex, double normalized) {
+		const uint16_t value = static_cast<uint16_t>(std::clamp<long>(std::lround(normalized * maximum), 0, static_cast<long>(maximum)));
+		if (bytesPerSample == 1) {
+			result.bytes[sampleIndex] = static_cast<uint8_t>(value);
+		} else {
+			const std::size_t offset = sampleIndex * 2;
+			result.bytes[offset] = static_cast<uint8_t>(value & 0xffu);
+			result.bytes[offset + 1] = static_cast<uint8_t>(value >> 8u);
+		}
+	};
+
+	for (int y = 0; y < image.height; ++y) {
+		for (int x = 0; x < image.width; ++x) {
+			const double yy = (static_cast<double>(load_sample(image.planes[0], x, y, bytesPerSample, 0)) - yOffset) / yScale;
+			const std::size_t pixel = static_cast<std::size_t>(y) * image.width + x;
+			if (is_gray(image.format)) {
+				store(pixel, yy);
+				continue;
+			}
+
+			double chromaX = static_cast<double>(x);
+			double chromaY = static_cast<double>(y);
+			if (is_420(image.format) || is_422(image.format)) {
+				const Chroma420SampleLocation location = image.color.chroma420Location.value_or(Chroma420SampleLocation::LeftCenter);
+				const bool horizontallyCentered = location == Chroma420SampleLocation::Center ||
+				                                  location == Chroma420SampleLocation::TopCenter ||
+				                                  location == Chroma420SampleLocation::BottomCenter;
+				chromaX = (static_cast<double>(x) - (horizontallyCentered ? 0.5 : 0.0)) * 0.5;
+				if (is_420(image.format)) {
+					if (location == Chroma420SampleLocation::TopLeft || location == Chroma420SampleLocation::TopCenter) chromaY = static_cast<double>(y) * 0.5;
+					else if (location == Chroma420SampleLocation::BottomLeft || location == Chroma420SampleLocation::BottomCenter) chromaY = (static_cast<double>(y) - 1.0) * 0.5;
+					else chromaY = (static_cast<double>(y) - 0.5) * 0.5;
+				}
+			}
+			const double cb = (sample_plane_bilinear(image.planes[1], chromaX, chromaY, chromaWidth, chromaHeight, bytesPerSample) - cOffset) / cScale;
+			const double cr = (sample_plane_bilinear(image.planes[2], chromaX, chromaY, chromaWidth, chromaHeight, bytesPerSample) - cOffset) / cScale;
+			const double r = yy + (2.0 - 2.0 * weights.kr) * cr;
+			const double b = yy + (2.0 - 2.0 * weights.kb) * cb;
+			const double g = (yy - weights.kr * r - weights.kb * b) / kg;
+			store(pixel * 3 + 0, r);
+			store(pixel * 3 + 1, g);
+			store(pixel * 3 + 2, b);
+		}
+	}
+	return result;
+}
+
+JxlColorEncoding jxl_color_encoding(const RawImage& image) {
+	JxlColorEncoding color{};
+	color.color_space = is_gray(image.format) ? JXL_COLOR_SPACE_GRAY : JXL_COLOR_SPACE_RGB;
+	color.white_point = JXL_WHITE_POINT_D65;
+	color.primaries = JXL_PRIMARIES_SRGB;
+	color.rendering_intent = JXL_RENDERING_INTENT_RELATIVE;
+	if (!is_gray(image.format)) {
+		switch (image.color.primaries) {
+			case ColorPrimaries::BT709: color.primaries = JXL_PRIMARIES_SRGB; break;
+			case ColorPrimaries::BT2020: color.primaries = JXL_PRIMARIES_2100; break;
+			case ColorPrimaries::DisplayP3: color.primaries = JXL_PRIMARIES_P3; break;
+			case ColorPrimaries::DCIP3:
+				color.primaries = JXL_PRIMARIES_P3;
+				color.white_point = JXL_WHITE_POINT_DCI;
+				break;
+			default:
+				throw std::invalid_argument("JPEG XL cannot represent the selected primaries as a structured color profile; select BT.709, Display P3, or BT.2020 explicitly");
+		}
+	}
+	switch (image.color.transfer) {
+		case TransferCharacteristics::BT709:
+		case TransferCharacteristics::BT601:
+		case TransferCharacteristics::BT2020_10:
+		case TransferCharacteristics::BT2020_12: color.transfer_function = JXL_TRANSFER_FUNCTION_709; break;
+		case TransferCharacteristics::SRGB: color.transfer_function = JXL_TRANSFER_FUNCTION_SRGB; break;
+		case TransferCharacteristics::Linear: color.transfer_function = JXL_TRANSFER_FUNCTION_LINEAR; break;
+		case TransferCharacteristics::PQ: color.transfer_function = JXL_TRANSFER_FUNCTION_PQ; break;
+		case TransferCharacteristics::HLG: color.transfer_function = JXL_TRANSFER_FUNCTION_HLG; break;
+		case TransferCharacteristics::Gamma22:
+			color.transfer_function = JXL_TRANSFER_FUNCTION_GAMMA;
+			color.gamma = 1.0 / 2.2;
+			break;
+		case TransferCharacteristics::Gamma28:
+			color.transfer_function = JXL_TRANSFER_FUNCTION_GAMMA;
+			color.gamma = 1.0 / 2.8;
+			break;
+		default:
+			throw std::invalid_argument("JPEG XL requires explicit supported transfer characteristics; select sRGB, BT.709, Linear, PQ, or HLG");
+	}
+	return color;
 }
 
 std::vector<uint8_t> raw_to_rgb8(const RawImage& image) {
@@ -449,10 +636,10 @@ EncodedImage encode_jpeg2000_still_image(const RawImage& image, std::span<const 
 }
 
 std::vector<EncoderParamInfo> query_jpegxl_parameters() {
-	return {
-		{.name = "quality", .label = "Quality", .group = "Coding", .kind = ParamKind::Int, .defaultValue = int64_t{50}, .intRange = IntRange{1, 100, 1}, .help = "JPEG-style quality mapped to JPEG XL distance. 100 maps to distance 0 but does not force lossless unless Lossless is enabled."},
-		{.name = "distance", .label = "Distance", .group = "Coding", .kind = ParamKind::Float, .defaultValue = double{-1.0}, .floatRange = FloatRange{-1.0, 25.0, 0.1}, .help = "Butteraugli distance override. -1 uses Quality."},
-		{.name = "lossless", .label = "Lossless", .group = "Coding", .kind = ParamKind::Bool, .defaultValue = false, .help = "Use true JPEG XL lossless mode."},
+	std::vector<EncoderParamInfo> result = {
+		{.name = "rate-control", .label = "Rate control", .group = "Coding", .kind = ParamKind::Enum, .defaultValue = std::string{"quality"}, .enumValues = {{"quality", "Quality"}, {"distance", "Butteraugli distance"}, {"lossless", "Lossless"}}, .help = "Select exactly one JPEG XL rate-control mode. The inactive controls are disabled and are not sent to libjxl."},
+		{.name = "quality", .label = "Quality", .group = "Coding", .kind = ParamKind::Int, .defaultValue = int64_t{90}, .intRange = IntRange{1, 100, 1}, .help = "JPEG-style quality mapped by libjxl to distance. Quality 90 corresponds to distance 1.0 (visually lossless); quality 100 is distance 0 but is still not mathematically lossless.", .enabledWhen = {{"rate-control", {"quality"}, "Quality is used only in Quality rate-control mode."}}},
+		{.name = "distance", .label = "Butteraugli distance", .group = "Coding", .kind = ParamKind::Float, .defaultValue = double{1.0}, .floatRange = FloatRange{0.0, 25.0, 0.1}, .help = "Direct libjxl distance target. Lower is higher quality; 1.0 is visually lossless and 0 alone is not true lossless.", .enabledWhen = {{"rate-control", {"distance"}, "Distance is used only in Butteraugli distance mode."}}},
 		{.name = "effort", .label = "Effort", .group = "Coding", .kind = ParamKind::Int, .defaultValue = int64_t{7}, .intRange = IntRange{1, 10, 1}, .help = "JPEG XL encoder effort."},
 		{.name = "decoding-speed", .label = "Decoding speed", .group = "Coding", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{0, 4, 1}, .help = "Decode speed tier. Higher can reduce density."},
 		{.name = "resampling", .label = "Resampling", .group = "Coding", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 8, 1}, .help = "-1 default, 1 none, 2/4/8 downsample before compression."},
@@ -468,7 +655,7 @@ std::vector<EncoderParamInfo> query_jpegxl_parameters() {
 		{.name = "keep-invisible", .label = "Keep invisible", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 1, 1}, .help = "Preserve invisible pixel color. Relevant only with alpha."},
 		{.name = "palette-colors", .label = "Palette colors", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 70913, 1}, .help = "Palette color limit. -1 default."},
 		{.name = "lossy-palette", .label = "Lossy palette", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 1, 1}, .help = "Palette quantization toggle."},
-		{.name = "color-transform", .label = "Color transform", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 2, 1}, .help = "-1 default, 0 none, 1 XYB, 2 YCbCr."},
+		{.name = "color-transform", .label = "Color transform", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 2, 1}, .help = "Automatic uses libjxl's choice; 0 is XYB, 1 preserves RGB, and 2 marks losslessly represented YCbCr values."},
 		{.name = "channel-colors-global-percent", .label = "Global palette %", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 100, 1}, .help = "Global channel palette threshold for modular encoding."},
 		{.name = "channel-colors-group-percent", .label = "Group palette %", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 100, 1}, .help = "Per-group channel palette threshold for modular encoding."},
 		{.name = "modular-color-space", .label = "Modular RCT", .group = "Modular", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 41, 1}, .help = "Reversible color transform index for modular encoding."},
@@ -490,31 +677,116 @@ std::vector<EncoderParamInfo> query_jpegxl_parameters() {
 		{.name = "full-image-heuristics", .label = "Full image heuristics", .group = "Heuristics", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 1, 1}, .help = "Use full image heuristics toggle."},
 		{.name = "disable-perceptual-heuristics", .label = "Disable perceptual", .group = "Heuristics", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{0, 1, 1}, .help = "Disable perceptual heuristics."},
 	};
+	// These libjxl switches only affect alpha/extra channels, JPEG
+	// reconstruction, or box metadata. This backend supplies a plain RGB/gray
+	// frame, so showing them would imply capabilities they cannot affect.
+	for (const std::string_view irrelevant : {
+		     "extra-channel-resampling", "already-downsampled", "keep-invisible",
+		     "jpeg-recon-cfl", "brotli-effort", "jpeg-compress-boxes"
+	     }) {
+		result.erase(std::remove_if(result.begin(), result.end(), [&](const EncoderParamInfo& parameter) {
+			return parameter.name == irrelevant;
+		}), result.end());
+	}
+	auto make_enum = [&](std::string_view name, std::string defaultValue, std::vector<EnumValue> values) {
+		auto parameter = std::find_if(result.begin(), result.end(), [&](const EncoderParamInfo& item) { return item.name == name; });
+		if (parameter == result.end()) return;
+		parameter->kind = ParamKind::Enum;
+		parameter->defaultValue = std::move(defaultValue);
+		parameter->intRange.reset();
+		parameter->enumValues = std::move(values);
+	};
+	make_enum("resampling", "-1", {{"-1", "Automatic"}, {"1", "None"}, {"2", "2×"}, {"4", "4×"}, {"8", "8×"}});
+	make_enum("noise", "-1", {{"-1", "Automatic"}, {"0", "Off"}, {"1", "On"}});
+	make_enum("modular", "-1", {{"-1", "Automatic"}, {"0", "VarDCT"}, {"1", "Modular"}});
+	make_enum("epf", "-1", {{"-1", "Automatic"}, {"0", "Off"}, {"1", "Level 1"}, {"2", "Level 2"}, {"3", "Level 3"}});
+	make_enum("gaborish", "-1", {{"-1", "Automatic"}, {"0", "Off"}, {"1", "On"}});
+	make_enum("dots", "-1", {{"-1", "Automatic"}, {"0", "Off"}, {"1", "On"}});
+	make_enum("patches", "-1", {{"-1", "Automatic"}, {"0", "Off"}, {"1", "On"}});
+	make_enum("lossy-palette", "-1", {{"-1", "Automatic"}, {"0", "Off"}, {"1", "On"}});
+	make_enum("color-transform", "-1", {{"-1", "Automatic"}, {"0", "XYB"}, {"1", "RGB"}});
+	make_enum("progressive-ac", "-1", {{"-1", "Automatic"}, {"0", "Off"}, {"1", "On"}});
+	make_enum("qprogressive-ac", "-1", {{"-1", "Automatic"}, {"0", "Off"}, {"1", "On"}});
+	make_enum("group-order", "-1", {{"-1", "Automatic"}, {"0", "Scanline"}, {"1", "Center first"}});
+	make_enum("responsive", "-1", {{"-1", "Automatic"}, {"0", "Off"}, {"1", "On"}});
+	make_enum("full-image-heuristics", "-1", {{"-1", "Automatic"}, {"0", "Off"}, {"1", "On"}});
+	for (EncoderParamInfo& parameter : result) {
+		if (parameter.name == "color-transform") {
+			parameter.help = "Internal libjxl color transform. Automatic lets libjxl choose; XYB is the perceptual transform and RGB preserves RGB channels. YCbCr is intentionally unavailable because this backend supplies RGB/gray samples.";
+		}
+		if (parameter.name == "resampling") {
+			parameter.help = "Optional whole-image downsampling inside libjxl. Only valid factors are offered; this is not chroma subsampling.";
+		}
+		if (parameter.name == "group-order-center-x" || parameter.name == "group-order-center-y") {
+			parameter.enabledWhen = {{"group-order", {"1"}, "Center coordinates apply only to Center-first group order."}};
+		}
+		if (parameter.group == "Modular") {
+			parameter.enabledWhen = {{"modular", {"1"}, "This option applies only when Modular encoding is selected explicitly."}};
+		}
+		if (parameter.name == "responsive") {
+			parameter.enabledWhen = {{"modular", {"1"}, "Responsive progression applies only to Modular encoding."}};
+		}
+	}
+	for (EncoderParamInfo& parameter : result) {
+		if (parameter.kind == ParamKind::Int && std::get_if<int64_t>(&parameter.defaultValue) != nullptr &&
+		    *std::get_if<int64_t>(&parameter.defaultValue) == -1) {
+			parameter.automaticIntValue = -1;
+			parameter.automaticLabel = "Automatic";
+		}
+	}
+	return result;
 }
 
 EncodedImage encode_jpegxl_still_image(const RawImage& image, std::span<const EncoderParam> params) {
-	const std::vector<uint8_t> rgb = raw_to_rgb8(image);
+	const JxlInputPixels pixels = raw_to_jxl_pixels(image);
+	const std::string rateControl = param_value<std::string>(params, "rate-control", "quality");
+	if (rateControl != "quality" && rateControl != "distance" && rateControl != "lossless") {
+		throw std::invalid_argument("unknown JPEG XL rate-control mode: " + rateControl);
+	}
+	// Keep accepting the former boolean for command-line callers, but the GUI
+	// exposes a single mutually-exclusive rate-control selector.
+	const bool lossless = rateControl == "lossless" || param_value<bool>(params, "lossless", false);
 	std::unique_ptr<JxlEncoder, decltype(&JxlEncoderDestroy)> enc(JxlEncoderCreate(nullptr), JxlEncoderDestroy);
 	if (!enc) throw std::runtime_error("JxlEncoderCreate failed");
+	auto encoder_error = [&](const std::string& operation) {
+		return std::runtime_error(operation + " failed (libjxl encoder error " + std::to_string(static_cast<int>(JxlEncoderGetError(enc.get()))) + ")");
+	};
 	JxlBasicInfo info{};
 	JxlEncoderInitBasicInfo(&info);
 	info.xsize = static_cast<uint32_t>(image.width);
 	info.ysize = static_cast<uint32_t>(image.height);
-	info.bits_per_sample = 8;
-	info.num_color_channels = 3;
-	info.uses_original_profile = JXL_FALSE;
-	if (JxlEncoderSetBasicInfo(enc.get(), &info) != JXL_ENC_SUCCESS) throw std::runtime_error("JxlEncoderSetBasicInfo failed");
-	JxlColorEncoding color{};
-	JxlColorEncodingSetToSRGB(&color, JXL_FALSE);
-	if (JxlEncoderSetColorEncoding(enc.get(), &color) != JXL_ENC_SUCCESS) throw std::runtime_error("JxlEncoderSetColorEncoding failed");
+	info.bits_per_sample = static_cast<uint32_t>(pixels.bitDepth);
+	info.exponent_bits_per_sample = 0;
+	info.num_color_channels = pixels.channels;
+	info.uses_original_profile = lossless ? JXL_TRUE : JXL_FALSE;
+	if (JxlEncoderSetBasicInfo(enc.get(), &info) != JXL_ENC_SUCCESS) throw encoder_error("JxlEncoderSetBasicInfo");
+	const JxlColorEncoding color = jxl_color_encoding(image);
+	if (JxlEncoderSetColorEncoding(enc.get(), &color) != JXL_ENC_SUCCESS) throw encoder_error("JxlEncoderSetColorEncoding");
 	JxlEncoderFrameSettings* frame = JxlEncoderFrameSettingsCreate(enc.get(), nullptr);
+	if (frame == nullptr) throw encoder_error("JxlEncoderFrameSettingsCreate");
 	auto setOption = [&](const std::string& name, JxlEncoderFrameSettingId option, int64_t fallback) {
-		const int value = static_cast<int>(param_value<int64_t>(params, name, fallback));
+		int64_t resolved = fallback;
+		for (const EncoderParam& parameter : params) {
+			if (parameter.name != name) continue;
+			if (const auto* integer = std::get_if<int64_t>(&parameter.value)) resolved = *integer;
+			else if (const auto* boolean = std::get_if<bool>(&parameter.value)) resolved = *boolean ? 1 : 0;
+			else if (const auto* text = std::get_if<std::string>(&parameter.value)) {
+				try {
+					std::size_t consumed = 0;
+					resolved = std::stoll(*text, &consumed);
+					if (consumed != text->size()) throw std::invalid_argument("trailing characters");
+				} catch (const std::exception&) {
+					throw std::invalid_argument("JPEG XL option '" + name + "' has a non-numeric selection: " + *text);
+				}
+			}
+			break;
+		}
+		const int value = static_cast<int>(resolved);
 		if (value == fallback) {
 			return;
 		}
 		if (JxlEncoderFrameSettingsSetOption(frame, option, value) != JXL_ENC_SUCCESS) {
-			throw std::runtime_error("JxlEncoderFrameSettingsSetOption failed for " + name);
+			throw encoder_error("JPEG XL option '" + name + "' with value " + std::to_string(value));
 		}
 	};
 	setOption("effort", JXL_ENC_FRAME_SETTING_EFFORT, 7);
@@ -553,24 +825,27 @@ EncodedImage encode_jpegxl_still_image(const RawImage& image, std::span<const En
 	setOption("buffering", JXL_ENC_FRAME_SETTING_BUFFERING, -1);
 	setOption("full-image-heuristics", JXL_ENC_FRAME_SETTING_USE_FULL_IMAGE_HEURISTICS, -1);
 	setOption("disable-perceptual-heuristics", JXL_ENC_FRAME_SETTING_DISABLE_PERCEPTUAL_HEURISTICS, 0);
-	const int quality = static_cast<int>(param_value<int64_t>(params, "quality", 50));
-	const bool lossless = param_value<bool>(params, "lossless", false);
 	if (JxlEncoderSetFrameLossless(frame, lossless ? JXL_TRUE : JXL_FALSE) != JXL_ENC_SUCCESS) {
-		throw std::runtime_error("JxlEncoderSetFrameLossless failed");
+		throw encoder_error("JxlEncoderSetFrameLossless");
 	}
 	if (lossless) {
 		if (JxlEncoderSetFrameDistance(frame, 0.0f) != JXL_ENC_SUCCESS) {
-			throw std::runtime_error("JxlEncoderSetFrameDistance failed");
+			throw encoder_error("JxlEncoderSetFrameDistance(0)");
 		}
 	} else {
-		const double distanceOverride = param_value<double>(params, "distance", -1.0);
-		const float distance = distanceOverride >= 0.0 ? static_cast<float>(distanceOverride) : JxlEncoderDistanceFromQuality(static_cast<float>(quality));
+		const float distance = rateControl == "distance"
+			? static_cast<float>(param_value<double>(params, "distance", 1.0))
+			: JxlEncoderDistanceFromQuality(static_cast<float>(param_value<int64_t>(params, "quality", 90)));
 		if (JxlEncoderSetFrameDistance(frame, distance) != JXL_ENC_SUCCESS) {
-			throw std::runtime_error("JxlEncoderSetFrameDistance failed");
+			throw encoder_error("JxlEncoderSetFrameDistance(" + std::to_string(distance) + ")");
 		}
 	}
-	const JxlPixelFormat format{3, JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 0};
-	if (JxlEncoderAddImageFrame(frame, &format, rgb.data(), rgb.size()) != JXL_ENC_SUCCESS) throw std::runtime_error("JxlEncoderAddImageFrame failed");
+	if (pixels.bitDepth > 8) {
+		const JxlBitDepth inputDepth{JXL_BIT_DEPTH_FROM_CODESTREAM, 0, 0};
+		if (JxlEncoderSetFrameBitDepth(frame, &inputDepth) != JXL_ENC_SUCCESS) throw encoder_error("JxlEncoderSetFrameBitDepth");
+	}
+	const JxlPixelFormat format{pixels.channels, pixels.dataType, JXL_LITTLE_ENDIAN, 0};
+	if (JxlEncoderAddImageFrame(frame, &format, pixels.bytes.data(), pixels.bytes.size()) != JXL_ENC_SUCCESS) throw encoder_error("JxlEncoderAddImageFrame");
 	JxlEncoderCloseInput(enc.get());
 	std::vector<std::byte> out(4096);
 	uint8_t* next = reinterpret_cast<uint8_t*>(out.data());
@@ -578,14 +853,17 @@ EncodedImage encode_jpegxl_still_image(const RawImage& image, std::span<const En
 	for (;;) {
 		const JxlEncoderStatus status = JxlEncoderProcessOutput(enc.get(), &next, &avail);
 		if (status == JXL_ENC_SUCCESS) break;
-		if (status != JXL_ENC_NEED_MORE_OUTPUT) throw std::runtime_error("JxlEncoderProcessOutput failed");
+		if (status != JXL_ENC_NEED_MORE_OUTPUT) throw encoder_error("JxlEncoderProcessOutput");
 		const std::size_t used = out.size() - avail;
 		out.resize(out.size() * 2);
 		next = reinterpret_cast<uint8_t*>(out.data()) + used;
 		avail = out.size() - used;
 	}
 	out.resize(out.size() - avail);
-	return encoded_with_preview(std::move(out), rgb8_to_yuv444(rgb, image.width, image.height));
+	EncodedImage encoded;
+	encoded.hevcAnnexB = std::move(out);
+	encoded.codedColor = image.color;
+	return encoded;
 }
 
 std::vector<EncoderParamInfo> query_jpegxr_parameters() {

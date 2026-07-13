@@ -3,11 +3,13 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
 #include <iterator>
 #include <memory>
 #include <span>
@@ -579,7 +581,7 @@ uint8_t av1_level_idx_from_params(std::span<const EncoderParam> params, int widt
 	if (requested < 0) {
 		return av1_level_idx_for_picture(width, height);
 	}
-	return static_cast<uint8_t>(std::clamp<int64_t>(requested, 0, 20));
+	return static_cast<uint8_t>(std::clamp<int64_t>(requested, 0, 23));
 }
 
 int bit_depth(PixelFormat format) {
@@ -750,26 +752,36 @@ void checked(VAStatus status, std::string_view operation) {
 struct VaDisplay {
 	int fd = -1;
 	VADisplay dpy = nullptr;
+	bool initialized = false;
 
 	explicit VaDisplay(const std::string& path) {
 		fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
 		if (fd < 0) {
 			throw VaError("failed to open VA-API render node '" + path + "': " + std::strerror(errno));
 		}
-		dpy = vaGetDisplayDRM(fd);
-		if (dpy == nullptr) {
-			throw VaError("vaGetDisplayDRM returned null");
+		try {
+			dpy = vaGetDisplayDRM(fd);
+			if (dpy == nullptr) {
+				throw VaError("vaGetDisplayDRM returned null for '" + path + "'");
+			}
+			int major = 0;
+			int minor = 0;
+			checked(vaInitialize(dpy, &major, &minor), "initialize '" + path + "'");
+			initialized = true;
+		} catch (...) {
+			if (dpy != nullptr) (void)vaTerminate(dpy);
+			dpy = nullptr;
+			close(fd);
+			fd = -1;
+			throw;
 		}
-		int major = 0;
-		int minor = 0;
-		checked(vaInitialize(dpy, &major, &minor), "initialize");
 	}
 
 	VaDisplay(const VaDisplay&) = delete;
 	VaDisplay& operator=(const VaDisplay&) = delete;
 
 	~VaDisplay() {
-		if (dpy != nullptr) {
+		if (initialized && dpy != nullptr) {
 			(void)vaTerminate(dpy);
 		}
 		if (fd >= 0) {
@@ -777,6 +789,190 @@ struct VaDisplay {
 		}
 	}
 };
+
+bool has_encode_entrypoint(VADisplay dpy, VAProfile profile) {
+	const int capacity = std::max(1, vaMaxNumEntrypoints(dpy));
+	std::vector<VAEntrypoint> entrypoints(static_cast<std::size_t>(capacity));
+	int count = 0;
+	const VAStatus status = vaQueryConfigEntrypoints(dpy, profile, entrypoints.data(), &count);
+	if (status != VA_STATUS_SUCCESS || count < 0 || count > capacity) return false;
+	return std::find(entrypoints.begin(), entrypoints.begin() + count, VAEntrypointEncSlice) != entrypoints.begin() + count;
+}
+
+bool profile_is_advertised(VADisplay dpy, VAProfile wanted) {
+	const int capacity = std::max(1, vaMaxNumProfiles(dpy));
+	std::vector<VAProfile> profiles(static_cast<std::size_t>(capacity));
+	int count = 0;
+	checked(vaQueryConfigProfiles(dpy, profiles.data(), &count), "query profiles");
+	if (count < 0 || count > capacity) throw VaError("VA-API driver returned an invalid profile count");
+	return std::find(profiles.begin(), profiles.begin() + count, wanted) != profiles.begin() + count;
+}
+
+bool supports_profile(VADisplay dpy, VAProfile profile) {
+	return profile_is_advertised(dpy, profile) && has_encode_entrypoint(dpy, profile);
+}
+
+struct ProfileCapabilities {
+	VAProfile profile = VAProfileNone;
+	uint32_t rtFormats = 0;
+	uint32_t rateControl = 0;
+	uint32_t packedHeaders = 0;
+	uint32_t qualityRange = 0;
+	uint32_t tileSupport = 0;
+	uint32_t maxTileRows = 0;
+	uint32_t maxTileCols = 0;
+	uint32_t maxWidth = 0;
+	uint32_t maxHeight = 0;
+};
+
+uint32_t attribute_value(const VAConfigAttrib& attribute) {
+	return attribute.value == VA_ATTRIB_NOT_SUPPORTED ? 0u : attribute.value;
+}
+
+ProfileCapabilities query_profile_capabilities(VADisplay dpy, VAProfile profile) {
+	if (!supports_profile(dpy, profile)) {
+		throw VaError("VA-API profile " + std::to_string(static_cast<int>(profile)) + " has no EncSlice entrypoint");
+	}
+	std::array<VAConfigAttrib, 9> attributes{{
+		{VAConfigAttribRTFormat, 0},
+		{VAConfigAttribRateControl, 0},
+		{VAConfigAttribEncPackedHeaders, 0},
+		{VAConfigAttribEncQualityRange, 0},
+		{VAConfigAttribEncTileSupport, 0},
+		{VAConfigAttribEncMaxTileRows, 0},
+		{VAConfigAttribEncMaxTileCols, 0},
+		{VAConfigAttribMaxPictureWidth, 0},
+		{VAConfigAttribMaxPictureHeight, 0},
+	}};
+	checked(vaGetConfigAttributes(dpy, profile, VAEntrypointEncSlice, attributes.data(), static_cast<int>(attributes.size())), "query encode attributes");
+	return {
+		.profile = profile,
+		.rtFormats = attribute_value(attributes[0]),
+		.rateControl = attribute_value(attributes[1]),
+		.packedHeaders = attribute_value(attributes[2]),
+		.qualityRange = attribute_value(attributes[3]),
+		.tileSupport = attribute_value(attributes[4]),
+		.maxTileRows = attribute_value(attributes[5]),
+		.maxTileCols = attribute_value(attributes[6]),
+		.maxWidth = attribute_value(attributes[7]),
+		.maxHeight = attribute_value(attributes[8]),
+	};
+}
+
+std::optional<ProfileCapabilities> optional_profile_capabilities(VADisplay dpy, VAProfile profile) {
+	if (!supports_profile(dpy, profile)) return std::nullopt;
+	return query_profile_capabilities(dpy, profile);
+}
+
+std::vector<EnumValue> rate_control_values(uint32_t modes) {
+	std::vector<EnumValue> values;
+	if ((modes & VA_RC_CQP) != 0) values.push_back({"cqp", "CQP"});
+	if ((modes & VA_RC_ICQ) != 0) values.push_back({"icq", "ICQ"});
+	if ((modes & VA_RC_VBR) != 0) values.push_back({"vbr", "VBR"});
+	if ((modes & VA_RC_CBR) != 0) values.push_back({"cbr", "CBR"});
+	return values;
+}
+
+std::pair<uint32_t, uint32_t> largest_complete_format_set(const std::array<std::array<bool, 3>, 2>& supported) {
+	std::pair<uint32_t, uint32_t> best{};
+	int bestScore = 0;
+	int bestChoices = 0;
+	for (uint32_t depthMask = 1; depthMask < 4; ++depthMask) {
+		for (uint32_t chromaMask = 1; chromaMask < 8; ++chromaMask) {
+			bool complete = true;
+			for (int depth = 0; depth < 2; ++depth) {
+				for (int chroma = 0; chroma < 3; ++chroma) {
+					if ((depthMask & (1u << depth)) != 0 && (chromaMask & (1u << chroma)) != 0 && !supported[depth][chroma]) complete = false;
+				}
+			}
+			if (!complete) continue;
+			const int depthCount = std::popcount(depthMask);
+			const int chromaCount = std::popcount(chromaMask);
+			const int score = depthCount * chromaCount;
+			const int choices = depthCount + chromaCount;
+			if (score > bestScore || (score == bestScore && choices > bestChoices)) {
+				best = {depthMask, chromaMask};
+				bestScore = score;
+				bestChoices = choices;
+			}
+		}
+	}
+	return best;
+}
+
+void require_encode_configuration(
+	VADisplay dpy,
+	VAProfile profile,
+	uint32_t rtFormat,
+	uint32_t rcMode,
+	uint32_t packedHeaders,
+	int width,
+	int height,
+	std::string_view device
+) {
+	const ProfileCapabilities caps = query_profile_capabilities(dpy, profile);
+	auto fail = [&](const std::string& reason) {
+		throw VaError("VA-API driver on '" + std::string(device) + "' cannot encode the requested configuration: " + reason);
+	};
+	if ((caps.rtFormats & rtFormat) == 0) fail("render-target format is not supported by the selected profile");
+	if ((caps.rateControl & rcMode) == 0) fail("rate-control mode is not supported by the selected profile");
+	if ((caps.packedHeaders & packedHeaders) != packedHeaders) fail("required packed-header types are not supported");
+	if (caps.maxWidth != 0 && static_cast<uint32_t>(width) > caps.maxWidth) {
+		fail("width " + std::to_string(width) + " exceeds driver maximum " + std::to_string(caps.maxWidth));
+	}
+	if (caps.maxHeight != 0 && static_cast<uint32_t>(height) > caps.maxHeight) {
+		fail("height " + std::to_string(height) + " exceeds driver maximum " + std::to_string(caps.maxHeight));
+	}
+}
+
+void require_tile_configuration(VADisplay dpy, VAProfile profile, uint32_t columns, uint32_t rows, std::string_view device) {
+	const ProfileCapabilities caps = query_profile_capabilities(dpy, profile);
+	if (columns <= 1 && rows <= 1) return;
+	auto fail = [&](const std::string& reason) {
+		throw VaError("VA-API driver on '" + std::string(device) + "' cannot encode the requested tile layout: " + reason);
+	};
+	if (caps.tileSupport == 0) fail("tiling is not supported by the selected profile");
+	if (caps.maxTileCols != 0 && columns > caps.maxTileCols) fail(std::to_string(columns) + " columns exceed driver maximum " + std::to_string(caps.maxTileCols));
+	if (caps.maxTileRows != 0 && rows > caps.maxTileRows) fail(std::to_string(rows) + " rows exceed driver maximum " + std::to_string(caps.maxTileRows));
+}
+
+std::vector<std::string> render_node_paths() {
+	std::vector<std::string> paths;
+	std::error_code error;
+	for (std::filesystem::directory_iterator it("/dev/dri", error), end; !error && it != end; it.increment(error)) {
+		const std::string name = it->path().filename().string();
+		if (!name.starts_with("renderD") || name.size() == 7 ||
+		    !std::all_of(name.begin() + 7, name.end(), [](unsigned char c) { return c >= '0' && c <= '9'; })) continue;
+		paths.push_back(it->path().string());
+	}
+	std::sort(paths.begin(), paths.end());
+	return paths;
+}
+
+std::string default_vaapi_device(bool av1) {
+	const std::vector<VaapiDeviceInfo> devices = discover_vaapi_devices();
+	std::string diagnostics;
+	for (const VaapiDeviceInfo& device : devices) {
+		if (device.initialized && (av1 ? device.supportsAv1Encode : device.supportsHevcEncode)) {
+			try {
+				if (av1) (void)query_vaapi_av1_parameters(device.path);
+				else (void)query_vaapi_hevc_parameters(device.path);
+				return device.path;
+			} catch (const std::exception& e) {
+				if (!diagnostics.empty()) diagnostics += "; ";
+				diagnostics += device.path + ": " + e.what();
+				continue;
+			}
+		}
+		if (!device.error.empty()) {
+			if (!diagnostics.empty()) diagnostics += "; ";
+			diagnostics += device.path + ": " + device.error;
+		}
+	}
+	if (devices.empty()) throw VaError("no DRM render nodes were found under /dev/dri");
+	throw VaError(std::string("no usable VA-API ") + (av1 ? "AV1" : "HEVC") + " encoder was found" +
+	              (diagnostics.empty() ? std::string{} : ": " + diagnostics));
+}
 
 struct ConfigGuard {
 	VADisplay dpy = nullptr;
@@ -1225,6 +1421,20 @@ EncoderParamInfo int_param(
 	return info;
 }
 
+EncoderParamInfo automatic_int_param(
+	std::string name,
+	std::string label,
+	std::string group,
+	int64_t automaticValue,
+	IntRange range,
+	std::string help
+) {
+	EncoderParamInfo info = int_param(std::move(name), std::move(label), std::move(group), automaticValue, range, std::move(help));
+	info.automaticIntValue = automaticValue;
+	info.automaticLabel = "Auto";
+	return info;
+}
+
 EncoderParamInfo enum_param(
 	std::string name,
 	std::string label,
@@ -1323,7 +1533,10 @@ struct VaEncodeObjects {
 
 	VaEncodeObjects(const RawImage& image, VAProfile profile, uint32_t rtFormat, uint32_t pixelFormat, const std::string& device, uint32_t packedHeaders, uint32_t rcMode, bool contextRenderTargets = true)
 		: display(device),
-		  config(display.dpy, create_config(display.dpy, profile, rtFormat, packedHeaders, rcMode)),
+		  config(display.dpy, [&] {
+			require_encode_configuration(display.dpy, profile, rtFormat, rcMode, packedHeaders, image.width, image.height, device);
+			return create_config(display.dpy, profile, rtFormat, packedHeaders, rcMode);
+		  }()),
 		  input(display.dpy, create_surface(display.dpy, image, rtFormat, pixelFormat)),
 		  recon(display.dpy, create_surface(display.dpy, image, rtFormat, pixelFormat)) {
 		VAContextID rawContext = VA_INVALID_ID;
@@ -1352,9 +1565,127 @@ struct VaEncodeObjects {
 
 } // namespace
 
-std::vector<EncoderParamInfo> query_vaapi_hevc_parameters() {
+std::vector<VaapiDeviceInfo> probe_vaapi_devices(std::span<const std::string> paths) {
+	std::vector<VaapiDeviceInfo> devices;
+	devices.reserve(paths.size());
+	for (const std::string& path : paths) {
+		VaapiDeviceInfo info;
+		info.path = path;
+		try {
+			VaDisplay display(path);
+			info.initialized = true;
+			const char* vendor = vaQueryVendorString(display.dpy);
+			info.vendor = vendor != nullptr && vendor[0] != '\0' ? vendor : "unknown VA driver";
+			for (VAProfile profile : {
+			         VAProfileHEVCMain, VAProfileHEVCMain10, VAProfileHEVCMain422_10,
+			         VAProfileHEVCMain444, VAProfileHEVCMain444_10,
+			         VAProfileHEVCSccMain, VAProfileHEVCSccMain10,
+			         VAProfileHEVCSccMain444, VAProfileHEVCSccMain444_10,
+		     }) {
+				info.supportsHevcEncode = info.supportsHevcEncode || supports_profile(display.dpy, profile);
+			}
+			info.supportsAv1Encode = supports_profile(display.dpy, VAProfileAV1Profile0);
+		} catch (const std::exception& e) {
+			info.error = e.what();
+		}
+		devices.push_back(std::move(info));
+	}
+	return devices;
+}
+
+std::vector<VaapiDeviceInfo> discover_vaapi_devices() {
+	return probe_vaapi_devices(render_node_paths());
+}
+
+std::vector<EncoderParamInfo> query_vaapi_hevc_parameters(std::string_view device) {
+	VaDisplay display{std::string(device)};
+	std::vector<ProfileCapabilities> capabilities;
+	for (VAProfile profile : {
+	         VAProfileHEVCMain, VAProfileHEVCMain10, VAProfileHEVCMain422_10,
+	         VAProfileHEVCMain444, VAProfileHEVCMain444_10,
+	         VAProfileHEVCSccMain, VAProfileHEVCSccMain10,
+	         VAProfileHEVCSccMain444, VAProfileHEVCSccMain444_10,
+	     }) {
+		if (auto caps = optional_profile_capabilities(display.dpy, profile)) capabilities.push_back(*caps);
+	}
+	constexpr uint32_t requiredPackedHeaders =
+		VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_PICTURE | VA_ENC_PACKED_HEADER_SLICE;
+	capabilities.erase(std::remove_if(capabilities.begin(), capabilities.end(), [](const ProfileCapabilities& caps) {
+		return (caps.packedHeaders & requiredPackedHeaders) != requiredPackedHeaders;
+	}), capabilities.end());
+	if (capabilities.empty()) throw VaError("VA-API driver on '" + std::string(device) + "' has no HEVC EncSlice profile");
+
+	auto has_format = [&](VAProfile profile, uint32_t format) {
+		return std::any_of(capabilities.begin(), capabilities.end(), [&](const ProfileCapabilities& caps) {
+			return caps.profile == profile && (caps.rtFormats & format) != 0;
+		});
+	};
+	const std::array<std::array<bool, 3>, 2> mainFormats{{
+		{{has_format(VAProfileHEVCMain, VA_RT_FORMAT_YUV420),
+		  has_format(VAProfileHEVCMain422_10, VA_RT_FORMAT_YUV422),
+		  has_format(VAProfileHEVCMain444, VA_RT_FORMAT_YUV444)}},
+		{{has_format(VAProfileHEVCMain10, VA_RT_FORMAT_YUV420_10),
+		  has_format(VAProfileHEVCMain422_10, VA_RT_FORMAT_YUV422_10),
+		  has_format(VAProfileHEVCMain444_10, VA_RT_FORMAT_YUV444_10)}},
+	}};
+	const auto [depthMask, chromaMask] = largest_complete_format_set(mainFormats);
+	const bool supports8 = (depthMask & 1u) != 0;
+	const bool supports10 = (depthMask & 2u) != 0;
+	const bool supports420 = (chromaMask & 1u) != 0;
+	const bool supports422 = (chromaMask & 2u) != 0;
+	const bool supports444 = (chromaMask & 4u) != 0;
+	const std::array<std::array<bool, 3>, 2> sccFormats{{
+		{{has_format(VAProfileHEVCSccMain, VA_RT_FORMAT_YUV420), false,
+		  has_format(VAProfileHEVCSccMain444, VA_RT_FORMAT_YUV444)}},
+		{{has_format(VAProfileHEVCSccMain10, VA_RT_FORMAT_YUV420_10), false,
+		  has_format(VAProfileHEVCSccMain444_10, VA_RT_FORMAT_YUV444_10)}},
+	}};
+	const auto [sccDepthMask, sccChromaMask] = largest_complete_format_set(sccFormats);
+	const uint32_t selectableSccDepthMask = sccDepthMask & depthMask;
+	const uint32_t selectableSccChromaMask = sccChromaMask & chromaMask;
+	if ((!supports8 && !supports10) || (!supports420 && !supports422 && !supports444)) {
+		throw VaError("VA-API HEVC driver on '" + std::string(device) + "' advertises no supported YUV encode format");
+	}
+	uint32_t rateControl = 0;
+	uint32_t sccRateControl = 0;
+	uint32_t qualityRange = 0;
+	uint32_t maxTileRows = 0;
+	uint32_t maxTileCols = 0;
+	bool tileSupport = true;
+	bool sccSupport = false;
+	bool sawMainProfile = false;
+	bool sawSccProfile = false;
+	bool sawQualityRange = false;
+	bool sawMaxTileRows = false;
+	bool sawMaxTileCols = false;
+	for (const ProfileCapabilities& caps : capabilities) {
+		const bool scc = caps.profile == VAProfileHEVCSccMain || caps.profile == VAProfileHEVCSccMain10 ||
+		                 caps.profile == VAProfileHEVCSccMain444 || caps.profile == VAProfileHEVCSccMain444_10;
+		if (scc) {
+			sccRateControl = sawSccProfile ? sccRateControl & caps.rateControl : caps.rateControl;
+			sawSccProfile = true;
+		} else {
+			rateControl = sawMainProfile ? rateControl & caps.rateControl : caps.rateControl;
+			sawMainProfile = true;
+		}
+		sccSupport = sccSupport || scc;
+		qualityRange = sawQualityRange ? std::min(qualityRange, caps.qualityRange) : caps.qualityRange;
+		sawQualityRange = true;
+		tileSupport = tileSupport && caps.tileSupport != 0;
+		if (caps.maxTileRows != 0) {
+			maxTileRows = sawMaxTileRows ? std::min(maxTileRows, caps.maxTileRows) : caps.maxTileRows;
+			sawMaxTileRows = true;
+		}
+		if (caps.maxTileCols != 0) {
+			maxTileCols = sawMaxTileCols ? std::min(maxTileCols, caps.maxTileCols) : caps.maxTileCols;
+			sawMaxTileCols = true;
+		}
+	}
+	const std::vector<EnumValue> rateControls = rate_control_values(rateControl);
+	if (rateControls.empty()) throw VaError("VA-API HEVC driver on '" + std::string(device) + "' advertises no supported rate-control mode");
+
 	std::vector<EncoderParamInfo> out{
-		enum_param("rate-control", "Mode", "Rate Control", "cqp", {{"cqp", "CQP"}, {"icq", "ICQ"}, {"vbr", "VBR"}, {"cbr", "CBR"}}, "VA-API rate-control mode advertised by this driver."),
+		enum_param("rate-control", "Mode", "Rate Control", rateControls.front().value, rateControls, "VA-API rate-control mode advertised by this driver."),
 		int_param("qpi", "QP", "Rate Control", 35, {0, 51, 1}, "I-picture quantization parameter for still-image encoding."),
 		int_param("bitrate-kbps", "Bitrate", "Rate Control", 10000, {1, 1000000, 1000}, "Target bitrate for CBR/VBR/ICQ modes."),
 		int_param("target-usage", "Target usage", "Speed / Quality", 4, {0, 7, 1}, "VA quality level: 1 highest quality, 7 fastest, 0 driver default."),
@@ -1394,10 +1725,81 @@ std::vector<EncoderParamInfo> query_vaapi_hevc_parameters() {
 		bool_param("loop-filter-across-tiles", "Filter across tiles", "Partitioning", true, "Allow filters across tile boundaries."),
 		bool_param("loop-filter-across-slices", "Filter across slices", "Partitioning", true, "Allow filters across slice boundaries."),
 	};
+	auto find_param = [&](std::string_view name) -> EncoderParamInfo* {
+		const auto it = std::find_if(out.begin(), out.end(), [&](const EncoderParamInfo& param) { return param.name == name; });
+		return it == out.end() ? nullptr : &*it;
+	};
+	if (EncoderParamInfo* qpi = find_param("qpi")) {
+		qpi->enabledWhen.push_back({"rate-control", {"cqp", "icq"}, "QP is used directly by CQP and as the quality factor by ICQ."});
+	}
+	if (EncoderParamInfo* bitrate = find_param("bitrate-kbps")) {
+		if ((rateControl & (VA_RC_VBR | VA_RC_CBR)) == 0) {
+			out.erase(std::remove_if(out.begin(), out.end(), [](const EncoderParamInfo& param) { return param.name == "bitrate-kbps"; }), out.end());
+		} else {
+			bitrate->enabledWhen.push_back({"rate-control", {"vbr", "cbr"}, "Bitrate applies only to VBR and CBR."});
+			bitrate->directNumericInput = true;
+		}
+	}
+	if (EncoderParamInfo* usage = find_param("target-usage")) {
+		if (qualityRange == 0) {
+			out.erase(std::remove_if(out.begin(), out.end(), [](const EncoderParamInfo& param) { return param.name == "target-usage"; }), out.end());
+		} else {
+			usage->intRange = IntRange{0, static_cast<int64_t>(qualityRange), 1};
+			usage->defaultValue = static_cast<int64_t>(std::min<uint32_t>(4, qualityRange));
+		}
+	}
+	if (!sccSupport || selectableSccDepthMask == 0 || selectableSccChromaMask == 0) {
+		out.erase(std::remove_if(out.begin(), out.end(), [](const EncoderParamInfo& param) { return param.name == "scc"; }), out.end());
+	} else if (EncoderParamInfo* scc = find_param("scc")) {
+		std::vector<std::string> acceptedRateControls;
+		for (const EnumValue& value : rate_control_values(sccRateControl)) acceptedRateControls.push_back(value.value);
+		if (acceptedRateControls.empty()) {
+			out.erase(std::remove_if(out.begin(), out.end(), [](const EncoderParamInfo& param) { return param.name == "scc"; }), out.end());
+		} else {
+			scc->enabledWhen.push_back({"rate-control", std::move(acceptedRateControls), "The selected rate-control mode must be supported by every advertised SCC profile."});
+			std::vector<std::string> acceptedDepths;
+			if ((selectableSccDepthMask & 1u) != 0) acceptedDepths.push_back("8");
+			if ((selectableSccDepthMask & 2u) != 0) acceptedDepths.push_back("10");
+			scc->enabledWhen.push_back({"bit-depth", std::move(acceptedDepths), "Select an explicit bit depth supported by the SCC profile."});
+			std::vector<std::string> acceptedChroma;
+			if ((selectableSccChromaMask & 1u) != 0) acceptedChroma.push_back("420");
+			if ((selectableSccChromaMask & 4u) != 0) acceptedChroma.push_back("444");
+			scc->enabledWhen.push_back({"chroma-subsampling", std::move(acceptedChroma), "Select a chroma layout supported by the SCC profile."});
+		}
+	}
+	if (EncoderParamInfo* depth = find_param("bit-depth")) {
+		depth->enumValues = {{"source", "Source"}};
+		if (supports8) depth->enumValues.push_back({"8", "8-bit"});
+		if (supports10) depth->enumValues.push_back({"10", "10-bit"});
+	}
+	if (EncoderParamInfo* chroma = find_param("chroma-subsampling")) {
+		chroma->enumValues.clear();
+		if (supports420) chroma->enumValues.push_back({"420", "4:2:0"});
+		if (supports422) chroma->enumValues.push_back({"422", "4:2:2"});
+		if (supports444) chroma->enumValues.push_back({"444", "4:4:4"});
+		chroma->defaultValue = chroma->enumValues.front().value;
+	}
+	if (!tileSupport) {
+		out.erase(std::remove_if(out.begin(), out.end(), [](const EncoderParamInfo& param) {
+			return param.name == "num-tile-cols" || param.name == "num-tile-rows" ||
+			       param.name == "loop-filter-across-tiles";
+		}), out.end());
+	} else {
+		if (EncoderParamInfo* columns = find_param("num-tile-cols"); columns != nullptr && maxTileCols != 0) {
+			columns->intRange->max = std::min<int64_t>(columns->intRange->max, maxTileCols);
+		}
+		if (EncoderParamInfo* rows = find_param("num-tile-rows"); rows != nullptr && maxTileRows != 0) {
+			rows->intRange->max = std::min<int64_t>(rows->intRange->max, maxTileRows);
+		}
+	}
 	return out;
 }
 
-EncodedImage encode_vaapi_hevc_still_image(const RawImage& image, std::span<const EncoderParam> params) {
+std::vector<EncoderParamInfo> query_vaapi_hevc_parameters() {
+	return query_vaapi_hevc_parameters(default_vaapi_device(false));
+}
+
+EncodedImage encode_vaapi_hevc_still_image(const RawImage& image, std::span<const EncoderParam> params, std::string_view device) {
 	const bool scc = get_param<bool>(params, "scc", false);
 	const std::string chroma = get_param<std::string>(params, "chroma-subsampling", "420");
 	if (scc && chroma == "422") {
@@ -1423,19 +1825,19 @@ EncodedImage encode_vaapi_hevc_still_image(const RawImage& image, std::span<cons
 	const uint32_t rcMode = vaapi_rate_control_mode(get_param<std::string>(params, "rate-control", "cqp"));
 	const uint32_t bitrateKbps = static_cast<uint32_t>(std::clamp<int64_t>(get_int_param(params, "bitrate-kbps", 10000), 1, 1000000));
 	const uint32_t quality = static_cast<uint32_t>(get_int_param(params, "target-usage", 4));
-	const std::string device = "/dev/dri/renderD128";
-	if (scc && rcMode != VA_RC_CQP) {
-		throw std::runtime_error("VA-API HEVC SCC profiles on this driver advertise only CQP rate control");
-	}
+	const uint32_t tileCols = static_cast<uint32_t>(std::clamp<int64_t>(get_int_param(params, "num-tile-cols", 1), 1, 19));
+	const uint32_t tileRows = static_cast<uint32_t>(std::clamp<int64_t>(get_int_param(params, "num-tile-rows", 1), 1, 21));
+	const std::string devicePath(device);
 	VaEncodeObjects va(
 		encodeImage,
 			profile,
 			rtFormat,
 			pixelFormat,
-			device,
+			devicePath,
 			VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_PICTURE | VA_ENC_PACKED_HEADER_SLICE,
 			rcMode
 	);
+	require_tile_configuration(va.display.dpy, profile, tileCols, tileRows, device);
 	upload_yuv_to_surface(va.display.dpy, va.input.surface, encodeImage);
 	checked(vaSyncSurface(va.display.dpy, va.input.surface), "sync HEVC input surface");
 
@@ -1487,8 +1889,8 @@ EncodedImage encode_vaapi_hevc_still_image(const RawImage& image, std::span<cons
 		pic,
 		static_cast<uint32_t>(encodeImage.width),
 		static_cast<uint32_t>(encodeImage.height),
-		static_cast<uint32_t>(get_int_param(params, "num-tile-cols", 1)),
-		static_cast<uint32_t>(get_int_param(params, "num-tile-rows", 1))
+		tileCols,
+		tileRows
 	);
 
 	VAEncSliceParameterBufferHEVC slice{};
@@ -1518,11 +1920,13 @@ EncodedImage encode_vaapi_hevc_still_image(const RawImage& image, std::span<cons
 	auto seqBuf = create_buffer(va.display.dpy, va.context.id, VAEncSequenceParameterBufferType, seq);
 	auto rcBuf = create_misc_rate_control(va.display.dpy, va.context.id, rcMode, qpi, bitrateKbps);
 	auto frameRateBuf = create_frame_rate(va.display.dpy, va.context.id);
-	auto qualityBuf = create_quality_level(va.display.dpy, va.context.id, quality);
+	BufferGuard qualityBuf;
+	if (query_profile_capabilities(va.display.dpy, profile).qualityRange != 0) {
+		qualityBuf = create_quality_level(va.display.dpy, va.context.id, quality);
+	}
 	auto picBuf = create_buffer(va.display.dpy, va.context.id, VAEncPictureParameterBufferType, pic);
 	auto sliceBuf = create_buffer(va.display.dpy, va.context.id, VAEncSliceParameterBufferType, slice);
-	const bool entryPointsPresent = get_int_param(params, "num-tile-cols", 1) > 1 ||
-	                                get_int_param(params, "num-tile-rows", 1) > 1 ||
+	const bool entryPointsPresent = tileCols > 1 || tileRows > 1 ||
 	                                get_param<bool>(params, "entropy-coding-sync", false);
 	const std::vector<std::byte> sliceHeader = hevc_slice_header(
 		slice.slice_qp_delta,
@@ -1547,11 +1951,13 @@ EncodedImage encode_vaapi_hevc_still_image(const RawImage& image, std::span<cons
 	auto packedSps = create_packed_header(va.display.dpy, va.context.id, VAEncPackedHeaderHEVC_SPS, spsHeader);
 	auto packedPps = create_packed_header(va.display.dpy, va.context.id, VAEncPackedHeaderHEVC_PPS, ppsHeader);
 	auto packedSlice = create_packed_header(va.display.dpy, va.context.id, VAEncPackedHeaderHEVC_Slice, sliceHeader);
-	VABufferID buffers[] = {
-		seqBuf.id,
-		rcBuf.id,
-		frameRateBuf.id,
-		qualityBuf.id,
+	std::vector<VABufferID> buffers;
+	buffers.reserve(14);
+	buffers.push_back(seqBuf.id);
+	buffers.push_back(rcBuf.id);
+	buffers.push_back(frameRateBuf.id);
+	if (qualityBuf.id != VA_INVALID_ID) buffers.push_back(qualityBuf.id);
+	const VABufferID remainingBuffers[] = {
 		picBuf.id,
 		packedVps.params.id,
 		packedVps.data.id,
@@ -1563,8 +1969,9 @@ EncodedImage encode_vaapi_hevc_still_image(const RawImage& image, std::span<cons
 		packedSlice.data.id,
 		sliceBuf.id,
 	};
+	buffers.insert(buffers.end(), std::begin(remainingBuffers), std::end(remainingBuffers));
 	checked(vaBeginPicture(va.display.dpy, va.context.id, va.input.surface), "begin HEVC picture");
-	checked(vaRenderPicture(va.display.dpy, va.context.id, buffers, static_cast<int>(std::size(buffers))), "render HEVC picture");
+	checked(vaRenderPicture(va.display.dpy, va.context.id, buffers.data(), static_cast<int>(buffers.size())), "render HEVC picture");
 	checked(vaEndPicture(va.display.dpy, va.context.id), "end HEVC picture");
 
 	EncodedImage result;
@@ -1575,12 +1982,38 @@ EncodedImage encode_vaapi_hevc_still_image(const RawImage& image, std::span<cons
 	return result;
 }
 
-std::vector<EncoderParamInfo> query_vaapi_av1_parameters() {
-	return {
-		enum_param("rate-control", "Mode", "Rate Control", "cqp", {{"cqp", "CQP"}, {"icq", "ICQ"}, {"vbr", "VBR"}, {"cbr", "CBR"}}, "VA-API rate-control mode advertised by this driver."),
+EncodedImage encode_vaapi_hevc_still_image(const RawImage& image, std::span<const EncoderParam> params) {
+	std::string errors;
+	for (const VaapiDeviceInfo& device : discover_vaapi_devices()) {
+		if (!device.initialized || !device.supportsHevcEncode) continue;
+		try {
+			return encode_vaapi_hevc_still_image(image, params, device.path);
+		} catch (const std::exception& e) {
+			if (!errors.empty()) errors += "; ";
+			errors += device.path + ": " + e.what();
+		}
+	}
+	if (errors.empty()) (void)default_vaapi_device(false);
+	throw VaError("no VA-API HEVC device accepted the requested configuration: " + errors);
+}
+
+std::vector<EncoderParamInfo> query_vaapi_av1_parameters(std::string_view device) {
+	VaDisplay display{std::string(device)};
+	const ProfileCapabilities caps = query_profile_capabilities(display.dpy, VAProfileAV1Profile0);
+	const std::vector<EnumValue> rateControls = rate_control_values(caps.rateControl);
+	if (rateControls.empty()) throw VaError("VA-API AV1 driver on '" + std::string(device) + "' advertises no supported rate-control mode");
+	const bool supports8 = (caps.rtFormats & VA_RT_FORMAT_YUV420) != 0;
+	const bool supports10 = (caps.rtFormats & VA_RT_FORMAT_YUV420_10) != 0;
+	if (!supports8 && !supports10) throw VaError("VA-API AV1 driver on '" + std::string(device) + "' advertises no supported 4:2:0 encode format");
+	constexpr uint32_t requiredPackedHeaders = VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_PICTURE;
+	if ((caps.packedHeaders & requiredPackedHeaders) != requiredPackedHeaders) {
+		throw VaError("VA-API AV1 driver on '" + std::string(device) + "' lacks packed sequence/picture header support required by this encoder");
+	}
+	std::vector<EncoderParamInfo> out{
+		enum_param("rate-control", "Mode", "Rate Control", rateControls.front().value, rateControls, "VA-API rate-control mode advertised by this driver."),
 		int_param("qindex", "Q index", "Rate Control", 128, {0, 255, 1}, "AV1 base quantizer index for CQP still-image encoding."),
 		int_param("bitrate-kbps", "Bitrate", "Rate Control", 10000, {1, 1000000, 1000}, "Target bitrate for CBR/VBR/ICQ modes."),
-		int_param("level-idx", "Level index", "Profile / Level", -1, {-1, 20, 1}, "AV1 seq_level_idx value; -1 chooses the lowest level for the image size."),
+		automatic_int_param("level-idx", "Level index", "Profile / Level", -1, {-1, 23, 1}, "Auto is an application-only sentinel that selects the lowest valid AV1 level for the image. Explicit values 0..23 map to AV1 levels 2.0..7.3; -1 is never written as seq_level_idx."),
 		enum_param("bit-depth", "Bit depth", "Compression", "source", {{"source", "Source"}, {"8", "8-bit"}, {"10", "10-bit"}}, "Encode bit depth."),
 		bool_param("disable-cdf-update", "Disable CDF update", "Coding Tools", false, "Disable AV1 CDF updates for the still frame."),
 		bool_param("cdef", "CDEF", "Filters", true, "Enable AV1 constrained directional enhancement filtering."),
@@ -1589,9 +2022,46 @@ std::vector<EncoderParamInfo> query_vaapi_av1_parameters() {
 		int_param("tile-columns", "Tile columns", "Partitioning", 1, {1, 64, 1}, "Number of AV1 tile columns."),
 		int_param("tile-rows", "Tile rows", "Partitioning", 1, {1, 64, 1}, "Number of AV1 tile rows."),
 	};
+	auto find_param = [&](std::string_view name) -> EncoderParamInfo* {
+		const auto it = std::find_if(out.begin(), out.end(), [&](const EncoderParamInfo& param) { return param.name == name; });
+		return it == out.end() ? nullptr : &*it;
+	};
+	if (EncoderParamInfo* qindex = find_param("qindex")) {
+		qindex->enabledWhen.push_back({"rate-control", {"cqp", "icq"}, "Q index is used directly by CQP and as the quality factor by ICQ."});
+	}
+	if (EncoderParamInfo* bitrate = find_param("bitrate-kbps")) {
+		if ((caps.rateControl & (VA_RC_VBR | VA_RC_CBR)) == 0) {
+			out.erase(std::remove_if(out.begin(), out.end(), [](const EncoderParamInfo& param) { return param.name == "bitrate-kbps"; }), out.end());
+		} else {
+			bitrate->enabledWhen.push_back({"rate-control", {"vbr", "cbr"}, "Bitrate applies only to VBR and CBR."});
+			bitrate->directNumericInput = true;
+		}
+	}
+	if (EncoderParamInfo* depth = find_param("bit-depth")) {
+		depth->enumValues = {{"source", "Source"}};
+		if (supports8) depth->enumValues.push_back({"8", "8-bit"});
+		if (supports10) depth->enumValues.push_back({"10", "10-bit"});
+	}
+	if (caps.tileSupport == 0) {
+		out.erase(std::remove_if(out.begin(), out.end(), [](const EncoderParamInfo& param) {
+			return param.name == "tile-columns" || param.name == "tile-rows";
+		}), out.end());
+	} else {
+		if (EncoderParamInfo* columns = find_param("tile-columns"); columns != nullptr && caps.maxTileCols != 0) {
+			columns->intRange->max = std::min<int64_t>(columns->intRange->max, caps.maxTileCols);
+		}
+		if (EncoderParamInfo* rows = find_param("tile-rows"); rows != nullptr && caps.maxTileRows != 0) {
+			rows->intRange->max = std::min<int64_t>(rows->intRange->max, caps.maxTileRows);
+		}
+	}
+	return out;
 }
 
-EncodedImage encode_vaapi_av1_still_image(const RawImage& image, std::span<const EncoderParam> params) {
+std::vector<EncoderParamInfo> query_vaapi_av1_parameters() {
+	return query_vaapi_av1_parameters(default_vaapi_device(true));
+}
+
+EncodedImage encode_vaapi_av1_still_image(const RawImage& image, std::span<const EncoderParam> params, std::string_view device) {
 	const int targetDepth = requested_bit_depth(params, image);
 	if (targetDepth != 8 && targetDepth != 10) {
 		throw std::runtime_error("VA-API AV1 accepts 8-bit or 10-bit input");
@@ -1625,10 +2095,11 @@ EncodedImage encode_vaapi_av1_still_image(const RawImage& image, std::span<const
 		VAProfileAV1Profile0,
 		rtFormat,
 		pixelFormat,
-		"/dev/dri/renderD128",
+		std::string(device),
 		VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_PICTURE,
 		rcMode
 	);
+	require_tile_configuration(va.display.dpy, VAProfileAV1Profile0, tileCols, tileRows, device);
 	upload_yuv_to_surface(va.display.dpy, va.input.surface, encodeImage);
 	checked(vaSyncSurface(va.display.dpy, va.input.surface), "sync AV1 input surface");
 
@@ -1765,6 +2236,21 @@ EncodedImage encode_vaapi_av1_still_image(const RawImage& image, std::span<const
 	append_ivf_header(result.hevcAnnexB, encodeImage.width, encodeImage.height, 1);
 	append_ivf_frame(result.hevcAnnexB, frame, 0);
 	return result;
+}
+
+EncodedImage encode_vaapi_av1_still_image(const RawImage& image, std::span<const EncoderParam> params) {
+	std::string errors;
+	for (const VaapiDeviceInfo& device : discover_vaapi_devices()) {
+		if (!device.initialized || !device.supportsAv1Encode) continue;
+		try {
+			return encode_vaapi_av1_still_image(image, params, device.path);
+		} catch (const std::exception& e) {
+			if (!errors.empty()) errors += "; ";
+			errors += device.path + ": " + e.what();
+		}
+	}
+	if (errors.empty()) (void)default_vaapi_device(true);
+	throw VaError("no VA-API AV1 device accepted the requested configuration: " + errors);
 }
 
 } // namespace codec_gui

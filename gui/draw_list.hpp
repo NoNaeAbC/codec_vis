@@ -36,6 +36,7 @@ namespace codec_gui::gui {
 		TextureId texture;
 		Rect uvRect{0, 0, 1, 1};
 		float opacity = 1.0f;
+		int layer = 0;
 	};
 
 	[[nodiscard]] TextureId resolve_texture(const ResourceSnapshot& resources, ImageId image);

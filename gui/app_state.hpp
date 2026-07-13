@@ -93,8 +93,12 @@ namespace codec_gui::gui {
 		std::string codecName;
 		std::string backendName;
 		std::vector<std::byte> bytes;
+		PixelFormat codedPixelFormat = PixelFormat::YUV420P8;
+		ColorDescription codedColor;
 		uint64_t byteSize = 0;
 		double encodeSeconds = 0.0;
+		double decodeSeconds = 0.0;
+		double metricSeconds = 0.0;
 		std::filesystem::path outputPath;
 		std::vector<ParamSummary> keyParams;
 		std::vector<QualityMetricRecord> metrics;
@@ -203,6 +207,7 @@ namespace codec_gui::gui {
 		ImageId source;
 		BackendId backend;
 		std::vector<EncoderParam> params;
+		bool replacePreviousResult = false;
 		EncodeRunState state = EncodeRunState::Queued;
 		double startedSeconds = 0.0;
 		double finishedSeconds = 0.0;
@@ -242,6 +247,7 @@ namespace codec_gui::gui {
 		float inspectorWidth = 360.0f;
 		float commandBarHeight = 40.0f;
 		float statusBarHeight = 28.0f;
+		float inspectorScrollOffset = 0.0f;
 	};
 
 	enum class ImageSortKey {
@@ -254,6 +260,7 @@ namespace codec_gui::gui {
 	struct ImageListState {
 		ImageSortKey sortKey = ImageSortKey::CreationTime;
 		bool ascending = true;
+		float scrollOffset = 0.0f;
 	};
 
 	struct StorageState {
@@ -274,6 +281,7 @@ namespace codec_gui::gui {
 	struct InteractionState {
 		std::string focusedWidget;
 		std::string activePointerCapture;
+		bool replaceFocusedNumericValue = false;
 		PaneId hoveredPane;
 		Point lastPointer;
 		int framebufferWidth = 1280;
@@ -296,6 +304,9 @@ namespace codec_gui::gui {
 		StorageState storage;
 		DebugState debug;
 		InteractionState interaction;
+		// Application workflow state: encoded results are retained unless the user
+		// explicitly enables scratch replacement.
+		bool scratchResults = false;
 		uint64_t nextId = 1;
 	};
 
@@ -306,6 +317,7 @@ namespace codec_gui::gui {
 		SourceLoaded,
 		SourceLoadFailed,
 		SelectImage,
+		RemoveImage,
 		SelectPane,
 		AssignImageToPane,
 		ClearPaneImage,
@@ -320,6 +332,7 @@ namespace codec_gui::gui {
 		SetImageListSort,
 		SelectBackend,
 		SetEncoderParam,
+		ToggleScratchResults,
 		RefreshBackendCapabilities,
 		BackendCapabilitiesReady,
 		BackendCapabilitiesFailed,
@@ -336,6 +349,7 @@ namespace codec_gui::gui {
 		EncodeRunCanceled,
 		SaveEncodedResult,
 		SaveCompleted,
+		SaveCanceled,
 		SaveFailed,
 		PointerMoved,
 		PointerPressed,

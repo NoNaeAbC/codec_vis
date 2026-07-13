@@ -201,6 +201,7 @@ RawImage rgb_to_yuv420_bt709_limited(const RgbImage& rgb) {
 	image.width = width;
 	image.height = height;
 	image.format = PixelFormat::YUV420P8;
+	image.color = {ColorPrimaries::BT709, TransferCharacteristics::SRGB, MatrixCoefficients::BT709, ColorRange::Limited, Chroma420SampleLocation::LeftCenter};
 	image.planes[0].strideBytes = width;
 	image.planes[1].strideBytes = width / 2;
 	image.planes[2].strideBytes = width / 2;
@@ -255,6 +256,7 @@ RawImage rgb16_to_yuv420p10_bt709_limited(const Rgb16Image& rgb) {
 	image.width = width;
 	image.height = height;
 	image.format = PixelFormat::YUV420P10LE;
+	image.color = {ColorPrimaries::BT709, TransferCharacteristics::SRGB, MatrixCoefficients::BT709, ColorRange::Limited, Chroma420SampleLocation::LeftCenter};
 	image.planes[0].strideBytes = width * 2;
 	image.planes[1].strideBytes = width;
 	image.planes[2].strideBytes = width;
@@ -340,6 +342,7 @@ RawImage make_test_pattern() {
 	image.width = width;
 	image.height = height;
 	image.format = PixelFormat::YUV420P8;
+	image.color = {ColorPrimaries::BT709, TransferCharacteristics::SRGB, MatrixCoefficients::BT709, ColorRange::Limited, Chroma420SampleLocation::LeftCenter};
 	image.planes[0].bytes.resize(height * width);
 	image.planes[0].strideBytes = width;
 	image.planes[1].bytes.resize(height * width / 4);

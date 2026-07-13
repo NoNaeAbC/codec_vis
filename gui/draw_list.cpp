@@ -1,6 +1,7 @@
 #include "draw_list.hpp"
 
 #include "image_list_model.hpp"
+#include "encoder_param_state.hpp"
 #include "metrics.hpp"
 #include "raw_image_utils.hpp"
 #include "ui_widgets.hpp"
@@ -50,6 +51,8 @@ constexpr CommandButton CommandButtons[] = {
 	{834, 60, "Grid", "grid"},
 	{900, 52, "Fit", "fit"},
 	{958, 64, "100%", "100"},
+	{1028, 110, "Delete image", "delete"},
+	{1144, 144, "Keep results", "scratch"},
 };
 
 void push_rect(std::vector<DrawCommand>& out, Rect rect, Color color) {
@@ -82,6 +85,27 @@ void push_scissor(std::vector<DrawCommand>& out, DrawCommandKind kind, Rect rect
 	command.kind = kind;
 	command.rect = rect;
 	out.push_back(std::move(command));
+}
+
+bool contains(Rect rect, Point point) {
+	return point.x >= rect.x && point.y >= rect.y && point.x < rect.x + rect.w && point.y < rect.y + rect.h;
+}
+
+std::vector<std::string> wrap_tooltip(std::string_view text, std::size_t columns = 68) {
+	std::vector<std::string> lines;
+	std::string line;
+	std::istringstream words{std::string{text}};
+	std::string word;
+	while (words >> word) {
+		if (!line.empty() && line.size() + 1 + word.size() > columns) {
+			lines.push_back(std::move(line));
+			line.clear();
+		}
+		if (!line.empty()) line += ' ';
+		line += word;
+	}
+	if (!line.empty()) lines.push_back(std::move(line));
+	return lines;
 }
 
 Rect image_row_pane_button_rect(Rect row, std::size_t index) {
@@ -281,6 +305,7 @@ std::string pane_label(const AppState& state, PaneId id) {
 }
 
 bool command_active(const AppState& state, std::string_view name) {
+	if (name == "scratch") return state.scratchResults;
 	if (name == "single") return state.viewMode.kind == ViewModeKind::Single;
 	if (name == "side") return state.viewMode.kind == ViewModeKind::SideBySide;
 	if (name == "split") return state.viewMode.kind == ViewModeKind::Split;
@@ -332,12 +357,20 @@ const char* pixel_format_label(PixelFormat format) {
 	switch (format) {
 		case PixelFormat::YUV420P8: return "YUV420";
 		case PixelFormat::YUV420P10LE: return "YUV420-10";
+		case PixelFormat::YUV420P12LE: return "YUV420-12";
+		case PixelFormat::YUV420P14LE: return "YUV420-14";
 		case PixelFormat::YUV422P8: return "YUV422";
 		case PixelFormat::YUV422P10LE: return "YUV422-10";
+		case PixelFormat::YUV422P12LE: return "YUV422-12";
+		case PixelFormat::YUV422P14LE: return "YUV422-14";
 		case PixelFormat::YUV444P8: return "YUV444";
 		case PixelFormat::YUV444P10LE: return "YUV444-10";
+		case PixelFormat::YUV444P12LE: return "YUV444-12";
+		case PixelFormat::YUV444P14LE: return "YUV444-14";
 		case PixelFormat::Gray8: return "Gray";
 		case PixelFormat::Gray10LE: return "Gray10";
+		case PixelFormat::Gray12LE: return "Gray12";
+		case PixelFormat::Gray14LE: return "Gray14";
 	}
 	return "";
 }
@@ -359,7 +392,7 @@ std::string format_pixel_sample(const ImageObject& image, ImagePixelCoord coord)
 	}
 	const int chromaX = (is_420(raw.format) || is_422(raw.format)) ? coord.x / 2 : coord.x;
 	const int chromaY = is_420(raw.format) ? coord.y / 2 : coord.y;
-	const uint32_t neutral = sampleBytes == 1 ? 128u : 512u;
+	const uint32_t neutral = 1u << (bit_depth(raw.format) - 1);
 	const uint32_t u = pixel_sample_at(raw.planes[1], chromaX, chromaY, sampleBytes).value_or(neutral);
 	const uint32_t v = pixel_sample_at(raw.planes[2], chromaX, chromaY, sampleBytes).value_or(neutral);
 	oss << pixel_format_label(raw.format) << ' ' << *y << ',' << u << ',' << v;
@@ -414,12 +447,11 @@ void draw_image_list(std::vector<DrawCommand>& out, const AppState& state, Rect 
 	header += state.imageList.ascending ? " asc" : " desc";
 	push_text(out, Rect{rect.x + 12, rect.y + 10, rect.w - 24, 22}, std::move(header), TextColor);
 
-	float y = rect.y + 42;
+	const Rect content{rect.x, rect.y + 40.0f, rect.w, std::max(0.0f, rect.h - 40.0f)};
+	push_scissor(out, DrawCommandKind::ScissorBegin, content);
+	float y = rect.y + 42.0f - state.imageList.scrollOffset;
 	for (const ImageObject* imagePtr : ordered_images(state)) {
 		const ImageObject& image = *imagePtr;
-		if (y + 54 > rect.y + rect.h) {
-			break;
-		}
 		const Rect row{rect.x + 6, y - 2, rect.w - 12, 50};
 		const bool selected = image.id == state.selection.selectedImage;
 		if (selected) {
@@ -463,6 +495,7 @@ void draw_image_list(std::vector<DrawCommand>& out, const AppState& state, Rect 
 		}
 		y += 56;
 	}
+	push_scissor(out, DrawCommandKind::ScissorEnd, content);
 }
 
 void draw_run_details(std::vector<DrawCommand>& out, const AppState& state, const EncodeRun& run, Rect rect, float& y) {
@@ -492,8 +525,11 @@ void draw_run_details(std::vector<DrawCommand>& out, const AppState& state, cons
 		y += 20;
 	}
 	if (!run.error.empty() && y + 18 < rect.y + rect.h) {
-		push_text(out, Rect{rect.x + 12, y, rect.w - 24, 18}, "Error: " + run.error, Color{0.95f, 0.45f, 0.35f, 1.0f});
-		y += 20;
+		for (const std::string& line : wrap_tooltip("Error: " + run.error, std::max<std::size_t>(24, static_cast<std::size_t>((rect.w - 24) / 9)))) {
+			if (y + 18 >= rect.y + rect.h) break;
+			push_text(out, Rect{rect.x + 12, y, rect.w - 24, 18}, line, Color{0.95f, 0.45f, 0.35f, 1.0f});
+			y += 20;
+		}
 	}
 	if (run.finishedSeconds > run.startedSeconds && y + 18 < rect.y + rect.h) {
 		std::ostringstream duration;
@@ -517,6 +553,18 @@ void draw_run_details(std::vector<DrawCommand>& out, const AppState& state, cons
 				push_text(out, Rect{rect.x + 12, y, rect.w - 24, 18}, "Encode duration: " + encodedDuration.str(), MutedTextColor);
 				y += 20;
 			}
+			if (image->encoded->decodeSeconds > 0.0 && y + 18 < rect.y + rect.h) {
+				std::ostringstream duration;
+				duration << std::fixed << std::setprecision(3) << image->encoded->decodeSeconds << " s";
+				push_text(out, Rect{rect.x + 12, y, rect.w - 24, 18}, "Decode duration: " + duration.str(), MutedTextColor);
+				y += 20;
+			}
+			if (image->encoded->metricSeconds > 0.0 && y + 18 < rect.y + rect.h) {
+				std::ostringstream duration;
+				duration << std::fixed << std::setprecision(3) << image->encoded->metricSeconds << " s";
+				push_text(out, Rect{rect.x + 12, y, rect.w - 24, 18}, "Metric duration: " + duration.str(), MutedTextColor);
+				y += 20;
+			}
 			if (!image->encoded->outputPath.empty() && y + 18 < rect.y + rect.h) {
 				push_text(out, Rect{rect.x + 12, y, rect.w - 24, 18}, "Output: " + image->encoded->outputPath.string(), MutedTextColor);
 				y += 20;
@@ -534,7 +582,8 @@ void draw_run_details(std::vector<DrawCommand>& out, const AppState& state, cons
 }
 
 void draw_queue_panel(std::vector<DrawCommand>& out, const AppState& state, Rect rect, float& y) {
-	if (state.encodeRuns.empty() || y + 44 >= rect.y + rect.h) {
+	// Header plus an actual two-line row must fit in full.
+	if (state.encodeRuns.empty() || y + 62 > rect.y + rect.h) {
 		return;
 	}
 	push_text(out, Rect{rect.x + 12, y, rect.w - 24, 20}, "Encode queue", TextColor);
@@ -542,10 +591,10 @@ void draw_queue_panel(std::vector<DrawCommand>& out, const AppState& state, Rect
 	std::size_t shown = 0;
 	for (auto it = state.encodeRuns.rbegin(); it != state.encodeRuns.rend() && shown < 4; ++it) {
 		const EncodeRun& run = *it;
-		if (y + 34 >= rect.y + rect.h) {
+		if (y + 36 > rect.y + rect.h) {
 			break;
 		}
-		const Rect row{rect.x + 12, y, rect.w - 24, 30};
+		const Rect row{rect.x + 12, y, rect.w - 24, 36};
 		if (run.id == state.selection.selectedRun) {
 			push_rect(out, row, ActiveColor);
 			push_border(out, row, AccentColor);
@@ -554,7 +603,7 @@ void draw_queue_panel(std::vector<DrawCommand>& out, const AppState& state, Rect
 		if (const BackendInfo* backend = backend_by_id(state, run.backend)) {
 			title += "  " + backend->name;
 		}
-		push_text(out, Rect{row.x + 6, row.y + 2, row.w - 12, 14}, std::move(title), TextColor);
+		push_text(out, Rect{row.x + 6, row.y + 2, row.w - 12, 16}, std::move(title), TextColor);
 		std::string detail = encode_run_state_text(run.state);
 		if (run.finishedSeconds > run.startedSeconds) {
 			std::ostringstream duration;
@@ -564,8 +613,8 @@ void draw_queue_panel(std::vector<DrawCommand>& out, const AppState& state, Rect
 		if (run.producedImage) {
 			detail += "  result #" + std::to_string(run.producedImage->value);
 		}
-		push_text(out, Rect{row.x + 6, row.y + 16, row.w - 12, 12}, std::move(detail), MutedTextColor);
-		y += 34;
+		push_text(out, Rect{row.x + 6, row.y + 18, row.w - 12, 16}, std::move(detail), MutedTextColor);
+		y += 40;
 		++shown;
 	}
 	y += 6;
@@ -600,7 +649,9 @@ void draw_inspector(std::vector<DrawCommand>& out, const AppState& state, Rect r
 	push_border(out, rect, BorderColor);
 	push_text(out, Rect{rect.x + 12, rect.y + 10, rect.w - 24, 22}, "Encoder", TextColor);
 
-	float y = rect.y + 42;
+	const Rect content{rect.x, rect.y + 40.0f, rect.w, std::max(0.0f, rect.h - 40.0f)};
+	push_scissor(out, DrawCommandKind::ScissorBegin, content);
+	float y = rect.y + 42.0f - state.layout.inspectorScrollOffset;
 	const BackendInfo* backend = selected_backend(state);
 	if (backend == nullptr) {
 		push_text(out, Rect{rect.x + 12, y, rect.w - 24, 20}, "No backend available", MutedTextColor);
@@ -629,9 +680,8 @@ void draw_inspector(std::vector<DrawCommand>& out, const AppState& state, Rect r
 		}
 
 		std::string currentGroup;
-		int renderedParams = 0;
 		for (const EncoderParamInfo& param : backend->params) {
-			if (!param.relevantForStillImage || y + 44 > rect.y + rect.h - 120) {
+			if (!param.relevantForStillImage) {
 				continue;
 			}
 			if (param.group != currentGroup) {
@@ -639,12 +689,19 @@ void draw_inspector(std::vector<DrawCommand>& out, const AppState& state, Rect r
 				push_text(out, Rect{rect.x + 12, y + 4, rect.w - 24, 18}, currentGroup.empty() ? "Parameters" : currentGroup, TextColor);
 				y += 24;
 			}
-			push_text(out, Rect{rect.x + 12, y, rect.w * 0.46f, 18}, param.label, MutedTextColor);
+			const bool parameterEnabled = parameter_is_enabled(state, *backend, param);
+			const Color parameterColor = parameterEnabled ? MutedTextColor : Color{0.42f, 0.43f, 0.45f, 1.0f};
+			push_text(out, Rect{rect.x + 12, y, rect.w * 0.46f, 18}, param.label, parameterColor);
 			Rect control{rect.x + rect.w * 0.50f, y - 2, rect.w * 0.44f, 20};
-			push_rect(out, control, Color{0.11f, 0.12f, 0.13f, 1.0f});
+			push_rect(out, control, parameterEnabled ? Color{0.11f, 0.12f, 0.13f, 1.0f} : Color{0.07f, 0.075f, 0.08f, 1.0f});
 			push_border(out, control, BorderColor);
 			const ParamValue currentValue = current_param_value(state, backend->id, param);
 			std::string value = param_value_to_string(currentValue);
+			if (param.automaticIntValue) {
+				if (const int64_t* integer = std::get_if<int64_t>(&currentValue); integer != nullptr && *integer == *param.automaticIntValue) {
+					value = param.automaticLabel.empty() ? "Auto" : param.automaticLabel;
+				}
+			}
 			if (param.kind == ParamKind::Bool) {
 				value = value.empty() ? "off" : value;
 				const bool enabled = std::get_if<bool>(&currentValue) != nullptr && *std::get_if<bool>(&currentValue);
@@ -653,10 +710,6 @@ void draw_inspector(std::vector<DrawCommand>& out, const AppState& state, Rect r
 				push_border(out, checkbox, BorderColor);
 				push_text(out, Rect{control.x + 24, control.y + 3, control.w - 30, 16}, enabled ? "on" : "off", TextColor);
 				y += 24;
-				++renderedParams;
-				if (renderedParams >= 16) {
-					break;
-				}
 				continue;
 			} else if (param.kind == ParamKind::Enum && !param.enumValues.empty()) {
 				const auto it = std::find_if(param.enumValues.begin(), param.enumValues.end(), [&](const EnumValue& enumValue) {
@@ -677,17 +730,17 @@ void draw_inspector(std::vector<DrawCommand>& out, const AppState& state, Rect r
 				}
 			} else if (param.kind == ParamKind::Enum && param.enumValues.empty()) {
 				value = "unavailable";
-			} else if (param.kind == ParamKind::Int && param.intRange) {
+			} else if (param.kind == ParamKind::Int && param.intRange && !param.directNumericInput) {
 				const int64_t current = std::get_if<int64_t>(&currentValue) == nullptr ? param.intRange->min : *std::get_if<int64_t>(&currentValue);
 				const double denom = static_cast<double>(param.intRange->max - param.intRange->min);
 				const float ratio = denom <= 0.0 ? 0.0f : static_cast<float>(std::clamp((static_cast<double>(current - param.intRange->min)) / denom, 0.0, 1.0));
 				push_rect(out, Rect{control.x + 4, control.y + 8, std::max(0.0f, (control.w - 8) * ratio), 4}, AccentColor);
-			} else if (param.kind == ParamKind::Float && param.floatRange) {
+			} else if (param.kind == ParamKind::Float && param.floatRange && !param.directNumericInput) {
 				const double current = std::get_if<double>(&currentValue) == nullptr ? param.floatRange->min : *std::get_if<double>(&currentValue);
 				const double denom = param.floatRange->max - param.floatRange->min;
 				const float ratio = denom <= 0.0 ? 0.0f : static_cast<float>(std::clamp((current - param.floatRange->min) / denom, 0.0, 1.0));
 				push_rect(out, Rect{control.x + 4, control.y + 8, std::max(0.0f, (control.w - 8) * ratio), 4}, AccentColor);
-			} else if (param.kind == ParamKind::String) {
+			} else if (param.kind == ParamKind::String || param.directNumericInput) {
 				const std::string widgetId = "param:" + std::to_string(backend->id.value) + ":" + param.name;
 				if (state.interaction.focusedWidget == widgetId) {
 					push_border(out, control, FocusColor);
@@ -695,12 +748,8 @@ void draw_inspector(std::vector<DrawCommand>& out, const AppState& state, Rect r
 			} else if (value.empty()) {
 				value = "-";
 			}
-			push_text(out, Rect{control.x + 6, control.y + 3, control.w - 12, 16}, std::move(value), TextColor);
+			push_text(out, Rect{control.x + 6, control.y + 3, control.w - 12, 16}, std::move(value), parameterEnabled ? TextColor : parameterColor);
 			y += 24;
-			++renderedParams;
-			if (renderedParams >= 16) {
-				break;
-			}
 		}
 		if (backend->params.empty() && backend->capabilities.available) {
 			push_text(out, Rect{rect.x + 12, y, rect.w - 24, 18}, "Capability query pending", MutedTextColor);
@@ -747,7 +796,19 @@ void draw_inspector(std::vector<DrawCommand>& out, const AppState& state, Rect r
 			if (image->encoded->encodeSeconds > 0.0) {
 				std::ostringstream duration;
 				duration << std::fixed << std::setprecision(3) << image->encoded->encodeSeconds << " s";
-				push_text(out, Rect{rect.x + 12, y, rect.w - 24, 18}, "Duration: " + duration.str(), MutedTextColor);
+				push_text(out, Rect{rect.x + 12, y, rect.w - 24, 18}, "Encode duration: " + duration.str(), MutedTextColor);
+				y += 20;
+			}
+			if (image->encoded->decodeSeconds > 0.0) {
+				std::ostringstream duration;
+				duration << std::fixed << std::setprecision(3) << image->encoded->decodeSeconds << " s";
+				push_text(out, Rect{rect.x + 12, y, rect.w - 24, 18}, "Decode duration: " + duration.str(), MutedTextColor);
+				y += 20;
+			}
+			if (image->encoded->metricSeconds > 0.0) {
+				std::ostringstream duration;
+				duration << std::fixed << std::setprecision(3) << image->encoded->metricSeconds << " s";
+				push_text(out, Rect{rect.x + 12, y, rect.w - 24, 18}, "Metric duration: " + duration.str(), MutedTextColor);
 				y += 20;
 			}
 			if (!image->encoded->outputPath.empty() && y + 18 < rect.y + rect.h) {
@@ -816,6 +877,118 @@ void draw_inspector(std::vector<DrawCommand>& out, const AppState& state, Rect r
 			}
 		}
 	}
+	push_scissor(out, DrawCommandKind::ScissorEnd, content);
+}
+
+void draw_parameter_tooltip(std::vector<DrawCommand>& out, const AppState& state, const LayoutResult& layout) {
+	const BackendInfo* backend = selected_backend(state);
+	if (backend == nullptr || !contains(layout.inspector, state.interaction.lastPointer)) {
+		return;
+	}
+	float y = layout.inspector.y + 42.0f + 22.0f - state.layout.inspectorScrollOffset;
+	y += static_cast<float>(state.backends.size()) * 24.0f + 8.0f + 22.0f;
+	std::string currentGroup;
+	const EncoderParamInfo* hovered = nullptr;
+	for (const EncoderParamInfo& param : backend->params) {
+		if (!param.relevantForStillImage) continue;
+		if (param.group != currentGroup) {
+			currentGroup = param.group;
+			y += 24.0f;
+		}
+		const Rect row{layout.inspector.x + 8.0f, y - 3.0f, layout.inspector.w - 16.0f, 22.0f};
+		if (contains(row, state.interaction.lastPointer) &&
+		    state.interaction.lastPointer.y >= layout.inspector.y + 40.0f) {
+			hovered = &param;
+			break;
+		}
+		y += 24.0f;
+	}
+	if (hovered == nullptr) return;
+	const std::size_t overlayStart = out.size();
+
+	std::string defaultText = std::visit([](const auto& value) -> std::string {
+		using T = std::decay_t<decltype(value)>;
+		if constexpr (std::is_same_v<T, std::monostate>) {
+			return "not specified";
+		} else if constexpr (std::is_same_v<T, bool>) {
+			return value ? "on" : "off";
+		} else if constexpr (std::is_same_v<T, double>) {
+			std::ostringstream out;
+			out << value;
+			return out.str();
+		} else if constexpr (std::is_same_v<T, int64_t>) {
+			return std::to_string(value);
+		} else {
+			return value.empty() ? "explicitly unset" : value;
+		}
+	}, hovered->defaultValue);
+	if (hovered->automaticIntValue) {
+		if (const int64_t* integer = std::get_if<int64_t>(&hovered->defaultValue); integer != nullptr && *integer == *hovered->automaticIntValue) {
+			defaultText = (hovered->automaticLabel.empty() ? "Auto" : hovered->automaticLabel) + " (application sentinel " + std::to_string(*integer) + "; not written to the bitstream)";
+		}
+	}
+	std::vector<std::string> lines;
+	lines.push_back(hovered->label + " (" + hovered->name + ")");
+	lines.push_back("Application default: " + defaultText);
+	if (const std::string reason = parameter_disabled_reason(state, *backend, *hovered); !reason.empty()) {
+		lines.push_back("Disabled: " + reason);
+	}
+	const std::vector<std::string> helpLines = wrap_tooltip(hovered->help.empty() ? "No description is available for this option." : hovered->help);
+	lines.insert(lines.end(), helpLines.begin(), helpLines.end());
+	const float width = std::min(560.0f, static_cast<float>(state.interaction.framebufferWidth) - 32.0f);
+	const float height = 20.0f + static_cast<float>(lines.size()) * 24.0f;
+	float x = layout.inspector.x - width - 12.0f;
+	if (x < 12.0f) x = std::min(layout.inspector.x + layout.inspector.w + 12.0f, static_cast<float>(state.interaction.framebufferWidth) - width - 12.0f);
+	float tooltipY = std::min(state.interaction.lastPointer.y + 18.0f, static_cast<float>(state.interaction.framebufferHeight) - height - 12.0f);
+	x = std::max(12.0f, x);
+	tooltipY = std::max(12.0f, tooltipY);
+	const Rect box{x, tooltipY, width, height};
+	push_rect(out, box, Color{0.025f, 0.028f, 0.034f, 1.0f});
+	push_border(out, box, FocusColor);
+	float lineY = box.y + 8.0f;
+	for (std::size_t i = 0; i < lines.size(); ++i) {
+		push_text(out, Rect{box.x + 10.0f, lineY, box.w - 20.0f, 18.0f}, lines[i], i < 2 ? TextColor : MutedTextColor);
+		lineY += 24.0f;
+	}
+	for (std::size_t i = overlayStart; i < out.size(); ++i) out[i].layer = 1;
+}
+
+void draw_image_tooltip(std::vector<DrawCommand>& out, const AppState& state, const LayoutResult& layout) {
+	if (!contains(layout.imageList, state.interaction.lastPointer) || state.interaction.lastPointer.y < layout.imageList.y + 40.0f) return;
+	float y = layout.imageList.y + 42.0f - state.imageList.scrollOffset;
+	const ImageObject* hovered = nullptr;
+	for (const ImageObject* image : ordered_images(state)) {
+		if (contains(Rect{layout.imageList.x + 6, y - 2, layout.imageList.w - 12, 50}, state.interaction.lastPointer)) {
+			hovered = image;
+			break;
+		}
+		y += 56.0f;
+	}
+	if (hovered == nullptr) return;
+	const std::size_t overlayStart = out.size();
+	std::vector<std::string> lines{hovered->displayName, std::to_string(hovered->width) + " x " + std::to_string(hovered->height) + "  " + pixel_format_label(hovered->pixelFormat)};
+	if (hovered->encoded) {
+		lines.push_back("Encoded size: " + format_bytes_both(hovered->encoded->byteSize));
+		lines.push_back("Backend: " + hovered->encoded->backendName + "  codec: " + hovered->encoded->codecName);
+		for (const ParamSummary& param : hovered->encoded->keyParams) {
+			if (lines.size() >= 8) break;
+			lines.push_back(param.name + " = " + param.value);
+		}
+	}
+	lines.push_back("Select then use Delete to remove this entry.");
+	const float width = std::min(520.0f, static_cast<float>(state.interaction.framebufferWidth) - 32.0f);
+	const float height = 16.0f + static_cast<float>(lines.size()) * 20.0f;
+	float x = std::min(state.interaction.lastPointer.x + 18.0f, static_cast<float>(state.interaction.framebufferWidth) - width - 12.0f);
+	float tooltipY = std::min(state.interaction.lastPointer.y + 18.0f, static_cast<float>(state.interaction.framebufferHeight) - height - 12.0f);
+	const Rect box{std::max(12.0f, x), std::max(12.0f, tooltipY), width, height};
+	push_rect(out, box, Color{0.025f, 0.028f, 0.034f, 1.0f});
+	push_border(out, box, FocusColor);
+	float lineY = box.y + 8.0f;
+	for (std::size_t i = 0; i < lines.size(); ++i) {
+		push_text(out, Rect{box.x + 10.0f, lineY, box.w - 20.0f, 18.0f}, lines[i], i == 0 ? TextColor : MutedTextColor);
+		lineY += 20.0f;
+	}
+	for (std::size_t i = overlayStart; i < out.size(); ++i) out[i].layer = 1;
 }
 
 void draw_viewer(std::vector<DrawCommand>& out, const AppState& state, const LayoutResult& layout, const ResourceSnapshot& resources, double timeSeconds) {
@@ -931,7 +1104,8 @@ std::vector<DrawCommand> build_draw_list(
 			push_rect(out, buttonRect, ActiveColor);
 			push_border(out, buttonRect, AccentColor);
 		}
-		push_text(out, Rect{buttonRect.x + 8.0f, buttonRect.y + 6.0f, buttonRect.w - 16.0f, buttonRect.h - 10.0f}, button.label, command_active(state, button.name) ? TextColor : MutedTextColor);
+		const char* label = std::string_view{button.name} == "scratch" && state.scratchResults ? "Scratch mode" : button.label;
+		push_text(out, Rect{buttonRect.x + 8.0f, buttonRect.y + 6.0f, buttonRect.w - 16.0f, buttonRect.h - 10.0f}, label, command_active(state, button.name) ? TextColor : MutedTextColor);
 	}
 	draw_image_list(out, state, layout.imageList);
 	draw_viewer(out, state, layout, resources, timeSeconds);
@@ -1001,7 +1175,13 @@ std::vector<DrawCommand> build_draw_list(
 			}
 		}
 	}
-	push_text(out, Rect{layout.statusBar.x + 12, layout.statusBar.y + 6, layout.statusBar.w - 24, 18}, std::move(status), MutedTextColor);
+	if (!state.errors.empty()) {
+		const AppError& error = state.errors.front();
+		status = "ERROR [" + error.subsystem + "/" + error.operation + "]: " + error.message + "  (click to dismiss)";
+	}
+	push_text(out, Rect{layout.statusBar.x + 12, layout.statusBar.y + 6, layout.statusBar.w - 24, 18}, std::move(status), state.errors.empty() ? MutedTextColor : Color{0.98f, 0.55f, 0.4f, 1.0f});
+	draw_parameter_tooltip(out, state, layout);
+	draw_image_tooltip(out, state, layout);
 	return out;
 }
 

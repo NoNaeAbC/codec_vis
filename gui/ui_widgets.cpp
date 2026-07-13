@@ -1,6 +1,7 @@
 #include "ui_widgets.hpp"
 
 #include "image_list_model.hpp"
+#include "encoder_param_state.hpp"
 #include "viewer_model.hpp"
 
 #include <algorithm>
@@ -11,6 +12,10 @@ namespace {
 
 bool contains(Rect rect, Point point) {
 	return point.x >= rect.x && point.y >= rect.y && point.x < rect.x + rect.w && point.y < rect.y + rect.h;
+}
+
+bool intersects(Rect a, Rect b) {
+	return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
 }
 
 const BackendInfo* selected_backend(const AppState& state) {
@@ -38,11 +43,11 @@ WidgetKind widget_kind_for_param(const EncoderParamInfo& param) {
 		case ParamKind::Bool:
 			return WidgetKind::Toggle;
 		case ParamKind::Int:
-			return param.intRange ? WidgetKind::SliderInt : WidgetKind::NumericInput;
+			return param.intRange && !param.directNumericInput ? WidgetKind::SliderInt : WidgetKind::NumericInput;
 		case ParamKind::Float:
-			return param.floatRange ? WidgetKind::SliderFloat : WidgetKind::NumericInput;
+			return param.floatRange && !param.directNumericInput ? WidgetKind::SliderFloat : WidgetKind::NumericInput;
 		case ParamKind::Enum:
-			return WidgetKind::Dropdown;
+			return WidgetKind::SelectionPane;
 		case ParamKind::String:
 			return WidgetKind::TextInput;
 	}
@@ -84,18 +89,20 @@ std::vector<WidgetInfo> collect_widgets(const AppState& state, const LayoutResul
 		{834, 60, "grid"},
 		{900, 52, "fit"},
 		{958, 64, "100"},
+		{1028, 52, "delete"},
 	};
 	for (const Button& button : buttons) {
 		push_widget(out, state, std::string{"command:"} + button.name, WidgetKind::Button, Rect{layout.commandBar.x + button.x, layout.commandBar.y, button.w, layout.commandBar.h});
 	}
 
 	push_widget(out, state, "image-list:sort", WidgetKind::TableList, Rect{layout.imageList.x, layout.imageList.y, layout.imageList.w, 40}, layout.imageList.w > 0.0f);
-	float y = layout.imageList.y + 42;
+	float y = layout.imageList.y + 42.0f - state.imageList.scrollOffset;
+	const Rect imageListContent{layout.imageList.x, layout.imageList.y + 40.0f, layout.imageList.w, std::max(0.0f, layout.imageList.h - 40.0f)};
 	for (const ImageObject* image : ordered_images(state)) {
-		if (y + 54 > layout.imageList.y + layout.imageList.h) {
-			break;
+		const Rect row{layout.imageList.x + 6, y - 2, layout.imageList.w - 12, 50};
+		if (intersects(row, imageListContent)) {
+			push_widget(out, state, "image-row:" + std::to_string(image->id.value), WidgetKind::TableList, row, layout.imageList.w > 0.0f);
 		}
-		push_widget(out, state, "image-row:" + std::to_string(image->id.value), WidgetKind::TableList, Rect{layout.imageList.x + 6, y - 2, layout.imageList.w - 12, 50}, layout.imageList.w > 0.0f);
 		y += 56;
 	}
 
@@ -109,17 +116,21 @@ std::vector<WidgetInfo> collect_widgets(const AppState& state, const LayoutResul
 	}
 
 	const BackendInfo* backend = selected_backend(state);
-	y = layout.inspector.y + 42.0f + 22.0f;
+	const Rect inspectorContent{layout.inspector.x, layout.inspector.y + 40.0f, layout.inspector.w, std::max(0.0f, layout.inspector.h - 40.0f)};
+	y = layout.inspector.y + 42.0f + 22.0f - state.layout.inspectorScrollOffset;
 	for (const BackendInfo& candidate : state.backends) {
-		push_widget(out, state, "backend:" + std::to_string(candidate.id.value), WidgetKind::Button, backend_row_rect(layout.inspector, y), true);
+		const Rect row = backend_row_rect(layout.inspector, y);
+		if (intersects(row, inspectorContent)) {
+			push_widget(out, state, "backend:" + std::to_string(candidate.id.value), WidgetKind::Button, row, true);
+		}
 		y += 24.0f;
 	}
 	if (backend != nullptr) {
 		y = backend_selector_end_y(state, layout.inspector) + 22.0f;
+		y -= state.layout.inspectorScrollOffset;
 		std::string currentGroup;
-		int renderedParams = 0;
 		for (const EncoderParamInfo& param : backend->params) {
-			if (!param.relevantForStillImage || y + 44 > layout.inspector.y + layout.inspector.h - 120) {
+			if (!param.relevantForStillImage) {
 				continue;
 			}
 			if (param.group != currentGroup) {
@@ -127,12 +138,10 @@ std::vector<WidgetInfo> collect_widgets(const AppState& state, const LayoutResul
 				y += 24;
 			}
 			Rect control{layout.inspector.x + layout.inspector.w * 0.50f, y - 2, layout.inspector.w * 0.44f, 20};
-			push_widget(out, state, "param:" + std::to_string(backend->id.value) + ":" + param.name, widget_kind_for_param(param), control, backend->capabilities.available && param.name != "implementation");
-			y += 24;
-			++renderedParams;
-			if (renderedParams >= 16) {
-				break;
+			if (intersects(control, inspectorContent)) {
+				push_widget(out, state, "param:" + std::to_string(backend->id.value) + ":" + param.name, widget_kind_for_param(param), control, backend->capabilities.available && param.name != "implementation" && parameter_is_enabled(state, *backend, param));
 			}
+			y += 24;
 		}
 	}
 

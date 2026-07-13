@@ -13,6 +13,8 @@ namespace codec_gui::gui {
 		Rect uv;
 		Color color;
 		bool elision = false;
+		int layer = 0;
+		Rect clip{-1000000.0f, -1000000.0f, 2000000.0f, 2000000.0f};
 	};
 
 	struct TextAtlas {
@@ -25,7 +27,8 @@ namespace codec_gui::gui {
 	[[nodiscard]] TextAtlas build_text_atlas(
 		const std::vector<DrawCommand>& commands,
 		TextShaper& shaper,
-		int atlasWidth = 1024
+		int atlasWidth = 1024,
+		float deviceScale = 1.0f
 	);
 
 } // namespace codec_gui::gui

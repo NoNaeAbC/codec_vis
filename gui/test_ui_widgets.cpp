@@ -40,6 +40,23 @@ AppState make_state() {
 	name.kind = ParamKind::String;
 	name.defaultValue = std::string{"frog"};
 	backend.params.push_back(name);
+	EncoderParamInfo mode;
+	mode.name = "rate-control";
+	mode.label = "Rate control";
+	mode.group = "Rate Control";
+	mode.kind = ParamKind::Enum;
+	mode.defaultValue = std::string{"crf"};
+	mode.enumValues = {{"qp", "QP"}, {"crf", "CRF"}};
+	backend.params.push_back(mode);
+	EncoderParamInfo qp;
+	qp.name = "qp";
+	qp.label = "QP";
+	qp.group = "Rate Control";
+	qp.kind = ParamKind::Int;
+	qp.defaultValue = int64_t{22};
+	qp.intRange = IntRange{0, 51, 1};
+	qp.enabledWhen = {{"rate-control", {"qp"}, "QP mode only"}};
+	backend.params.push_back(qp);
 	state.backends.push_back(backend);
 	state.selection.selectedBackend = backend.id;
 	return state;
@@ -56,7 +73,7 @@ const WidgetInfo* find_widget(const std::vector<WidgetInfo>& widgets, const std:
 
 int main() {
 	AppState state = make_state();
-	LayoutResult layout = compute_layout(state.layout, 1280, 720, 1.0f);
+	LayoutResult layout = compute_layout(state.layout, 1920, 1080, 1.0f);
 	state.interaction.lastPointer = Point{150, 20};
 	state.interaction.focusedWidget = "param:1:preset-name";
 
@@ -76,6 +93,17 @@ int main() {
 	assert(backend != nullptr);
 	assert(backend->kind == WidgetKind::Button);
 	assert(backend->enabled);
+	const WidgetInfo* disabledQp = find_widget(widgets, "param:1:qp");
+	assert(disabledQp != nullptr);
+	assert(!disabledQp->enabled);
+	Action selectQpMode;
+	selectQpMode.kind = ActionKind::SetEncoderParam;
+	selectQpMode.backend = BackendId{1};
+	selectQpMode.param = {"rate-control", std::string{"qp"}};
+	state = update(std::move(state), selectQpMode).state;
+	const std::vector<WidgetInfo> updatedWidgets = collect_widgets(state, layout);
+	const WidgetInfo* enabledQp = find_widget(updatedWidgets, "param:1:qp");
+	assert(enabledQp != nullptr && enabledQp->enabled);
 
 	Action focus;
 	focus.kind = ActionKind::SetEncoderParam;
@@ -89,13 +117,18 @@ int main() {
 	typed.text = "x";
 	state = update(std::move(state), typed).state;
 	assert(state.encoderConfigs.size() == 1);
-	assert(std::get<std::string>(state.encoderConfigs.front().params.front().value) == "frogx");
+	auto presetValue = [&]() -> const EncoderParam& {
+		const auto it = std::find_if(state.encoderConfigs.front().params.begin(), state.encoderConfigs.front().params.end(), [](const EncoderParam& param) { return param.name == "preset-name"; });
+		assert(it != state.encoderConfigs.front().params.end());
+		return *it;
+	};
+	assert(std::get<std::string>(presetValue().value) == "frogx");
 
 	Action backspace;
 	backspace.kind = ActionKind::KeyPressed;
 	backspace.text = "backspace";
 	state = update(std::move(state), backspace).state;
-	assert(std::get<std::string>(state.encoderConfigs.front().params.front().value) == "frog");
+	assert(std::get<std::string>(presetValue().value) == "frog");
 
 	return 0;
 }

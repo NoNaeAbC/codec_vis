@@ -22,9 +22,9 @@ int main() {
 	assert(chosen.path == root / "frog image.jpg");
 
 	Action canceledSave = action_from_save_portal_response(ImageId{9}, 2, {});
-	assert(canceledSave.kind == ActionKind::SaveFailed);
+	assert(canceledSave.kind == ActionKind::SaveCanceled);
 	assert(canceledSave.image == ImageId{9});
-	assert(!canceledSave.text.empty());
+	assert(canceledSave.text.empty());
 	Action save = action_from_save_portal_response(ImageId{9}, 0, {"file://" + (root / "result.ivf").string()});
 	assert(save.kind == ActionKind::SaveEncodedResult);
 	assert(save.image == ImageId{9});

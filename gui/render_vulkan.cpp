@@ -7,6 +7,7 @@
 #include <vulkan/vulkan_wayland.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <fstream>
@@ -125,8 +126,8 @@ VkExtent2D choose_extent(const VkSurfaceCapabilitiesKHR& caps, const WaylandWind
 		return caps.currentExtent;
 	}
 	VkExtent2D extent{
-		static_cast<uint32_t>(std::max(1, window.width())),
-		static_cast<uint32_t>(std::max(1, window.height())),
+		static_cast<uint32_t>(std::max(1, window.framebuffer_width())),
+		static_cast<uint32_t>(std::max(1, window.framebuffer_height())),
 	};
 	extent.width = std::clamp(extent.width, caps.minImageExtent.width, caps.maxImageExtent.width);
 	extent.height = std::clamp(extent.height, caps.minImageExtent.height, caps.maxImageExtent.height);
@@ -245,16 +246,20 @@ void image_barrier(
 	vkCmdPipelineBarrier(commandBuffer, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
-VkRect2D clamp_scissor(Rect rect, VkExtent2D extent) {
-	const float x0f = std::clamp(rect.x, 0.0f, static_cast<float>(extent.width));
-	const float y0f = std::clamp(rect.y, 0.0f, static_cast<float>(extent.height));
-	const float x1f = std::clamp(rect.x + std::max(0.0f, rect.w), 0.0f, static_cast<float>(extent.width));
-	const float y1f = std::clamp(rect.y + std::max(0.0f, rect.h), 0.0f, static_cast<float>(extent.height));
-	const int32_t x0 = static_cast<int32_t>(x0f);
-	const int32_t y0 = static_cast<int32_t>(y0f);
-	const uint32_t w = static_cast<uint32_t>(std::max(0.0f, x1f - x0f));
-	const uint32_t h = static_cast<uint32_t>(std::max(0.0f, y1f - y0f));
-	return VkRect2D{{x0, y0}, {w, h}};
+VkRect2D clamp_scissor(Rect rect, VkExtent2D extent, float scale = 1.0f) {
+	const float x0f = std::clamp(rect.x * scale, 0.0f, static_cast<float>(extent.width));
+	const float y0f = std::clamp(rect.y * scale, 0.0f, static_cast<float>(extent.height));
+	const float x1f = std::clamp((rect.x + std::max(0.0f, rect.w)) * scale, 0.0f, static_cast<float>(extent.width));
+	const float y1f = std::clamp((rect.y + std::max(0.0f, rect.h)) * scale, 0.0f, static_cast<float>(extent.height));
+	const int32_t x0 = static_cast<int32_t>(std::floor(x0f));
+	const int32_t y0 = static_cast<int32_t>(std::floor(y0f));
+	const int32_t x1 = static_cast<int32_t>(std::ceil(x1f));
+	const int32_t y1 = static_cast<int32_t>(std::ceil(y1f));
+	return VkRect2D{{x0, y0}, {static_cast<uint32_t>(std::max(0, x1 - x0)), static_cast<uint32_t>(std::max(0, y1 - y0))}};
+}
+
+Rect scaled_rect(Rect rect, float scale) {
+	return Rect{rect.x * scale, rect.y * scale, rect.w * scale, rect.h * scale};
 }
 
 std::size_t swapchain_bytes_per_pixel(VkFormat format) {
@@ -330,6 +335,8 @@ struct VulkanRenderer::Impl {
 	VkSwapchainKHR swapchain = VK_NULL_HANDLE;
 	VkFormat swapchainFormat = VK_FORMAT_UNDEFINED;
 	VkExtent2D swapchainExtent{};
+	VkExtent2D logicalExtent{};
+	float outputScale = 1.0f;
 	bool swapchainTransferSrc = false;
 	std::vector<VkImage> swapchainImages;
 	std::vector<VkImageView> swapchainImageViews;
@@ -348,6 +355,8 @@ struct VulkanRenderer::Impl {
 	VkPipeline textPipeline = VK_NULL_HANDLE;
 	VkPipelineLayout imagePipelineLayout = VK_NULL_HANDLE;
 	VkPipeline imagePipeline = VK_NULL_HANDLE;
+	TransientTextResources text;
+	std::vector<uint8_t> textAlpha;
 	std::vector<GpuImageResource> images;
 	std::optional<Rect> pendingProbeRect;
 	bool lastProbeNonblank = false;
@@ -644,6 +653,8 @@ VulkanRenderer VulkanRenderer::create(const WaylandWindow& window) {
 		}
 		impl->swapchainFormat = surfaceFormat.format;
 		impl->swapchainExtent = choose_extent(surfaceCaps, window);
+		impl->logicalExtent = {static_cast<uint32_t>(std::max(1, window.width())), static_cast<uint32_t>(std::max(1, window.height()))};
+		impl->outputScale = window.output_scale();
 		impl->swapchainTransferSrc = (surfaceCaps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
 
 		VkSwapchainCreateInfoKHR swapchainInfo{};
@@ -983,6 +994,8 @@ void VulkanRenderer::recreate_swapchain(const WaylandWindow& window) {
 		imageCount = std::min(imageCount, surfaceCaps.maxImageCount);
 	}
 	impl_->swapchainExtent = choose_extent(surfaceCaps, window);
+	impl_->logicalExtent = {static_cast<uint32_t>(std::max(1, window.width())), static_cast<uint32_t>(std::max(1, window.height()))};
+	impl_->outputScale = window.output_scale();
 	impl_->swapchainTransferSrc = (surfaceCaps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
 	VkSwapchainKHR oldSwapchain = impl_->swapchain;
 	VkSwapchainCreateInfoKHR swapchainInfo{};
@@ -1274,16 +1287,22 @@ void VulkanRenderer::render_draw_list(const std::vector<DrawCommand>& commands, 
 	}
 	VkSemaphore renderFinished = impl_->renderFinishedByImage.at(imageIndex);
 
-	TransientTextResources text;
+	bool uploadText = false;
 	if (textAtlas != nullptr && impl_->textPipeline != VK_NULL_HANDLE) {
-		text = create_transient_text(
-			impl_->device,
-			impl_->physicalDevice,
-			impl_->descriptorPool,
-			impl_->textDescriptorSetLayout,
-			*textAtlas
-		);
+		if (impl_->text.image == VK_NULL_HANDLE || impl_->textAlpha != textAtlas->alpha) {
+			destroy_transient_text(impl_->device, impl_->descriptorPool, impl_->text);
+			impl_->text = create_transient_text(
+				impl_->device,
+				impl_->physicalDevice,
+				impl_->descriptorPool,
+				impl_->textDescriptorSetLayout,
+				*textAtlas
+			);
+			impl_->textAlpha = textAtlas->alpha;
+			uploadText = impl_->text.image != VK_NULL_HANDLE;
+		}
 	}
+	TransientTextResources& text = impl_->text;
 	const std::optional<Rect> probeRect = impl_->pendingProbeRect;
 	impl_->pendingProbeRect.reset();
 	impl_->lastProbeNonblank = false;
@@ -1313,7 +1332,7 @@ void VulkanRenderer::render_draw_list(const std::vector<DrawCommand>& commands, 
 	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
 	vk_checked(vkBeginCommandBuffer(impl_->commandBuffer, &beginInfo), "vkBeginCommandBuffer");
 
-	if (text.image != VK_NULL_HANDLE) {
+	if (text.image != VK_NULL_HANDLE && uploadText) {
 		image_barrier(
 			impl_->commandBuffer,
 			text.image,
@@ -1382,7 +1401,7 @@ void VulkanRenderer::render_draw_list(const std::vector<DrawCommand>& commands, 
 		RectPushConstants push{
 			{rect.x, rect.y, rect.w, rect.h},
 			{color.r, color.g, color.b, color.a},
-			{static_cast<float>(impl_->swapchainExtent.width), static_cast<float>(impl_->swapchainExtent.height)}
+			{static_cast<float>(impl_->logicalExtent.width), static_cast<float>(impl_->logicalExtent.height)}
 		};
 		vkCmdPushConstants(impl_->commandBuffer, impl_->rectPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 		vkCmdDraw(impl_->commandBuffer, 6, 1, 0, 0);
@@ -1399,14 +1418,19 @@ void VulkanRenderer::render_draw_list(const std::vector<DrawCommand>& commands, 
 			{command.rect.x, command.rect.y, command.rect.w, command.rect.h},
 			{command.uvRect.x, command.uvRect.y, command.uvRect.w, command.uvRect.h},
 			{command.color.r, command.color.g, command.color.b, command.opacity},
-			{static_cast<float>(impl_->swapchainExtent.width), static_cast<float>(impl_->swapchainExtent.height)}
+			{static_cast<float>(impl_->logicalExtent.width), static_cast<float>(impl_->logicalExtent.height)}
 		};
 		vkCmdPushConstants(impl_->commandBuffer, impl_->imagePipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 		vkCmdDraw(impl_->commandBuffer, 6, 1, 0, 0);
 		vkCmdBindPipeline(impl_->commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, impl_->rectPipeline);
 	};
-	for (const DrawCommand& command : commands) {
-		switch (command.kind) {
+	auto draw_geometry_layer = [&](int layer) {
+		scissorStack.assign(1, fullScissor);
+		vkCmdSetScissor(impl_->commandBuffer, 0, 1, &fullScissor);
+		vkCmdBindPipeline(impl_->commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, impl_->rectPipeline);
+		for (const DrawCommand& command : commands) {
+			if (command.layer != layer) continue;
+			switch (command.kind) {
 			case DrawCommandKind::Rect:
 				draw_rect(command.rect, command.color);
 				break;
@@ -1422,7 +1446,7 @@ void VulkanRenderer::render_draw_list(const std::vector<DrawCommand>& commands, 
 				draw_image(command);
 				break;
 			case DrawCommandKind::ScissorBegin: {
-				VkRect2D scissor = clamp_scissor(command.rect, impl_->swapchainExtent);
+				VkRect2D scissor = clamp_scissor(command.rect, impl_->swapchainExtent, impl_->outputScale);
 				scissorStack.push_back(scissor);
 				vkCmdSetScissor(impl_->commandBuffer, 0, 1, &scissor);
 				break;
@@ -1435,27 +1459,33 @@ void VulkanRenderer::render_draw_list(const std::vector<DrawCommand>& commands, 
 				break;
 			case DrawCommandKind::Text:
 				break;
+			}
 		}
-	}
-
-	if (text.image != VK_NULL_HANDLE && textAtlas != nullptr) {
-		vkCmdSetScissor(impl_->commandBuffer, 0, 1, &fullScissor);
+	};
+	auto draw_text_layer = [&](int layer) {
+		if (text.image == VK_NULL_HANDLE || textAtlas == nullptr) return;
 		vkCmdBindPipeline(impl_->commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, impl_->textPipeline);
 		vkCmdBindDescriptorSets(impl_->commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, impl_->textPipelineLayout, 0, 1, &text.descriptorSet, 0, nullptr);
 		for (const GlyphQuad& quad : textAtlas->quads) {
-			if (quad.rect.w <= 0.0f || quad.rect.h <= 0.0f || quad.color.a <= 0.0f) {
+			if (quad.layer != layer || quad.rect.w <= 0.0f || quad.rect.h <= 0.0f || quad.color.a <= 0.0f) {
 				continue;
 			}
+			const VkRect2D clip = clamp_scissor(quad.clip, impl_->swapchainExtent, impl_->outputScale);
+			vkCmdSetScissor(impl_->commandBuffer, 0, 1, &clip);
 			TextPushConstants push{
 				{quad.rect.x, quad.rect.y, quad.rect.w, quad.rect.h},
 				{quad.uv.x, quad.uv.y, quad.uv.w, quad.uv.h},
 				{quad.color.r, quad.color.g, quad.color.b, quad.color.a},
-				{static_cast<float>(impl_->swapchainExtent.width), static_cast<float>(impl_->swapchainExtent.height)}
+				{static_cast<float>(impl_->logicalExtent.width), static_cast<float>(impl_->logicalExtent.height)}
 			};
 			vkCmdPushConstants(impl_->commandBuffer, impl_->textPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 			vkCmdDraw(impl_->commandBuffer, 6, 1, 0, 0);
 		}
-	}
+	};
+	draw_geometry_layer(0);
+	draw_text_layer(0);
+	draw_geometry_layer(1);
+	draw_text_layer(1);
 
 	vkCmdEndRenderPass(impl_->commandBuffer);
 	if (probeRect) {
@@ -1525,11 +1555,10 @@ void VulkanRenderer::render_draw_list(const std::vector<DrawCommand>& commands, 
 		vk_checked(vkMapMemory(impl_->device, readbackMemory, 0, readbackSize, 0, &mapped), "vkMapMemory");
 		std::memcpy(pixels.data(), mapped, pixels.size());
 		vkUnmapMemory(impl_->device, readbackMemory);
-		impl_->lastProbeNonblank = readback_has_non_background_pixels(pixels, impl_->swapchainExtent, impl_->swapchainFormat, *probeRect);
+		impl_->lastProbeNonblank = readback_has_non_background_pixels(pixels, impl_->swapchainExtent, impl_->swapchainFormat, scaled_rect(*probeRect, impl_->outputScale));
 		vkDestroyBuffer(impl_->device, readbackBuffer, nullptr);
 		vkFreeMemory(impl_->device, readbackMemory, nullptr);
 	}
-	destroy_transient_text(impl_->device, impl_->descriptorPool, text);
 }
 
 bool VulkanRenderer::render_draw_list_pixel_probe(
@@ -1551,6 +1580,8 @@ void VulkanRenderer::reset() {
 	}
 	if (impl_->device != VK_NULL_HANDLE) {
 		vkDeviceWaitIdle(impl_->device);
+		destroy_transient_text(impl_->device, impl_->descriptorPool, impl_->text);
+		impl_->textAlpha.clear();
 		for (GpuImageResource& image : impl_->images) {
 			destroy_gpu_image(impl_->device, impl_->descriptorPool, image);
 		}

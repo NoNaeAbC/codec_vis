@@ -89,9 +89,16 @@ std::vector<Action> execute_command(const Command& command, const AppState& stat
 
 				EncodeResult encode = run_backend_encode(*backend, *image->decoded, command.params);
 				encode.metadata.run = command.run;
+				const auto decodeStart = std::chrono::steady_clock::now();
 				DecodeResult preview = backend->decodePreview(encode.encoded);
+				encode.metadata.decodeSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - decodeStart).count();
 				if (preview.image) {
-					MetricResult metric = compute_quality_metrics(*image->decoded, *preview.image);
+					auto decoded = std::make_shared<RawImage>(*preview.image);
+					decoded->color = encode.comparisonReference->color;
+					preview.image = std::move(decoded);
+					const auto metricStart = std::chrono::steady_clock::now();
+					MetricResult metric = compute_quality_metrics(*encode.comparisonReference, *preview.image);
+					encode.metadata.metricSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - metricStart).count();
 					encode.metadata.psnrY = metric.psnrY;
 					encode.metadata.psnrRgb = metric.psnrAll;
 					encode.metadata.metrics = std::move(metric.metrics);

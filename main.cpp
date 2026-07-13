@@ -404,7 +404,24 @@ codec_gui::RawImage make_test_pattern() {
 
 } // namespace
 
-int main(int argc, char **argv) {
+int main(int argc, char **argv) try {
+	if (argc > 1) {
+		const std::string argument = argv[1];
+		if (argument == "--help" || argument == "-h") {
+			std::cout << "Usage: codec_vis_cli [INPUT.jpg|INPUT.jpeg|INPUT.nef]\n"
+			             "Encode an input image, or a generated test pattern when no input is given.\n";
+			return 0;
+		}
+		if (!argument.empty() && argument.front() == '-') {
+			std::cerr << "codec_vis_cli: unknown option: " << argument << '\n';
+			return 2;
+		}
+	}
+	if (argc > 2) {
+		std::cerr << "codec_vis_cli: expected at most one input file (try --help)\n";
+		return 2;
+	}
+
 	const codec_gui::RawImage image = argc > 1
 	                                      ? load_input_image(argv[1])
 	                                      : make_test_pattern();
@@ -496,4 +513,8 @@ int main(int argc, char **argv) {
 					   });
 
 	dump_to_file("file.av2", encoded_av2.hevcAnnexB);
+	return 0;
+} catch (const std::exception& e) {
+	std::cerr << "codec_vis_cli: " << e.what() << '\n';
+	return 1;
 }

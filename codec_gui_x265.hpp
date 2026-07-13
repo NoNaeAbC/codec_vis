@@ -42,6 +42,12 @@ namespace codec_gui {
 		std::string label;
 	};
 
+	struct ParamCondition {
+		std::string parameter;
+		std::vector<std::string> acceptedValues;
+		std::string explanation;
+	};
+
 	struct EncoderParamInfo {
 		std::string name;  // x265 CLI/API parse name
 		std::string label; // GUI label
@@ -56,6 +62,14 @@ namespace codec_gui {
 
 		std::string help;
 		bool        relevantForStillImage = true;
+		// Every condition must match before the option is interactive or sent to
+		// the encoder. This makes mutually exclusive codec modes explicit.
+		std::vector<ParamCondition> enabledWhen;
+		// Keep range validation, but edit the value as text when a slider would
+		// have meaningless precision (for example a multi-gigabit bitrate).
+		bool directNumericInput = false;
+		std::optional<int64_t> automaticIntValue;
+		std::string automaticLabel;
 	};
 
 	using ParamValue = std::variant<bool, int64_t, double, std::string>;
@@ -68,34 +82,75 @@ namespace codec_gui {
 	enum class PixelFormat {
 		YUV420P8,
 		YUV420P10LE,
+		YUV420P12LE,
+		YUV420P14LE,
 		YUV422P8,
 		YUV422P10LE,
+		YUV422P12LE,
+		YUV422P14LE,
 		YUV444P8,
 		YUV444P10LE,
+		YUV444P12LE,
+		YUV444P14LE,
 		Gray8,
 		Gray10LE,
+		Gray12LE,
+		Gray14LE,
 	};
 
-	enum class ColorPrimaries {
-		Unspecified,
-		BT709,
-		BT2020,
+	// Numeric values follow ColourPrimaries in ITU-T H.273 (07/2024).
+	enum class ColorPrimaries : uint8_t {
+		BT709 = 1,
+		Unspecified = 2,
+		BT470M = 4,
+		BT470BG = 5,
+		BT601_525 = 6,
+		Film = 8,
+		BT2020 = 9,
+		XYZ = 10,
+		DCIP3 = 11,
+		DisplayP3 = 12,
 	};
 
-	enum class TransferCharacteristics {
-		Unspecified,
-		SRGB,
-		BT709,
-		PQ,
-		HLG,
-		Linear,
+	// Numeric values follow TransferCharacteristics in ITU-T H.273 (07/2024).
+	enum class TransferCharacteristics : uint8_t {
+		BT709 = 1,
+		Unspecified = 2,
+		Gamma22 = 4,
+		Gamma28 = 5,
+		BT601 = 6,
+		Linear = 8,
+		SRGB = 13,
+		BT2020_10 = 14,
+		BT2020_12 = 15,
+		PQ = 16,
+		HLG = 18,
 	};
 
-	enum class MatrixCoefficients {
-		Unspecified,
-		BT709,
-		BT2020NonConstant,
-		Identity,
+	// Numeric values follow MatrixCoefficients in ITU-T H.273 (07/2024).
+	enum class MatrixCoefficients : uint8_t {
+		Identity = 0,
+		BT709 = 1,
+		Unspecified = 2,
+		BT601 = 6,
+		YCgCo = 8,
+		BT2020NonConstant = 9,
+		BT2020Constant = 10,
+		ChromaticityDerivedNonConstant = 12,
+		ChromaticityDerivedConstant = 13,
+		ICtCp = 14,
+		IPTC2 = 15,
+		YCgCoRe = 16,
+		YCgCoRo = 17,
+	};
+
+	enum class Chroma420SampleLocation : uint8_t {
+		LeftCenter = 0,
+		Center = 1,
+		TopLeft = 2,
+		TopCenter = 3,
+		BottomLeft = 4,
+		BottomCenter = 5,
 	};
 
 	enum class ColorRange {
@@ -104,10 +159,11 @@ namespace codec_gui {
 	};
 
 	struct ColorDescription {
-		ColorPrimaries primaries = ColorPrimaries::BT709;
-		TransferCharacteristics transfer = TransferCharacteristics::SRGB;
-		MatrixCoefficients matrix = MatrixCoefficients::BT709;
+		ColorPrimaries primaries = ColorPrimaries::Unspecified;
+		TransferCharacteristics transfer = TransferCharacteristics::Unspecified;
+		MatrixCoefficients matrix = MatrixCoefficients::Unspecified;
 		ColorRange range = ColorRange::Limited;
+		std::optional<Chroma420SampleLocation> chroma420Location;
 	};
 
 	struct ImagePlane {
@@ -128,6 +184,10 @@ namespace codec_gui {
 		std::vector<std::byte> hevcAnnexB;
 		// Optional reconstructed/decoded preview provided directly by an encoder.
 		std::shared_ptr<const RawImage> previewImage;
+		// Color description of the samples supplied to an RGB-based encoder. RGB
+		// formats do not carry a YCbCr matrix or range, but the preview decoder
+		// needs both to reconstruct comparable YCbCr samples for quality metrics.
+		std::optional<ColorDescription> codedColor;
 	};
 
 	std::vector<EncoderParamInfo> query_x265_parameters();
@@ -172,12 +232,26 @@ namespace codec_gui {
 	std::vector<EncoderParamInfo> query_x264_parameters();
 	EncodedImage encode_x264_intra_still_image(const RawImage& image, std::span<const EncoderParam> params);
 
-		std::vector<EncoderParamInfo> query_vaapi_hevc_parameters();
+	struct VaapiDeviceInfo {
+		std::string path;
+		std::string vendor;
+		std::string error;
+		bool initialized = false;
+		bool supportsHevcEncode = false;
+		bool supportsAv1Encode = false;
+	};
 
-		EncodedImage encode_vaapi_hevc_still_image(const RawImage &image, std::span<const EncoderParam> params);
+	[[nodiscard]] std::vector<VaapiDeviceInfo> discover_vaapi_devices();
+	[[nodiscard]] std::vector<VaapiDeviceInfo> probe_vaapi_devices(std::span<const std::string> paths);
 
-		std::vector<EncoderParamInfo> query_vaapi_av1_parameters();
+	std::vector<EncoderParamInfo> query_vaapi_hevc_parameters();
+	std::vector<EncoderParamInfo> query_vaapi_hevc_parameters(std::string_view device);
+	EncodedImage encode_vaapi_hevc_still_image(const RawImage& image, std::span<const EncoderParam> params);
+	EncodedImage encode_vaapi_hevc_still_image(const RawImage& image, std::span<const EncoderParam> params, std::string_view device);
 
-	EncodedImage encode_vaapi_av1_still_image(const RawImage &image, std::span<const EncoderParam> params);
+	std::vector<EncoderParamInfo> query_vaapi_av1_parameters();
+	std::vector<EncoderParamInfo> query_vaapi_av1_parameters(std::string_view device);
+	EncodedImage encode_vaapi_av1_still_image(const RawImage& image, std::span<const EncoderParam> params);
+	EncodedImage encode_vaapi_av1_still_image(const RawImage& image, std::span<const EncoderParam> params, std::string_view device);
 
 } // namespace codec_gui

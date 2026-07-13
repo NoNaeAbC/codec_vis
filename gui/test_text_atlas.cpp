@@ -1,6 +1,7 @@
 #include "text_atlas.hpp"
 
 #include <cassert>
+#include <cmath>
 #include <filesystem>
 
 using namespace codec_gui::gui;
@@ -38,5 +39,37 @@ int main() {
 		sawElision = sawElision || quad.elision;
 	}
 	assert(sawElision);
+
+	DrawCommand clipBegin;
+	clipBegin.kind = DrawCommandKind::ScissorBegin;
+	clipBegin.rect = Rect{0, 40, 300, 80};
+	DrawCommand escaped = text;
+	escaped.rect = Rect{10, 10, 200, 24};
+	escaped.text = "must not escape above inspector";
+	DrawCommand visible = text;
+	visible.rect = Rect{10, 50, 200, 24};
+	visible.text = "visible inside inspector";
+	DrawCommand clipEnd;
+	clipEnd.kind = DrawCommandKind::ScissorEnd;
+	TextAtlas scissored = build_text_atlas({clipBegin, escaped, visible, clipEnd}, shaper, 128);
+	assert(!scissored.quads.empty());
+	for (const GlyphQuad& quad : scissored.quads) {
+		assert(quad.clip.x == clipBegin.rect.x);
+		assert(quad.clip.y == clipBegin.rect.y);
+		assert(quad.clip.w == clipBegin.rect.w);
+		assert(quad.clip.h == clipBegin.rect.h);
+		assert(quad.rect.y >= visible.rect.y);
+	}
+
+	constexpr float fractionalScale = 1.6f;
+	TextShaper hidpiShaper(font, 16.0f * fractionalScale);
+	TextAtlas hidpi = build_text_atlas({text}, hidpiShaper, 256, fractionalScale);
+	assert(!hidpi.quads.empty());
+	for (const GlyphQuad& quad : hidpi.quads) {
+		assert(std::fabs(quad.rect.x * fractionalScale - std::round(quad.rect.x * fractionalScale)) < 0.001f);
+		assert(std::fabs(quad.rect.y * fractionalScale - std::round(quad.rect.y * fractionalScale)) < 0.001f);
+		assert(std::fabs(quad.rect.w * fractionalScale - std::round(quad.rect.w * fractionalScale)) < 0.001f);
+		assert(std::fabs(quad.rect.h * fractionalScale - std::round(quad.rect.h * fractionalScale)) < 0.001f);
+	}
 	return 0;
 }

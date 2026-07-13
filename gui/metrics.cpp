@@ -1,4 +1,5 @@
 #include "metrics.hpp"
+#include "raw_image_conversion.hpp"
 #include "raw_image_utils.hpp"
 
 #include <algorithm>
@@ -11,6 +12,7 @@
 #include <span>
 #include <stdexcept>
 #include <string_view>
+#include <tuple>
 #include <utility>
 
 extern "C" {
@@ -49,21 +51,29 @@ std::optional<VmafPixelFormat> vmaf_pixel_format(PixelFormat format) {
 	switch (format) {
 		case PixelFormat::YUV420P8:
 		case PixelFormat::YUV420P10LE:
+		case PixelFormat::YUV420P12LE:
+		case PixelFormat::YUV420P14LE:
 			return VMAF_PIX_FMT_YUV420P;
 		case PixelFormat::YUV422P8:
 		case PixelFormat::YUV422P10LE:
+		case PixelFormat::YUV422P12LE:
+		case PixelFormat::YUV422P14LE:
 			return VMAF_PIX_FMT_YUV422P;
 		case PixelFormat::YUV444P8:
 		case PixelFormat::YUV444P10LE:
+		case PixelFormat::YUV444P12LE:
+		case PixelFormat::YUV444P14LE:
 			return VMAF_PIX_FMT_YUV444P;
 		case PixelFormat::Gray8:
 		case PixelFormat::Gray10LE:
+		case PixelFormat::Gray12LE:
+		case PixelFormat::Gray14LE:
 			return VMAF_PIX_FMT_YUV400P;
 	}
 	return std::nullopt;
 }
 
-int bit_depth(PixelFormat format) {
+int metric_bit_depth(PixelFormat format) {
 	switch (format) {
 		case PixelFormat::YUV420P8:
 		case PixelFormat::YUV422P8:
@@ -75,6 +85,16 @@ int bit_depth(PixelFormat format) {
 		case PixelFormat::YUV444P10LE:
 		case PixelFormat::Gray10LE:
 			return 10;
+		case PixelFormat::YUV420P12LE:
+		case PixelFormat::YUV422P12LE:
+		case PixelFormat::YUV444P12LE:
+		case PixelFormat::Gray12LE:
+			return 12;
+		case PixelFormat::YUV420P14LE:
+		case PixelFormat::YUV422P14LE:
+		case PixelFormat::YUV444P14LE:
+		case PixelFormat::Gray14LE:
+			return 14;
 	}
 	return 8;
 }
@@ -96,7 +116,7 @@ VmafPicturePtr make_vmaf_picture(const RawImage& image) {
 		throw std::runtime_error("unsupported pixel format for libvmaf");
 	}
 	auto picture = VmafPicturePtr(new VmafPicture{});
-	const int ret = vmaf_picture_alloc(picture.get(), *pixFmt, static_cast<unsigned>(bit_depth(image.format)), static_cast<unsigned>(image.width), static_cast<unsigned>(image.height));
+	const int ret = vmaf_picture_alloc(picture.get(), *pixFmt, static_cast<unsigned>(metric_bit_depth(image.format)), static_cast<unsigned>(image.width), static_cast<unsigned>(image.height));
 	if (ret < 0) {
 		throw std::runtime_error("libvmaf picture allocation failed");
 	}
@@ -261,7 +281,32 @@ MetricResult compute_psnr(const RawImage& reference, const RawImage& candidate) 
 }
 
 MetricResult compute_quality_metrics(const RawImage& reference, const RawImage& candidate) {
-	MetricResult result = compute_psnr(reference, candidate);
+	if (reference.width != candidate.width || reference.height != candidate.height) {
+		return compute_psnr(reference, candidate);
+	}
+	if (reference.color.primaries != candidate.color.primaries ||
+	    reference.color.transfer != candidate.color.transfer ||
+	    reference.color.matrix != candidate.color.matrix ||
+	    reference.color.range != candidate.color.range) {
+		MetricResult result;
+		result.unavailableReason = "color descriptions differ; an explicit comparison color transform is required";
+		for (const auto& [id, label, unit] : {
+			std::tuple{"psnr-y", "PSNR-Y", "dB"},
+			std::tuple{"psnr-all", "PSNR all", "dB"},
+			std::tuple{"psnr-hvs", "PSNR-HVS", "dB"},
+			std::tuple{"ssim", "SSIM", ""},
+			std::tuple{"ms-ssim", "MS-SSIM", ""},
+			std::tuple{"ciede2000", "CIEDE2000", ""},
+		}) {
+			result.metrics.push_back(metric_record(id, label, std::nullopt, unit, std::string_view{id} != "ciede2000", result.unavailableReason));
+		}
+		return result;
+	}
+	const int comparisonDepth = std::max(metric_bit_depth(reference.format), metric_bit_depth(candidate.format));
+	const PixelFormat comparisonFormat = pixel_format_for(comparisonDepth, true);
+	const RawImage normalizedReference = convert_raw_image_format(reference, comparisonFormat);
+	const RawImage normalizedCandidate = convert_raw_image_format(candidate, comparisonFormat);
+	MetricResult result = compute_psnr(normalizedReference, normalizedCandidate);
 	if (!result.unavailableReason.empty()) {
 		const std::string reason = result.unavailableReason;
 		result.metrics.push_back(metric_record("psnr-hvs", "PSNR-HVS", std::nullopt, "dB", true, reason));
@@ -271,10 +316,10 @@ MetricResult compute_quality_metrics(const RawImage& reference, const RawImage& 
 		return result;
 	}
 
-	append_vmaf_metric(result, reference, candidate, "psnr-hvs", "PSNR-HVS", "psnr_hvs", {"psnr_hvs_y", "psnr_hvs"});
-	append_vmaf_metric(result, reference, candidate, "ssim", "SSIM", "float_ssim", {"float_ssim", "ssim"});
-	append_vmaf_metric(result, reference, candidate, "ms-ssim", "MS-SSIM", "float_ms_ssim", {"float_ms_ssim", "ms_ssim"});
-	append_vmaf_metric(result, reference, candidate, "ciede2000", "CIEDE2000", "ciede", {"ciede2000", "ciede"});
+	append_vmaf_metric(result, normalizedReference, normalizedCandidate, "psnr-hvs", "PSNR-HVS", "psnr_hvs", {"psnr_hvs_y", "psnr_hvs"});
+	append_vmaf_metric(result, normalizedReference, normalizedCandidate, "ssim", "SSIM", "float_ssim", {"float_ssim", "ssim"});
+	append_vmaf_metric(result, normalizedReference, normalizedCandidate, "ms-ssim", "MS-SSIM", "float_ms_ssim", {"float_ms_ssim", "ms_ssim"});
+	append_vmaf_metric(result, normalizedReference, normalizedCandidate, "ciede2000", "CIEDE2000", "ciede", {"ciede2000", "ciede"});
 	return result;
 }
 

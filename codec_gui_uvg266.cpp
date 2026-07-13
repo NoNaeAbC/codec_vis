@@ -16,7 +16,7 @@
 #include <vector>
 
 extern "C" {
-#include <uvg266.h>
+#include <uvg266/uvg266.h>
 }
 
 namespace codec_gui {
@@ -52,6 +52,10 @@ struct FormatInfo {
 			return {UVG_CSP_400, 8, 1, {1, 1, 1}, {1, 1, 1}};
 		case PixelFormat::Gray10LE:
 			return {UVG_CSP_400, 10, 1, {1, 1, 1}, {1, 1, 1}};
+		case PixelFormat::YUV420P12LE: case PixelFormat::YUV420P14LE:
+		case PixelFormat::YUV422P12LE: case PixelFormat::YUV422P14LE:
+		case PixelFormat::YUV444P12LE: case PixelFormat::YUV444P14LE:
+		case PixelFormat::Gray12LE: case PixelFormat::Gray14LE: break;
 	}
 
 	throw std::runtime_error("unsupported pixel format");
@@ -359,11 +363,11 @@ EncodedImage encode_uvg266_still_image(const RawImage& image, std::span<const En
 	cfg->ref_frames     = 1;
 	cfg->input_format   = input_format_for_chroma(info);
 	cfg->input_bitdepth = uvgBitDepth;
-	cfg->vui.colorprim  = 1;
-	cfg->vui.transfer   = 13;
-	cfg->vui.colormatrix = 1;
-	cfg->vui.fullrange  = 0;
-	cfg->vui.chroma_loc = 0;
+	cfg->vui.colorprim  = static_cast<int8_t>(image.color.primaries);
+	cfg->vui.transfer   = static_cast<int8_t>(image.color.transfer);
+	cfg->vui.colormatrix = static_cast<int8_t>(image.color.matrix);
+	cfg->vui.fullrange  = image.color.range == ColorRange::Full ? 1 : 0;
+	cfg->vui.chroma_loc = static_cast<int8_t>(image.color.chroma420Location.value_or(Chroma420SampleLocation::LeftCenter));
 
 	for (const EncoderParam& param : params) {
 		const std::string value = param_value_to_string(param.value);

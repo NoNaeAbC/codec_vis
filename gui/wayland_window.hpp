@@ -33,6 +33,9 @@ namespace codec_gui::gui {
 		[[nodiscard]] wl_surface* surface() const;
 		[[nodiscard]] int width() const;
 		[[nodiscard]] int height() const;
+		[[nodiscard]] int framebuffer_width() const;
+		[[nodiscard]] int framebuffer_height() const;
+		[[nodiscard]] float output_scale() const;
 
 		void dispatch_pending();
 		[[nodiscard]] std::vector<Action> take_actions();

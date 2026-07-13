@@ -12,5 +12,10 @@ namespace codec_gui::gui {
 		const LayoutResult& layout,
 		Point point
 	);
+	[[nodiscard]] std::vector<Action> actions_for_pointer_move(
+		const AppState& state,
+		const LayoutResult& layout,
+		Point point
+	);
 
 } // namespace codec_gui::gui

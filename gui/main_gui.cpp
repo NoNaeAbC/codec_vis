@@ -15,8 +15,10 @@
 
 #include <hb.h>
 
+#include <algorithm>
 #include <exception>
 #include <chrono>
+#include <cmath>
 #include <future>
 #include <iostream>
 #include <memory>
@@ -154,14 +156,14 @@ int main(int argc, char** argv) {
 		state.selection.selectedBackend = state.backends.front().id;
 	}
 	std::vector<ActionFuture> asyncCommands;
-	state.interaction.framebufferWidth = 1280;
-	state.interaction.framebufferHeight = 720;
+	state.interaction.framebufferWidth = 1920;
+	state.interaction.framebufferHeight = 1080;
 	if (!sourcePath.empty()) {
 		Action chosen;
 		chosen.kind = ActionKind::SourcePathChosen;
 		chosen.path = sourcePath;
 		apply_action_and_commands(state, chosen, backends, &encodeRunner);
-	} else {
+	} else if (smokeOnce || smokeFrames > 0 || probeImagePixels) {
 		Action loaded;
 		loaded.kind = ActionKind::SourceLoaded;
 		loaded.sourceLoaded.path = "test-pattern";
@@ -180,6 +182,8 @@ int main(int argc, char** argv) {
 	TextAtlas atlas;
 	std::size_t textQuadCount = 0;
 	const auto startTime = std::chrono::steady_clock::now();
+	std::unique_ptr<TextShaper> textShaper;
+	float renderScale = 1.0f;
 	auto elapsed_seconds = [&]() {
 		return std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
 	};
@@ -193,21 +197,47 @@ int main(int argc, char** argv) {
 		panes = compute_pane_rects(state.viewMode, state.panes, layout.viewer);
 		drawCommands = build_draw_list(state, layout, {}, elapsed_seconds());
 		try {
-			TextShaper shaper(default_font_path(), 16.0f);
-			atlas = build_text_atlas(drawCommands, shaper);
+			if (!textShaper) textShaper = std::make_unique<TextShaper>(default_font_path(), 16.0f * renderScale);
+			atlas = build_text_atlas(drawCommands, *textShaper, 1024, renderScale);
 			textQuadCount = atlas.quads.size();
-		} catch (const std::exception&) {
+		} catch (const std::exception& e) {
 			atlas = {};
 			textQuadCount = 0;
+			const bool alreadyReported = std::any_of(state.errors.begin(), state.errors.end(), [](const AppError& error) {
+				return error.subsystem == "text renderer" && error.operation == "shape UI text";
+			});
+			if (!alreadyReported) {
+				state.errors.push_back(AppError{
+					.id = state.nextId++,
+					.severity = ErrorSeverity::Error,
+					.operation = "shape UI text",
+					.subsystem = "text renderer",
+					.message = e.what(),
+					.detail = {},
+					.image = std::nullopt,
+					.run = std::nullopt,
+				});
+			}
 		}
 	};
 	rebuild_frame_model();
 
 	try {
 		WaylandWindow window = WaylandWindow::create(state.interaction.framebufferWidth, state.interaction.framebufferHeight, "codec_vis");
-		std::cout << "Wayland: xdg-shell window " << window.width() << "x" << window.height() << '\n';
+		renderScale = window.output_scale();
+		state.interaction.framebufferWidth = window.width();
+		state.interaction.framebufferHeight = window.height();
+		state.interaction.outputScale = 1.0f;
+		textShaper.reset();
+		rebuild_frame_model();
+		std::cout << "Wayland: xdg-shell window " << window.width() << "x" << window.height()
+		          << " framebuffer " << window.framebuffer_width() << "x" << window.framebuffer_height()
+		          << " scale " << renderScale << '\n';
 		VulkanRenderer renderer = VulkanRenderer::create(window);
 		renderer.sync_images(state.images);
+		int renderedLogicalWidth = window.width();
+		int renderedLogicalHeight = window.height();
+		float renderedScale = renderScale;
 		int presentedFrames = 0;
 		do {
 			window.dispatch_pending();
@@ -220,6 +250,11 @@ int main(int argc, char** argv) {
 						apply_action_and_commands(state, uiAction, backends, &encodeRunner, &asyncCommands);
 					}
 					consumed = !uiActions.empty();
+				}
+				if (action.kind == ActionKind::PointerMoved) {
+					for (const Action& uiAction : actions_for_pointer_move(state, layout, action.point)) {
+						apply_action_and_commands(state, uiAction, backends, &encodeRunner, &asyncCommands);
+					}
 				}
 				if (!consumed) {
 					apply_action_and_commands(state, action, backends, &encodeRunner, &asyncCommands);
@@ -236,10 +271,21 @@ int main(int argc, char** argv) {
 				apply_action_and_commands(state, action, backends, &encodeRunner, &asyncCommands);
 				frameDirty = true;
 			}
-			if (window.width() != static_cast<int>(renderer.width()) || window.height() != static_cast<int>(renderer.height())) {
+			if (window.framebuffer_width() != static_cast<int>(renderer.width()) ||
+			    window.framebuffer_height() != static_cast<int>(renderer.height()) ||
+			    window.width() != renderedLogicalWidth || window.height() != renderedLogicalHeight ||
+			    std::abs(window.output_scale() - renderedScale) > 0.001f) {
 				renderer.recreate_swapchain(window);
 				state.interaction.framebufferWidth = window.width();
 				state.interaction.framebufferHeight = window.height();
+				state.interaction.outputScale = 1.0f;
+				if (std::abs(window.output_scale() - renderedScale) > 0.001f) {
+					renderScale = window.output_scale();
+					textShaper.reset();
+				}
+				renderedLogicalWidth = window.width();
+				renderedLogicalHeight = window.height();
+				renderedScale = window.output_scale();
 				frameDirty = true;
 			}
 			if (frameDirty) {

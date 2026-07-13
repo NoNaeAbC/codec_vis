@@ -218,6 +218,17 @@ int main() {
 		assert(actions.size() == 1);
 		assert(actions.front().param.name == "qp");
 		assert(std::get<int64_t>(actions.front().param.value) == 80);
+		state = update(std::move(state), actions.front()).state;
+		assert(state.interaction.activePointerCapture == "param:1:qp");
+		std::vector<Action> dragActions = actions_for_pointer_move(state, layout, Point{controlX + controlW * 0.10f, intY});
+		assert(dragActions.size() == 1);
+		assert(dragActions.front().param.name == "qp");
+		assert(std::get<int64_t>(dragActions.front().param.value) == 10);
+		Action release;
+		release.kind = ActionKind::PointerReleased;
+		release.point = Point{controlX + controlW * 0.10f, intY};
+		state = update(std::move(state), release).state;
+		assert(state.interaction.activePointerCapture.empty());
 	}
 
 	{

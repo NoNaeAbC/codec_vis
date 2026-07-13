@@ -55,6 +55,10 @@ struct FormatInfo {
 			return {AVM_IMG_FMT_I420, AVM_BITS_8, 1, {1, 1, 1}, {1, 1, 1}, 0, true};
 		case PixelFormat::Gray10LE:
 			return {AVM_IMG_FMT_I42016, AVM_BITS_10, 1, {1, 1, 1}, {1, 1, 1}, 0, true};
+		case PixelFormat::YUV420P12LE: case PixelFormat::YUV420P14LE:
+		case PixelFormat::YUV422P12LE: case PixelFormat::YUV422P14LE:
+		case PixelFormat::YUV444P12LE: case PixelFormat::YUV444P14LE:
+		case PixelFormat::Gray12LE: case PixelFormat::Gray14LE: break;
 	}
 
 	throw std::runtime_error("unsupported pixel format");
@@ -291,11 +295,11 @@ EncodedImage encode_av2_still_image(const RawImage& image, std::span<const Encod
 		}
 	} imageGuard{&raw};
 
-	raw.cp         = AVM_CICP_CP_BT_709;
-	raw.tc         = AVM_CICP_TC_SRGB;
-	raw.mc         = AVM_CICP_MC_BT_709;
-	raw.range      = AVM_CR_STUDIO_RANGE;
-	raw.csp        = AVM_CSP_LEFT;
+	raw.cp         = static_cast<avm_color_primaries_t>(image.color.primaries);
+	raw.tc         = static_cast<avm_transfer_characteristics_t>(image.color.transfer);
+	raw.mc         = static_cast<avm_matrix_coefficients_t>(image.color.matrix);
+	raw.range      = image.color.range == ColorRange::Full ? AVM_CR_FULL_RANGE : AVM_CR_STUDIO_RANGE;
+	raw.csp        = static_cast<avm_chroma_sample_position_t>(image.color.chroma420Location.value_or(Chroma420SampleLocation::LeftCenter));
 	raw.monochrome = info.monochrome ? 1 : 0;
 
 	copy_image_to_avm(image, info, raw);
@@ -311,11 +315,11 @@ EncodedImage encode_av2_still_image(const RawImage& image, std::span<const Encod
 		}
 	} codecGuard{&ctx};
 
-	checked_codec_call(ctx, avm_codec_control(&ctx, AV2E_SET_COLOR_PRIMARIES, AVM_CICP_CP_BT_709), "set color primaries");
-	checked_codec_call(ctx, avm_codec_control(&ctx, AV2E_SET_TRANSFER_CHARACTERISTICS, AVM_CICP_TC_SRGB), "set transfer");
-	checked_codec_call(ctx, avm_codec_control(&ctx, AV2E_SET_MATRIX_COEFFICIENTS, AVM_CICP_MC_BT_709), "set matrix");
-	checked_codec_call(ctx, avm_codec_control(&ctx, AV2E_SET_COLOR_RANGE, AVM_CR_STUDIO_RANGE), "set range");
-	checked_codec_call(ctx, avm_codec_control(&ctx, AV2E_SET_CHROMA_SAMPLE_POSITION, AVM_CSP_LEFT), "set chroma sample position");
+	checked_codec_call(ctx, avm_codec_control(&ctx, AV2E_SET_COLOR_PRIMARIES, static_cast<int>(image.color.primaries)), "set color primaries");
+	checked_codec_call(ctx, avm_codec_control(&ctx, AV2E_SET_TRANSFER_CHARACTERISTICS, static_cast<int>(image.color.transfer)), "set transfer");
+	checked_codec_call(ctx, avm_codec_control(&ctx, AV2E_SET_MATRIX_COEFFICIENTS, static_cast<int>(image.color.matrix)), "set matrix");
+	checked_codec_call(ctx, avm_codec_control(&ctx, AV2E_SET_COLOR_RANGE, image.color.range == ColorRange::Full ? AVM_CR_FULL_RANGE : AVM_CR_STUDIO_RANGE), "set range");
+	checked_codec_call(ctx, avm_codec_control(&ctx, AV2E_SET_CHROMA_SAMPLE_POSITION, static_cast<int>(image.color.chroma420Location.value_or(Chroma420SampleLocation::LeftCenter))), "set chroma sample position");
 	checked_codec_call(ctx, avm_codec_control(&ctx, AV2E_SET_ENABLE_INTRABC, 0), "disable intrabc");
 	checked_codec_call(ctx, avm_codec_control(&ctx, AV2E_SET_ENABLE_RECT_PARTITIONS, 0), "disable rect partitions");
 	checked_codec_call(ctx, avm_codec_control(&ctx, AV2E_SET_ENABLE_1TO4_PARTITIONS, 0), "disable 1:4 partitions");

@@ -102,6 +102,10 @@ struct FormatInfo {
 
         case PixelFormat::Gray10LE:
             return { VVENC_CHROMA_400, 10, 1, { 1, 1, 1 }, { 1, 1, 1 } };
+		case PixelFormat::YUV420P12LE: case PixelFormat::YUV420P14LE:
+		case PixelFormat::YUV422P12LE: case PixelFormat::YUV422P14LE:
+		case PixelFormat::YUV444P12LE: case PixelFormat::YUV444P14LE:
+		case PixelFormat::Gray12LE: case PixelFormat::Gray14LE: break;
     }
 
     throw std::runtime_error("unsupported pixel format");
@@ -524,7 +528,8 @@ void force_still_image_config(vvenc_config& cfg, const RawImage& image, const Fo
     int64_t     defaultValue,
     IntRange    range,
     std::string help,
-    bool        relevant = true
+    bool        relevant = true,
+    bool        directNumericInput = false
 ) {
     EncoderParamInfo p;
     p.name                  = std::move(name);
@@ -535,7 +540,18 @@ void force_still_image_config(vvenc_config& cfg, const RawImage& image, const Fo
     p.intRange              = range;
     p.help                  = std::move(help);
     p.relevantForStillImage = relevant;
+    p.directNumericInput    = directNumericInput;
     return p;
+}
+
+[[nodiscard]] EncoderParamInfo enabled_when(
+    EncoderParamInfo param,
+    std::string dependency,
+    std::vector<std::string> values,
+    std::string explanation
+) {
+    param.enabledWhen.push_back({std::move(dependency), std::move(values), std::move(explanation)});
+    return param;
 }
 
 [[nodiscard]] EncoderParamInfo enum_param(
@@ -621,23 +637,34 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "VVenC preset. This is applied before all other user parameters."
         ),
 
-        int_param(
+		enum_param(
+			"rate-control",
+			"Rate-control mode",
+			"Rate Control",
+			"qp",
+			{{"qp", "Fixed QP"}, {"bitrate", "Target bitrate"}},
+			"Select exactly one VVenC rate-control strategy. The inactive value is not submitted."
+		),
+
+		enabled_when(int_param(
             "qp",
             "QP",
             "Rate Control",
             32,
             { 0, 63, 1 },
             "Fixed QP for the key picture. Lower values improve quality and increase size."
-        ),
+		), "rate-control", {"qp"}, "QP is available only in Fixed QP mode."),
 
-        int_param(
+		enabled_when(int_param(
             "bitrate",
             "Target bitrate",
             "Rate Control",
             0,
             { 0, 2'000'000'000, 1'000 },
-            "Target bitrate in bit/s. Use 0 to disable rate control and use fixed QP."
-        ),
+            "Target bitrate in bit/s.",
+			true,
+			true
+		), "rate-control", {"bitrate"}, "Bitrate is available only in Target bitrate mode."),
 
         int_param(
             "passes",
@@ -851,7 +878,8 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
                 { "sdr_2020",  "SDR BT.2020" },
                 { "sdr_470bg", "SDR BT.470 B/G" },
             },
-            "HDR / transfer / colorimetry signaling mode."
+			"HDR / transfer / colorimetry signaling mode.",
+			false
         ),
 
         int_param(
@@ -912,7 +940,7 @@ codec_gui::EncodedImage encode_vvenc_still_image(
     vvenc_set_msg_callback(&cfg, nullptr, collect_vvenc_log);
 
     for (const EncoderParam& param : params) {
-        if (param.name == "preset") {
+		if (param.name == "preset" || param.name == "rate-control") {
             continue;
         }
 

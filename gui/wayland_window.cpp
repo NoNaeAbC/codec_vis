@@ -1,6 +1,8 @@
 #include "wayland_window.hpp"
 
 #include "xdg-shell-client-protocol.h"
+#include "fractional-scale-v1-client-protocol.h"
+#include "viewporter-client-protocol.h"
 
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon.h>
@@ -29,6 +31,10 @@ struct WaylandWindow::Impl {
 	wl_compositor* compositor = nullptr;
 	xdg_wm_base* wmBase = nullptr;
 	wl_data_device_manager* dataDeviceManager = nullptr;
+	wp_fractional_scale_manager_v1* fractionalScaleManager = nullptr;
+	wp_fractional_scale_v1* fractionalScale = nullptr;
+	wp_viewporter* viewporter = nullptr;
+	wp_viewport* viewport = nullptr;
 	wl_surface* surface = nullptr;
 	xdg_surface* xdgSurface = nullptr;
 	xdg_toplevel* toplevel = nullptr;
@@ -43,11 +49,32 @@ struct WaylandWindow::Impl {
 	std::vector<std::string> currentOfferMimeTypes;
 	int width = 0;
 	int height = 0;
+	float outputScale = 1.0f;
+	uint32_t outputScale120 = 120;
 	bool configured = false;
 	bool closeRequested = false;
 	Point pointerPosition;
 	std::vector<Action> actions;
 };
+
+namespace {
+
+void update_surface_viewport(WaylandWindow::Impl& impl) {
+	if (impl.viewport != nullptr && impl.width > 0 && impl.height > 0) {
+		wp_viewport_set_destination(impl.viewport, impl.width, impl.height);
+	}
+}
+
+void preferred_fractional_scale(void* data, wp_fractional_scale_v1*, uint32_t scale120) {
+	auto& impl = *static_cast<WaylandWindow::Impl*>(data);
+	impl.outputScale120 = std::max(120u, scale120);
+	impl.outputScale = std::max(1.0f, static_cast<float>(scale120) / 120.0f);
+	update_surface_viewport(impl);
+}
+
+constexpr wp_fractional_scale_v1_listener FractionalScaleListener{preferred_fractional_scale};
+
+} // namespace
 
 std::string decode_wayland_file_uri(std::string uri) {
 	const std::string prefix = "file://";
@@ -116,6 +143,10 @@ void registry_global(void* data, wl_registry* registry, uint32_t name, const cha
 		impl.seat = static_cast<wl_seat*>(wl_registry_bind(registry, name, &wl_seat_interface, 5));
 	} else if (iface == wl_data_device_manager_interface.name) {
 		impl.dataDeviceManager = static_cast<wl_data_device_manager*>(wl_registry_bind(registry, name, &wl_data_device_manager_interface, 3));
+	} else if (iface == wp_fractional_scale_manager_v1_interface.name) {
+		impl.fractionalScaleManager = static_cast<wp_fractional_scale_manager_v1*>(wl_registry_bind(registry, name, &wp_fractional_scale_manager_v1_interface, 1));
+	} else if (iface == wp_viewporter_interface.name) {
+		impl.viewporter = static_cast<wp_viewporter*>(wl_registry_bind(registry, name, &wp_viewporter_interface, 1));
 	}
 }
 
@@ -145,6 +176,7 @@ void toplevel_configure(void* data, xdg_toplevel*, int32_t width, int32_t height
 	if (height > 0) {
 		impl.height = height;
 	}
+	update_surface_viewport(impl);
 }
 
 void toplevel_close(void* data, xdg_toplevel*) {
@@ -472,13 +504,13 @@ WaylandWindow::~WaylandWindow() {
 	reset();
 }
 
-	WaylandWindow WaylandWindow::create(int width, int height, const char* title) {
-		Impl* impl = new Impl;
-		impl->width = width;
-		impl->height = height;
-		impl->actions.reserve(64);
+WaylandWindow WaylandWindow::create(int width, int height, const char* title) {
+	Impl* impl = new Impl;
+	impl->width = width;
+	impl->height = height;
+	impl->actions.reserve(64);
 
-		try {
+	try {
 		impl->display = wl_display_connect(nullptr);
 		require(impl->display != nullptr, "Wayland display is unavailable");
 
@@ -495,6 +527,16 @@ WaylandWindow::~WaylandWindow() {
 
 		impl->surface = wl_compositor_create_surface(impl->compositor);
 		require(impl->surface != nullptr, "Wayland surface creation failed");
+		if (impl->viewporter != nullptr) {
+			impl->viewport = wp_viewporter_get_viewport(impl->viewporter, impl->surface);
+			require(impl->viewport != nullptr, "Wayland viewport creation failed");
+		}
+		if (impl->fractionalScaleManager != nullptr) {
+			impl->fractionalScale = wp_fractional_scale_manager_v1_get_fractional_scale(impl->fractionalScaleManager, impl->surface);
+			require(impl->fractionalScale != nullptr, "Wayland fractional-scale object creation failed");
+			wp_fractional_scale_v1_add_listener(impl->fractionalScale, &FractionalScaleListener, impl);
+		}
+		wl_surface_set_buffer_scale(impl->surface, 1);
 		impl->xdgSurface = xdg_wm_base_get_xdg_surface(impl->wmBase, impl->surface);
 		require(impl->xdgSurface != nullptr, "xdg_surface creation failed");
 		xdg_surface_add_listener(impl->xdgSurface, &XdgSurfaceListener, impl);
@@ -540,6 +582,18 @@ int WaylandWindow::height() const {
 	return impl_ == nullptr ? 0 : impl_->height;
 }
 
+int WaylandWindow::framebuffer_width() const {
+	return impl_ == nullptr ? 0 : std::max(1, static_cast<int>((static_cast<int64_t>(impl_->width) * impl_->outputScale120 + 119) / 120));
+}
+
+int WaylandWindow::framebuffer_height() const {
+	return impl_ == nullptr ? 0 : std::max(1, static_cast<int>((static_cast<int64_t>(impl_->height) * impl_->outputScale120 + 119) / 120));
+}
+
+float WaylandWindow::output_scale() const {
+	return impl_ == nullptr ? 1.0f : impl_->outputScale;
+}
+
 void WaylandWindow::dispatch_pending() {
 	if (impl_ == nullptr || impl_->display == nullptr) {
 		return;
@@ -563,6 +617,12 @@ void WaylandWindow::reset() {
 	}
 	if (impl_->toplevel != nullptr) {
 		xdg_toplevel_destroy(impl_->toplevel);
+	}
+	if (impl_->fractionalScale != nullptr) {
+		wp_fractional_scale_v1_destroy(impl_->fractionalScale);
+	}
+	if (impl_->viewport != nullptr) {
+		wp_viewport_destroy(impl_->viewport);
 	}
 	destroy_current_offer(*impl_);
 	if (impl_->dataDevice != nullptr) {
@@ -600,6 +660,12 @@ void WaylandWindow::reset() {
 	}
 	if (impl_->compositor != nullptr) {
 		wl_compositor_destroy(impl_->compositor);
+	}
+	if (impl_->fractionalScaleManager != nullptr) {
+		wp_fractional_scale_manager_v1_destroy(impl_->fractionalScaleManager);
+	}
+	if (impl_->viewporter != nullptr) {
+		wp_viewporter_destroy(impl_->viewporter);
 	}
 	if (impl_->registry != nullptr) {
 		wl_registry_destroy(impl_->registry);

@@ -4,10 +4,10 @@
 
 namespace codec_gui::gui {
 
-[[nodiscard]] DecodeResult no_preview_decode(const EncodedImage& encoded);
 [[nodiscard]] DecodeResult decode_embedded_preview(const EncodedImage& encoded);
 [[nodiscard]] DecodeResult decode_hevc_preview(const EncodedImage& encoded);
 [[nodiscard]] DecodeResult decode_av1_preview(const EncodedImage& encoded);
+[[nodiscard]] DecodeResult decode_av2_preview(const EncodedImage& encoded);
 [[nodiscard]] DecodeResult decode_vvc_preview(const EncodedImage& encoded);
 [[nodiscard]] DecodeResult decode_jpegls_preview(const EncodedImage& encoded);
 [[nodiscard]] DecodeResult decode_jpeg_preview(const EncodedImage& encoded);

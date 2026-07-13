@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <stdexcept>
 #include <cstring>
+#include <cmath>
 #include <string>
 #include <utility>
 #include <vector>
@@ -108,7 +109,7 @@ TextShaper::TextShaper(const std::filesystem::path& fontPath, float pixelSize) :
 		if (FT_New_Face(impl_->ft, path.c_str(), 0, &face) != 0) {
 			continue;
 		}
-		if (FT_Set_Pixel_Sizes(face, 0, static_cast<FT_UInt>(pixelSize)) != 0) {
+		if (FT_Set_Char_Size(face, 0, static_cast<FT_F26Dot6>(std::lround(pixelSize * 64.0f)), 0, 0) != 0) {
 			FT_Done_Face(face);
 			continue;
 		}

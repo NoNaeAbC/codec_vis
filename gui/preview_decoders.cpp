@@ -1,4 +1,5 @@
 #include "preview_decoders.hpp"
+#include "dav2d_bridge.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -90,6 +91,134 @@ std::shared_ptr<const RawImage> rgb8_to_yuv444_preview(const std::vector<uint8_t
 	return image;
 }
 
+struct MatrixWeights {
+	double kr;
+	double kb;
+};
+
+MatrixWeights preview_matrix_weights(MatrixCoefficients matrix) {
+	switch (matrix) {
+		case MatrixCoefficients::BT709: return {0.2126, 0.0722};
+		case MatrixCoefficients::BT601: return {0.2990, 0.1140};
+		case MatrixCoefficients::BT2020NonConstant: return {0.2627, 0.0593};
+		default: throw std::invalid_argument("JPEG XL preview cannot reconstruct the selected YCbCr matrix");
+	}
+}
+
+PixelFormat yuv444_format_for_depth(int bitDepth) {
+	if (bitDepth == 8) return PixelFormat::YUV444P8;
+	if (bitDepth == 10) return PixelFormat::YUV444P10LE;
+	if (bitDepth == 12) return PixelFormat::YUV444P12LE;
+	if (bitDepth == 14) return PixelFormat::YUV444P14LE;
+	throw std::invalid_argument("JPEG XL preview supports integer 8-, 10-, 12-, and 14-bit images; codestream reports " + std::to_string(bitDepth) + " bits");
+}
+
+PixelFormat gray_format_for_depth(int bitDepth) {
+	if (bitDepth == 8) return PixelFormat::Gray8;
+	if (bitDepth == 10) return PixelFormat::Gray10LE;
+	if (bitDepth == 12) return PixelFormat::Gray12LE;
+	if (bitDepth == 14) return PixelFormat::Gray14LE;
+	throw std::invalid_argument("JPEG XL preview supports integer 8-, 10-, 12-, and 14-bit images; codestream reports " + std::to_string(bitDepth) + " bits");
+}
+
+uint16_t interleaved_sample(const std::vector<uint8_t>& pixels, std::size_t sample, int bytesPerSample) {
+	if (bytesPerSample == 1) return pixels.at(sample);
+	const std::size_t offset = sample * 2;
+	if (offset + 1 >= pixels.size()) throw std::runtime_error("JPEG XL decoder returned a truncated pixel buffer");
+	return static_cast<uint16_t>(pixels[offset] | (static_cast<uint16_t>(pixels[offset + 1]) << 8u));
+}
+
+void store_preview_sample(ImagePlane& plane, std::size_t sample, uint16_t value, int bytesPerSample) {
+	if (bytesPerSample == 1) {
+		plane.bytes[sample] = static_cast<uint8_t>(value);
+	} else {
+		const std::size_t offset = sample * 2;
+		plane.bytes[offset] = static_cast<uint8_t>(value & 0xffu);
+		plane.bytes[offset + 1] = static_cast<uint8_t>(value >> 8u);
+	}
+}
+
+std::shared_ptr<const RawImage> jxl_pixels_to_preview(
+	const std::vector<uint8_t>& pixels,
+	int width,
+	int height,
+	int bitDepth,
+	uint32_t channels,
+	const ColorDescription& color
+) {
+	if (channels != 1 && channels != 3) throw std::invalid_argument("unsupported JPEG XL color channel count: " + std::to_string(channels));
+	const int bytesPerSample = bitDepth == 8 ? 1 : 2;
+	const std::size_t expected = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * channels * bytesPerSample;
+	if (pixels.size() < expected) throw std::runtime_error("JPEG XL decoder pixel buffer is shorter than the declared image dimensions");
+	const double maximum = static_cast<double>((1u << bitDepth) - 1u);
+	// libjxl's default UINT16 output uses the full 0..65535 container range,
+	// independently of the codestream precision. Converting that normalized
+	// value back to the declared depth preserves all 10/12/14-bit information.
+	const double inputMaximum = bytesPerSample == 1 ? 255.0 : 65535.0;
+	const double scale = static_cast<double>(1u << (bitDepth - 8));
+	const double yOffset = color.range == ColorRange::Full ? 0.0 : 16.0 * scale;
+	const double yScale = color.range == ColorRange::Full ? maximum : 219.0 * scale;
+	const double cOffset = static_cast<double>(1u << (bitDepth - 1));
+	const double cScale = color.range == ColorRange::Full ? maximum : 224.0 * scale;
+
+	auto image = std::make_shared<RawImage>();
+	image->width = width;
+	image->height = height;
+	image->format = channels == 1 ? gray_format_for_depth(bitDepth) : yuv444_format_for_depth(bitDepth);
+	image->color = color;
+	const int planeCount = channels == 1 ? 1 : 3;
+	for (int plane = 0; plane < planeCount; ++plane) {
+		image->planes[plane].strideBytes = width * bytesPerSample;
+		image->planes[plane].bytes.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * bytesPerSample);
+	}
+	auto quantize = [&](double value) {
+		return static_cast<uint16_t>(std::clamp<long>(std::lround(value), 0, static_cast<long>(maximum)));
+	};
+	if (channels == 1) {
+		for (std::size_t pixel = 0; pixel < static_cast<std::size_t>(width) * height; ++pixel) {
+			const double y = static_cast<double>(interleaved_sample(pixels, pixel, bytesPerSample)) / inputMaximum;
+			store_preview_sample(image->planes[0], pixel, quantize(yOffset + yScale * y), bytesPerSample);
+		}
+		return image;
+	}
+
+	const MatrixWeights weights = preview_matrix_weights(color.matrix);
+	for (std::size_t pixel = 0; pixel < static_cast<std::size_t>(width) * height; ++pixel) {
+		const double r = static_cast<double>(interleaved_sample(pixels, pixel * 3 + 0, bytesPerSample)) / inputMaximum;
+		const double g = static_cast<double>(interleaved_sample(pixels, pixel * 3 + 1, bytesPerSample)) / inputMaximum;
+		const double b = static_cast<double>(interleaved_sample(pixels, pixel * 3 + 2, bytesPerSample)) / inputMaximum;
+		const double y = weights.kr * r + (1.0 - weights.kr - weights.kb) * g + weights.kb * b;
+		const double cb = (b - y) / (2.0 * (1.0 - weights.kb));
+		const double cr = (r - y) / (2.0 * (1.0 - weights.kr));
+		store_preview_sample(image->planes[0], pixel, quantize(yOffset + yScale * y), bytesPerSample);
+		store_preview_sample(image->planes[1], pixel, quantize(cOffset + cScale * cb), bytesPerSample);
+		store_preview_sample(image->planes[2], pixel, quantize(cOffset + cScale * cr), bytesPerSample);
+	}
+	return image;
+}
+
+ColorDescription color_description_from_jxl(const JxlColorEncoding& profile) {
+	ColorDescription color;
+	color.range = ColorRange::Full;
+	color.chroma420Location.reset();
+	switch (profile.primaries) {
+		case JXL_PRIMARIES_SRGB: color.primaries = ColorPrimaries::BT709; break;
+		case JXL_PRIMARIES_2100: color.primaries = ColorPrimaries::BT2020; break;
+		case JXL_PRIMARIES_P3: color.primaries = profile.white_point == JXL_WHITE_POINT_DCI ? ColorPrimaries::DCIP3 : ColorPrimaries::DisplayP3; break;
+		default: color.primaries = ColorPrimaries::Unspecified; break;
+	}
+	switch (profile.transfer_function) {
+		case JXL_TRANSFER_FUNCTION_709: color.transfer = TransferCharacteristics::BT709; break;
+		case JXL_TRANSFER_FUNCTION_SRGB: color.transfer = TransferCharacteristics::SRGB; break;
+		case JXL_TRANSFER_FUNCTION_LINEAR: color.transfer = TransferCharacteristics::Linear; break;
+		case JXL_TRANSFER_FUNCTION_PQ: color.transfer = TransferCharacteristics::PQ; break;
+		case JXL_TRANSFER_FUNCTION_HLG: color.transfer = TransferCharacteristics::HLG; break;
+		default: color.transfer = TransferCharacteristics::Unspecified; break;
+	}
+	color.matrix = color.primaries == ColorPrimaries::BT2020 ? MatrixCoefficients::BT2020NonConstant : MatrixCoefficients::BT709;
+	return color;
+}
+
 std::shared_ptr<const RawImage> copy_i420_preview(const unsigned char* const planes[3], const int strides[2], int width, int height) {
 	auto image = std::make_shared<RawImage>();
 	image->width = width;
@@ -169,18 +298,18 @@ struct IvfFrame {
 	std::size_t size = 0;
 };
 
-IvfFrame first_ivf_frame(const std::vector<std::byte>& bytes) {
+IvfFrame first_ivf_frame(const std::vector<std::byte>& bytes, const char* fourcc = "AV01", const char* codec = "AV1") {
 	if (bytes.size() < 44) {
-		throw std::runtime_error("AV1 IVF byte buffer is too small");
+		throw std::runtime_error(std::string(codec) + " IVF byte buffer is too small");
 	}
 	if (std::memcmp(bytes.data(), "DKIF", 4) != 0) {
-		throw std::runtime_error("AV1 preview expects IVF data");
+		throw std::runtime_error(std::string(codec) + " preview expects IVF data");
 	}
 	if (read_u16le(bytes.data() + 6) != 32) {
 		throw std::runtime_error("unsupported IVF header size");
 	}
-	if (std::memcmp(bytes.data() + 8, "AV01", 4) != 0) {
-		throw std::runtime_error("IVF stream is not AV1");
+	if (std::memcmp(bytes.data() + 8, fourcc, 4) != 0) {
+		throw std::runtime_error("IVF stream is not " + std::string(codec));
 	}
 	const uint32_t frameSize = read_u32le(bytes.data() + 32);
 	if (frameSize == 0 || 44ull + frameSize > bytes.size()) {
@@ -394,10 +523,6 @@ std::shared_ptr<const RawImage> copy_vvdec_frame(const vvdecFrame* frame) {
 
 } // namespace
 
-DecodeResult no_preview_decode(const EncodedImage&) {
-	return {nullptr, "preview decoder is not wired for this backend yet"};
-}
-
 DecodeResult decode_embedded_preview(const EncodedImage& encoded) {
 	if (encoded.previewImage) {
 		return {encoded.previewImage, {}};
@@ -548,7 +673,7 @@ DecodeResult decode_jpegxl_preview(const EncodedImage& encoded) {
 	try {
 		std::unique_ptr<JxlDecoder, decltype(&JxlDecoderDestroy)> dec(JxlDecoderCreate(nullptr), JxlDecoderDestroy);
 		if (!dec) throw std::runtime_error("JxlDecoderCreate failed");
-		if (JxlDecoderSubscribeEvents(dec.get(), JXL_DEC_BASIC_INFO | JXL_DEC_FULL_IMAGE) != JXL_DEC_SUCCESS) {
+		if (JxlDecoderSubscribeEvents(dec.get(), JXL_DEC_BASIC_INFO | JXL_DEC_COLOR_ENCODING | JXL_DEC_FULL_IMAGE) != JXL_DEC_SUCCESS) {
 			throw std::runtime_error("JxlDecoderSubscribeEvents failed");
 		}
 		if (JxlDecoderSetInput(dec.get(), reinterpret_cast<const uint8_t*>(encoded.hevcAnnexB.data()), encoded.hevcAnnexB.size()) != JXL_DEC_SUCCESS) {
@@ -556,27 +681,52 @@ DecodeResult decode_jpegxl_preview(const EncodedImage& encoded) {
 		}
 		JxlDecoderCloseInput(dec.get());
 		JxlBasicInfo info{};
-		std::vector<uint8_t> rgb;
-		const JxlPixelFormat format{3, JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 0};
+		JxlColorEncoding originalProfile{};
+		ColorDescription decodedColor;
+		bool haveColor = false;
+		std::vector<uint8_t> pixels;
+		JxlPixelFormat format{3, JXL_TYPE_UINT8, JXL_LITTLE_ENDIAN, 0};
 		for (;;) {
 			const JxlDecoderStatus status = JxlDecoderProcessInput(dec.get());
 			if (status == JXL_DEC_BASIC_INFO) {
 				if (JxlDecoderGetBasicInfo(dec.get(), &info) != JXL_DEC_SUCCESS) {
 					throw std::runtime_error("JxlDecoderGetBasicInfo failed");
 				}
+				if (info.exponent_bits_per_sample != 0 ||
+				    (info.bits_per_sample != 8 && info.bits_per_sample != 10 && info.bits_per_sample != 12 && info.bits_per_sample != 14)) {
+					throw std::runtime_error("JPEG XL preview supports integer 8-, 10-, 12-, and 14-bit codestreams; got " + std::to_string(info.bits_per_sample) + "-bit with " + std::to_string(info.exponent_bits_per_sample) + " exponent bits");
+				}
+				if (info.num_color_channels != 1 && info.num_color_channels != 3) {
+					throw std::runtime_error("unsupported JPEG XL color channel count: " + std::to_string(info.num_color_channels));
+				}
+				format.num_channels = info.num_color_channels;
+				format.data_type = info.bits_per_sample == 8 ? JXL_TYPE_UINT8 : JXL_TYPE_UINT16;
+			} else if (status == JXL_DEC_COLOR_ENCODING) {
+				if (JxlDecoderGetColorAsEncodedProfile(dec.get(), JXL_COLOR_PROFILE_TARGET_ORIGINAL, &originalProfile) != JXL_DEC_SUCCESS) {
+					throw std::runtime_error("JPEG XL codestream has no usable structured color profile");
+				}
+				decodedColor = encoded.codedColor.value_or(color_description_from_jxl(originalProfile));
+				haveColor = true;
+				if (info.uses_original_profile == JXL_FALSE &&
+				    JxlDecoderSetPreferredColorProfile(dec.get(), &originalProfile) != JXL_DEC_SUCCESS) {
+					throw std::runtime_error("JPEG XL decoder could not convert its reconstruction to the codestream's original color profile");
+				}
+			} else if (status == JXL_DEC_NEED_IMAGE_OUT_BUFFER) {
+				if (info.xsize == 0 || info.ysize == 0) throw std::runtime_error("JPEG XL decoder requested an output buffer before reporting dimensions");
 				size_t outSize = 0;
 				if (JxlDecoderImageOutBufferSize(dec.get(), &format, &outSize) != JXL_DEC_SUCCESS) {
-					outSize = static_cast<std::size_t>(info.xsize) * info.ysize * 3;
+					throw std::runtime_error("JxlDecoderImageOutBufferSize failed");
 				}
-				rgb.resize(outSize);
-				if (JxlDecoderSetImageOutBuffer(dec.get(), &format, rgb.data(), rgb.size()) != JXL_DEC_SUCCESS) {
+				pixels.resize(outSize);
+				if (JxlDecoderSetImageOutBuffer(dec.get(), &format, pixels.data(), pixels.size()) != JXL_DEC_SUCCESS) {
 					throw std::runtime_error("JxlDecoderSetImageOutBuffer failed");
 				}
 			} else if (status == JXL_DEC_FULL_IMAGE || status == JXL_DEC_SUCCESS) {
-				if (rgb.empty() || info.xsize == 0 || info.ysize == 0) {
+				if (pixels.empty() || info.xsize == 0 || info.ysize == 0) {
 					throw std::runtime_error("JPEG XL decoder produced no image");
 				}
-				return {rgb8_to_yuv444_preview(rgb, static_cast<int>(info.xsize), static_cast<int>(info.ysize)), {}};
+				if (!haveColor) throw std::runtime_error("JPEG XL decoder produced pixels without color metadata");
+				return {jxl_pixels_to_preview(pixels, static_cast<int>(info.xsize), static_cast<int>(info.ysize), static_cast<int>(info.bits_per_sample), info.num_color_channels, decodedColor), {}};
 			} else if (status == JXL_DEC_NEED_MORE_INPUT) {
 				throw std::runtime_error("JPEG XL decoder requested more input");
 			} else if (status == JXL_DEC_ERROR) {
@@ -785,6 +935,41 @@ DecodeResult decode_av1_preview(const EncodedImage& encoded) {
 		return {nullptr, "dav1d produced no preview picture"};
 	} catch (const std::exception& e) {
 		return {nullptr, e.what()};
+	}
+}
+
+DecodeResult decode_av2_preview(const EncodedImage& encoded) {
+	if (encoded.hevcAnnexB.empty()) {
+		return {nullptr, "AV2 encoded byte buffer is empty"};
+	}
+	try {
+		const IvfFrame frame = first_ivf_frame(encoded.hevcAnnexB, "AV02", "AV2");
+		CodecVisDav2dPicture decoded{};
+		char error[512]{};
+		if (codec_vis_dav2d_decode(reinterpret_cast<const uint8_t*>(frame.data), frame.size, &decoded, error, sizeof(error)) != 0) {
+			return {nullptr, error[0] == '\0' ? "dav2d decode failed" : error};
+		}
+		std::unique_ptr<CodecVisDav2dPicture, void (*)(CodecVisDav2dPicture*)> cleanup(&decoded, codec_vis_dav2d_picture_free);
+		auto image = std::make_shared<RawImage>();
+		image->width = decoded.width;
+		image->height = decoded.height;
+		const bool high = decoded.bit_depth > 8;
+		switch (decoded.layout) {
+			case 0: image->format = high ? PixelFormat::Gray10LE : PixelFormat::Gray8; break;
+			case 1: image->format = high ? PixelFormat::YUV420P10LE : PixelFormat::YUV420P8; break;
+			case 2: image->format = high ? PixelFormat::YUV422P10LE : PixelFormat::YUV422P8; break;
+			case 3: image->format = high ? PixelFormat::YUV444P10LE : PixelFormat::YUV444P8; break;
+			default: return {nullptr, "dav2d returned an unsupported pixel layout"};
+		}
+		const int planes = decoded.layout == 0 ? 1 : 3;
+		for (int plane = 0; plane < planes; ++plane) {
+			const int height = plane == 0 || decoded.layout == 2 || decoded.layout == 3 ? decoded.height : (decoded.height + 1) / 2;
+			image->planes[plane].strideBytes = decoded.strides[plane];
+			image->planes[plane].bytes.assign(decoded.planes[plane], decoded.planes[plane] + static_cast<std::size_t>(decoded.strides[plane]) * height);
+		}
+		return {std::move(image), {}};
+	} catch (const std::exception& error) {
+		return {nullptr, error.what()};
 	}
 }
 

@@ -15,9 +15,6 @@ namespace codec_gui::gui {
 		std::vector<const ImageObject*> out;
 		out.reserve(state.images.size());
 		for (const ImageObject& image : state.images) {
-			if (image.type == ImageObjectType::Derived) {
-				continue;
-			}
 			out.push_back(&image);
 		}
 

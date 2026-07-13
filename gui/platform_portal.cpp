@@ -67,9 +67,8 @@ Action action_from_open_portal_response(uint32_t response, const std::vector<std
 
 Action action_from_save_portal_response(ImageId image, uint32_t response, const std::vector<std::string>& uris) {
 	Action action;
-	action.kind = ActionKind::SaveFailed;
+	action.kind = ActionKind::SaveCanceled;
 	action.image = image;
-	action.text = "save canceled";
 	if (response == 0 && !uris.empty()) {
 		action.kind = ActionKind::SaveEncodedResult;
 		action.path = decode_portal_file_uri(uris.front());
@@ -152,9 +151,8 @@ Action show_save_file_portal(ImageId image, const std::filesystem::path& suggest
 
 	std::atomic<bool> done = false;
 	Action action;
-	action.kind = ActionKind::SaveFailed;
+	action.kind = ActionKind::SaveCanceled;
 	action.image = image;
-	action.text = "save canceled";
 	auto request = sdbus::createProxy(
 		*connection,
 		sdbus::ServiceName{"org.freedesktop.portal.Desktop"},

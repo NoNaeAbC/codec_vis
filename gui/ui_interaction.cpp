@@ -1,6 +1,7 @@
 #include "ui_interaction.hpp"
 
 #include "image_list_model.hpp"
+#include "encoder_param_state.hpp"
 #include "storage.hpp"
 
 #include <algorithm>
@@ -131,7 +132,7 @@ double slider_float_value(const EncoderParamInfo& param, Rect control, Point poi
 std::vector<EncoderParam> config_params_or_defaults(const AppState& state, const BackendInfo& backend) {
 	std::vector<EncoderParam> params;
 	for (const EncoderParamInfo& info : backend.params) {
-		if (!info.relevantForStillImage || info.name == "implementation") {
+		if (!info.relevantForStillImage || info.name == "implementation" || !parameter_is_enabled(state, backend, info)) {
 			continue;
 		}
 		EncoderParam param;
@@ -205,24 +206,24 @@ float selected_run_details_end_y(const AppState& state, Rect inspector, float y)
 }
 
 std::vector<Action> queue_panel_action(const AppState& state, Rect inspector, float y, Point point) {
-	if (state.encodeRuns.empty() || y + 44.0f >= inspector.y + inspector.h) {
+	if (state.encodeRuns.empty() || y + 62.0f > inspector.y + inspector.h) {
 		return {};
 	}
 	y += 22.0f;
 	std::size_t shown = 0;
 	for (auto it = state.encodeRuns.rbegin(); it != state.encodeRuns.rend() && shown < 4; ++it) {
 		const EncodeRun& run = *it;
-		if (y + 34.0f >= inspector.y + inspector.h) {
+		if (y + 36.0f > inspector.y + inspector.h) {
 			break;
 		}
-		const Rect row{inspector.x + 12.0f, y, inspector.w - 24.0f, 30.0f};
+		const Rect row{inspector.x + 12.0f, y, inspector.w - 24.0f, 36.0f};
 		if (contains(row, point)) {
 			Action action;
 			action.kind = ActionKind::SelectEncodeRun;
 			action.run = run.id;
 			return {action};
 		}
-		y += 34.0f;
+		y += 40.0f;
 		++shown;
 	}
 	return {};
@@ -254,6 +255,8 @@ std::vector<Action> command_bar_action(const AppState& state, const LayoutResult
 		{834, 60, "grid"},
 		{900, 52, "fit"},
 		{958, 64, "100"},
+		{1028, 110, "delete"},
+		{1144, 144, "scratch"},
 	};
 	for (const Button& button : buttons) {
 		Rect rect{layout.commandBar.x + button.x, layout.commandBar.y, button.w, layout.commandBar.h};
@@ -302,6 +305,18 @@ std::vector<Action> command_bar_action(const AppState& state, const LayoutResult
 			action.kind = ActionKind::SaveEncodedResult;
 			action.image = image;
 			return {std::move(action)};
+		}
+		if (std::string(button.name) == "delete") {
+			if (!valid(state.selection.selectedImage)) return {};
+			Action action;
+			action.kind = ActionKind::RemoveImage;
+			action.image = state.selection.selectedImage;
+			return {action};
+		}
+		if (std::string(button.name) == "scratch") {
+			Action action;
+			action.kind = ActionKind::ToggleScratchResults;
+			return {action};
 		}
 		if (std::string(button.name) == "single") {
 			Action action;
@@ -360,7 +375,7 @@ std::vector<Action> image_list_action(const AppState& state, const LayoutResult&
 		action.sortKey = next_sort_key(state.imageList.sortKey);
 		return {action};
 	}
-	float y = layout.imageList.y + 42;
+	float y = layout.imageList.y + 42.0f - state.imageList.scrollOffset;
 	for (const ImageObject* imagePtr : ordered_images(state)) {
 		const ImageObject& image = *imagePtr;
 		Rect row{layout.imageList.x + 6, y - 2, layout.imageList.w - 12, 50};
@@ -409,7 +424,7 @@ std::vector<Action> inspector_action(const AppState& state, const LayoutResult& 
 	if (!contains(layout.inspector, point)) {
 		return {};
 	}
-	float y = layout.inspector.y + 42.0f + 22.0f;
+	float y = layout.inspector.y + 42.0f + 22.0f - state.layout.inspectorScrollOffset;
 	for (const BackendInfo& candidate : state.backends) {
 		if (contains(backend_row_rect(layout.inspector, y), point)) {
 			Action action;
@@ -424,10 +439,10 @@ std::vector<Action> inspector_action(const AppState& state, const LayoutResult& 
 		return {};
 	}
 	y = backend_selector_end_y(state, layout.inspector) + 22.0f;
+	y -= state.layout.inspectorScrollOffset;
 	std::string currentGroup;
-	int renderedParams = 0;
 	for (const EncoderParamInfo& param : backend->params) {
-		if (!param.relevantForStillImage || y + 44 > layout.inspector.y + layout.inspector.h - 120) {
+		if (!param.relevantForStillImage) {
 			continue;
 		}
 		if (param.group != currentGroup) {
@@ -436,7 +451,7 @@ std::vector<Action> inspector_action(const AppState& state, const LayoutResult& 
 		}
 		Rect control{layout.inspector.x + layout.inspector.w * 0.50f, y - 2, layout.inspector.w * 0.44f, 20};
 		if (contains(control, point)) {
-			if (param.name == "implementation") {
+			if (param.name == "implementation" || !parameter_is_enabled(state, *backend, param)) {
 				return {};
 			}
 			const ParamValue value = current_value(state, backend->id, param);
@@ -455,24 +470,24 @@ std::vector<Action> inspector_action(const AppState& state, const LayoutResult& 
 				return {set_param_action(backend->id, param, param.enumValues[index].value)};
 			}
 			if (param.kind == ParamKind::Int) {
-				if (param.intRange) {
+				if (param.intRange && !param.directNumericInput) {
 					return {set_param_action(backend->id, param, slider_int_value(param, control, point))};
 				}
 				int64_t current = 0;
 				if (const int64_t* intValue = std::get_if<int64_t>(&value)) {
 					current = *intValue;
 				}
-				return {set_param_action(backend->id, param, current + 1)};
+				return {set_param_action(backend->id, param, current)};
 			}
 			if (param.kind == ParamKind::Float) {
-				if (param.floatRange) {
+				if (param.floatRange && !param.directNumericInput) {
 					return {set_param_action(backend->id, param, slider_float_value(param, control, point))};
 				}
 				double current = 0.0;
 				if (const double* doubleValue = std::get_if<double>(&value)) {
 					current = *doubleValue;
 				}
-				return {set_param_action(backend->id, param, current + 0.1)};
+				return {set_param_action(backend->id, param, current)};
 			}
 			if (param.kind == ParamKind::String) {
 				std::string current;
@@ -483,10 +498,6 @@ std::vector<Action> inspector_action(const AppState& state, const LayoutResult& 
 			}
 		}
 		y += 24;
-		++renderedParams;
-		if (renderedParams >= 16) {
-			break;
-		}
 	}
 	const std::vector<Action> queueActions = queue_panel_action(state, layout.inspector, selected_run_details_end_y(state, layout.inspector, y), point);
 	if (!queueActions.empty()) {
@@ -498,6 +509,12 @@ std::vector<Action> inspector_action(const AppState& state, const LayoutResult& 
 } // namespace
 
 std::vector<Action> actions_for_pointer_press(const AppState& state, const LayoutResult& layout, Point point) {
+	if (!state.errors.empty() && contains(layout.statusBar, point)) {
+		Action dismiss;
+		dismiss.kind = ActionKind::ErrorDismissed;
+		dismiss.value = static_cast<double>(state.errors.front().id);
+		return {dismiss};
+	}
 	if (contains(layout.commandBar, point)) {
 		return command_bar_action(state, layout, point);
 	}
@@ -506,6 +523,29 @@ std::vector<Action> actions_for_pointer_press(const AppState& state, const Layou
 	}
 	if (contains(layout.inspector, point)) {
 		return inspector_action(state, layout, point);
+	}
+	return {};
+}
+
+std::vector<Action> actions_for_pointer_move(const AppState& state, const LayoutResult& layout, Point point) {
+	const BackendInfo* backend = selected_backend(state);
+	if (backend == nullptr || state.interaction.activePointerCapture.empty()) return {};
+	float y = backend_selector_end_y(state, layout.inspector) + 22.0f - state.layout.inspectorScrollOffset;
+	std::string currentGroup;
+	for (const EncoderParamInfo& param : backend->params) {
+		if (!param.relevantForStillImage) continue;
+		if (param.group != currentGroup) {
+			currentGroup = param.group;
+			y += 24.0f;
+		}
+		const std::string widgetId = "param:" + std::to_string(backend->id.value) + ":" + param.name;
+		if (widgetId == state.interaction.activePointerCapture && parameter_is_enabled(state, *backend, param)) {
+			const Rect control{layout.inspector.x + layout.inspector.w * 0.50f, y - 2.0f, layout.inspector.w * 0.44f, 20.0f};
+			if (param.kind == ParamKind::Int && param.intRange && !param.directNumericInput) return {set_param_action(backend->id, param, slider_int_value(param, control, point))};
+			if (param.kind == ParamKind::Float && param.floatRange && !param.directNumericInput) return {set_param_action(backend->id, param, slider_float_value(param, control, point))};
+			return {};
+		}
+		y += 24.0f;
 	}
 	return {};
 }

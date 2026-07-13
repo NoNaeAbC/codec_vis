@@ -453,7 +453,10 @@ int main() {
 		std::vector<Rect> imageRects;
 		std::vector<Rect> scissors;
 		for (const DrawCommand& command : splitCommands) {
-			if (command.kind == DrawCommandKind::ScissorBegin) {
+			if (command.kind == DrawCommandKind::ScissorBegin &&
+			    command.rect.y == splitLayout.viewer.y &&
+			    command.rect.h == splitLayout.viewer.h &&
+			    command.rect.w < splitLayout.viewer.w) {
 				scissors.push_back(command.rect);
 			}
 			if (command.kind == DrawCommandKind::Image) {

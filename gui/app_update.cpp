@@ -50,6 +50,7 @@ const char* action_name(ActionKind kind) {
 		case ActionKind::SourceLoaded: return "SourceLoaded";
 		case ActionKind::SourceLoadFailed: return "SourceLoadFailed";
 		case ActionKind::SelectImage: return "SelectImage";
+		case ActionKind::RemoveImage: return "RemoveImage";
 		case ActionKind::SelectPane: return "SelectPane";
 		case ActionKind::AssignImageToPane: return "AssignImageToPane";
 		case ActionKind::ClearPaneImage: return "ClearPaneImage";
@@ -64,6 +65,7 @@ const char* action_name(ActionKind kind) {
 		case ActionKind::SetImageListSort: return "SetImageListSort";
 		case ActionKind::SelectBackend: return "SelectBackend";
 		case ActionKind::SetEncoderParam: return "SetEncoderParam";
+		case ActionKind::ToggleScratchResults: return "ToggleScratchResults";
 		case ActionKind::RefreshBackendCapabilities: return "RefreshBackendCapabilities";
 		case ActionKind::BackendCapabilitiesReady: return "BackendCapabilitiesReady";
 		case ActionKind::BackendCapabilitiesFailed: return "BackendCapabilitiesFailed";
@@ -80,6 +82,7 @@ const char* action_name(ActionKind kind) {
 		case ActionKind::EncodeRunCanceled: return "EncodeRunCanceled";
 		case ActionKind::SaveEncodedResult: return "SaveEncodedResult";
 		case ActionKind::SaveCompleted: return "SaveCompleted";
+		case ActionKind::SaveCanceled: return "SaveCanceled";
 		case ActionKind::SaveFailed: return "SaveFailed";
 		case ActionKind::PointerMoved: return "PointerMoved";
 		case ActionKind::PointerPressed: return "PointerPressed";
@@ -237,26 +240,48 @@ bool apply_text_input(AppState& state, const Action& action) {
 		return false;
 	}
 	const EncoderParamInfo* info = find_param_info(state, backend, name);
-	if (info == nullptr || info->kind != ParamKind::String) {
+	if (info == nullptr || (info->kind != ParamKind::String && !info->directNumericInput)) {
 		return false;
 	}
 	ParamValue value = current_param_value(state, backend, *info);
 	std::string text;
 	if (const std::string* existing = std::get_if<std::string>(&value)) {
 		text = *existing;
+	} else if (const int64_t* existing = std::get_if<int64_t>(&value)) {
+		text = std::to_string(*existing);
+	} else if (const double* existing = std::get_if<double>(&value)) {
+		text = std::to_string(*existing);
 	}
 	if (action.text == "backspace") {
+		if (info->directNumericInput && state.interaction.replaceFocusedNumericValue) text.clear();
 		if (!text.empty()) {
 			text.pop_back();
 		}
 	} else if (action.text == "escape" || action.text == "enter" || action.text == "fit" || action.text == "100%") {
+		state.interaction.replaceFocusedNumericValue = false;
 		return false;
 	} else {
-		text += action.text;
+		if (info->directNumericInput && state.interaction.replaceFocusedNumericValue) text = action.text;
+		else text += action.text;
 	}
+	state.interaction.replaceFocusedNumericValue = false;
 	EncoderParam param;
 	param.name = name;
-	param.value = std::move(text);
+	if (info->kind == ParamKind::Int) {
+		try {
+			const int64_t parsed = std::stoll(text.empty() || text == "-" ? "0" : text);
+			const IntRange range = info->intRange.value_or(IntRange{INT64_MIN, INT64_MAX, 1});
+			param.value = std::clamp(parsed, range.min, range.max);
+		} catch (const std::exception&) { return true; }
+	} else if (info->kind == ParamKind::Float) {
+		try {
+			const double parsed = std::stod(text.empty() || text == "-" ? "0" : text);
+			const FloatRange range = info->floatRange.value_or(FloatRange{-1.0e300, 1.0e300, 0.01});
+			param.value = std::clamp(parsed, range.min, range.max);
+		} catch (const std::exception&) { return true; }
+	} else {
+		param.value = std::move(text);
+	}
 	set_encoder_param(state, backend, std::move(param));
 	return true;
 }
@@ -493,6 +518,34 @@ void append_error(AppState& state, ErrorSeverity severity, std::string operation
 	state.errors.push_back(std::move(error));
 }
 
+ColorMetadata color_metadata(const ColorDescription& color) {
+	ColorMetadata out;
+	switch (color.primaries) {
+		case ColorPrimaries::BT709: out.primaries = "bt709"; break;
+		case ColorPrimaries::BT2020: out.primaries = "bt2020"; break;
+		case ColorPrimaries::DisplayP3: out.primaries = "display-p3"; break;
+		default: out.primaries = "unspecified (H.273 " + std::to_string(static_cast<int>(color.primaries)) + ")"; break;
+	}
+	switch (color.transfer) {
+		case TransferCharacteristics::SRGB: out.transfer = "srgb"; break;
+		case TransferCharacteristics::BT709: out.transfer = "bt709"; break;
+		case TransferCharacteristics::Linear: out.transfer = "linear"; break;
+		case TransferCharacteristics::PQ: out.transfer = "pq"; break;
+		case TransferCharacteristics::HLG: out.transfer = "hlg"; break;
+		case TransferCharacteristics::BT2020_10: out.transfer = "bt2020-10"; break;
+		case TransferCharacteristics::BT2020_12: out.transfer = "bt2020-12"; break;
+		default: out.transfer = "unspecified (H.273 " + std::to_string(static_cast<int>(color.transfer)) + ")"; break;
+	}
+	switch (color.matrix) {
+		case MatrixCoefficients::Identity: out.matrix = "identity"; break;
+		case MatrixCoefficients::BT709: out.matrix = "bt709"; break;
+		case MatrixCoefficients::BT2020NonConstant: out.matrix = "bt2020nc"; break;
+		default: out.matrix = "unspecified (H.273 " + std::to_string(static_cast<int>(color.matrix)) + ")"; break;
+	}
+	out.fullRange = color.range == ColorRange::Full;
+	return out;
+}
+
 UpdateResult update(AppState state, const Action& action) {
 	UpdateResult result;
 	result.state = std::move(state);
@@ -533,19 +586,7 @@ UpdateResult update(AppState state, const Action& action) {
 			source.width = action.sourceLoaded.image->width;
 			source.height = action.sourceLoaded.image->height;
 			source.pixelFormat = action.sourceLoaded.image->format;
-			source.color.primaries =
-				action.sourceLoaded.image->color.primaries == ColorPrimaries::BT2020 ? "bt2020" :
-				action.sourceLoaded.image->color.primaries == ColorPrimaries::BT709 ? "bt709" : "unspecified";
-			source.color.transfer =
-				action.sourceLoaded.image->color.transfer == TransferCharacteristics::PQ ? "pq" :
-				action.sourceLoaded.image->color.transfer == TransferCharacteristics::HLG ? "hlg" :
-				action.sourceLoaded.image->color.transfer == TransferCharacteristics::BT709 ? "bt709" :
-				action.sourceLoaded.image->color.transfer == TransferCharacteristics::SRGB ? "srgb" : "unspecified";
-			source.color.matrix =
-				action.sourceLoaded.image->color.matrix == MatrixCoefficients::BT2020NonConstant ? "bt2020nc" :
-				action.sourceLoaded.image->color.matrix == MatrixCoefficients::BT709 ? "bt709" :
-				action.sourceLoaded.image->color.matrix == MatrixCoefficients::Identity ? "identity" : "unspecified";
-			source.color.fullRange = action.sourceLoaded.image->color.range == ColorRange::Full;
+			source.color = color_metadata(action.sourceLoaded.image->color);
 			source.decoded = action.sourceLoaded.image;
 			result.state.images.erase(
 				std::remove_if(result.state.images.begin(), result.state.images.end(), [](const ImageObject& image) {
@@ -626,6 +667,25 @@ UpdateResult update(AppState state, const Action& action) {
 				append_error(result.state, ErrorSeverity::Warning, "select image", "viewer", "invalid image id");
 			}
 			break;
+		case ActionKind::RemoveImage: {
+			const auto active = std::find_if(result.state.encodeRuns.begin(), result.state.encodeRuns.end(), [&](const EncodeRun& run) {
+				return run.source == action.image && (run.state == EncodeRunState::Queued || run.state == EncodeRunState::Running || run.state == EncodeRunState::CancelRequested);
+			});
+			if (active != result.state.encodeRuns.end()) {
+				append_error(result.state, ErrorSeverity::Warning, "remove image", "image list", "cannot remove an image while its encode is active; cancel the run first");
+				append_command(result, CommandKind::RequestRedraw);
+				break;
+			}
+			result.state.images.erase(std::remove_if(result.state.images.begin(), result.state.images.end(), [&](const ImageObject& image) { return image.id == action.image; }), result.state.images.end());
+			for (ImageObject& image : result.state.images) {
+				image.parents.erase(std::remove(image.parents.begin(), image.parents.end(), action.image), image.parents.end());
+			}
+			for (Pane& pane : result.state.panes) if (pane.image == action.image) pane.image.reset();
+			for (EncodeRun& run : result.state.encodeRuns) if (run.producedImage == action.image) run.producedImage.reset();
+			if (result.state.selection.selectedImage == action.image) result.state.selection.selectedImage = {};
+			append_command(result, CommandKind::RequestRedraw);
+			break;
+		}
 		case ActionKind::SelectPane:
 			if (find_pane(result.state, action.pane) != nullptr) {
 				result.state.selection.activePane = action.pane;
@@ -730,10 +790,27 @@ UpdateResult update(AppState state, const Action& action) {
 			result.state.selection.selectedBackend = action.backend;
 			break;
 		case ActionKind::SetEncoderParam: {
-			result.state.interaction.focusedWidget = param_widget_id(action.backend, action.param.name);
+			const std::string widgetId = param_widget_id(action.backend, action.param.name);
+			result.state.interaction.focusedWidget = widgetId;
+			if (const BackendInfo* backend = find_backend(result.state, action.backend)) {
+				const auto info = std::find_if(backend->params.begin(), backend->params.end(), [&](const EncoderParamInfo& param) { return param.name == action.param.name; });
+				if (info != backend->params.end() &&
+				    !info->directNumericInput &&
+				    ((info->kind == ParamKind::Int && info->intRange) || (info->kind == ParamKind::Float && info->floatRange))) {
+					result.state.interaction.activePointerCapture = widgetId;
+				}
+				if (info != backend->params.end() && info->directNumericInput) {
+					result.state.interaction.replaceFocusedNumericValue = true;
+				}
+			}
 			set_encoder_param(result.state, action.backend, action.param);
+			append_command(result, CommandKind::RequestRedraw);
 			break;
 		}
+		case ActionKind::ToggleScratchResults:
+			result.state.scratchResults = !result.state.scratchResults;
+			append_command(result, CommandKind::RequestRedraw);
+			break;
 		case ActionKind::RefreshBackendCapabilities: {
 			Command command;
 			command.kind = CommandKind::QueryBackendCapabilities;
@@ -803,7 +880,7 @@ UpdateResult update(AppState state, const Action& action) {
 			image->width = action.derivedImage.image->width;
 			image->height = action.derivedImage.image->height;
 			image->pixelFormat = action.derivedImage.image->format;
-			image->color.fullRange = action.derivedImage.image->color.range == ColorRange::Full;
+			image->color = color_metadata(action.derivedImage.image->color);
 			image->decoded = action.derivedImage.image;
 			image->encoded.reset();
 			image->derived = DerivedMetadata{"absolute-difference", action.derivedImage.gain};
@@ -838,6 +915,7 @@ UpdateResult update(AppState state, const Action& action) {
 			run.source = action.image;
 			run.backend = action.backend;
 			run.params = action.params;
+			run.replacePreviousResult = result.state.scratchResults;
 			result.state.encodeRuns.push_back(run);
 			result.state.selection.selectedRun = run.id;
 			Command command;
@@ -868,20 +946,35 @@ UpdateResult update(AppState state, const Action& action) {
 			resultImage.displayName = action.encodeCompleted.metadata.backendName.empty()
 				? "Encoded result"
 				: action.encodeCompleted.metadata.backendName;
+			resultImage.displayName += "  run #" + std::to_string(run->id.value);
 			if (action.encodeCompleted.preview) {
 				resultImage.width = action.encodeCompleted.preview->width;
 				resultImage.height = action.encodeCompleted.preview->height;
 				resultImage.pixelFormat = action.encodeCompleted.preview->format;
-				resultImage.color.fullRange = action.encodeCompleted.preview->color.range == ColorRange::Full;
+				resultImage.color = color_metadata(action.encodeCompleted.preview->color);
 			} else if (source != nullptr) {
 				resultImage.width = source->width;
 				resultImage.height = source->height;
-				resultImage.pixelFormat = source->pixelFormat;
+				resultImage.pixelFormat = action.encodeCompleted.metadata.codedPixelFormat;
+				resultImage.color = color_metadata(action.encodeCompleted.metadata.codedColor);
 			}
 			resultImage.decoded = action.encodeCompleted.preview;
 			resultImage.encoded = action.encodeCompleted.metadata;
 			resultImage.encoded->byteSize = resultImage.encoded->bytes.size();
 			resultImage.parents.push_back(run->source);
+			if (run->replacePreviousResult) {
+				std::vector<ImageId> removed;
+				for (const ImageObject& image : result.state.images) {
+					if (image.encoded && image.encoded->backend == run->backend &&
+					    std::find(image.parents.begin(), image.parents.end(), run->source) != image.parents.end()) {
+						removed.push_back(image.id);
+					}
+				}
+				auto isRemoved = [&](ImageId id) { return std::find(removed.begin(), removed.end(), id) != removed.end(); };
+				result.state.images.erase(std::remove_if(result.state.images.begin(), result.state.images.end(), [&](const ImageObject& image) { return isRemoved(image.id); }), result.state.images.end());
+				for (Pane& pane : result.state.panes) if (pane.image && isRemoved(*pane.image)) pane.image.reset();
+				for (EncodeRun& oldRun : result.state.encodeRuns) if (oldRun.producedImage && isRemoved(*oldRun.producedImage)) oldRun.producedImage.reset();
+			}
 			run->state = EncodeRunState::Completed;
 			if (action.value > 0.0) {
 				run->finishedSeconds = action.value;
@@ -970,6 +1063,8 @@ UpdateResult update(AppState state, const Action& action) {
 				result.state.storage.lastExportDirectory = action.path.parent_path();
 			}
 			break;
+		case ActionKind::SaveCanceled:
+			break;
 		case ActionKind::SaveFailed:
 			append_error(result.state, ErrorSeverity::Error, "save encoded result", "storage", action.text);
 			break;
@@ -1011,7 +1106,46 @@ UpdateResult update(AppState state, const Action& action) {
 			result.state.interaction.activePointerCapture.clear();
 			result.state.interaction.lastPointer = action.point;
 			break;
-		case ActionKind::PointerScrolled:
+		case ActionKind::PointerScrolled: {
+			const LayoutResult layout = compute_layout(
+				result.state.layout,
+				result.state.interaction.framebufferWidth,
+				result.state.interaction.framebufferHeight,
+				result.state.interaction.outputScale
+			);
+			auto contains = [](Rect rect, Point point) {
+				return point.x >= rect.x && point.y >= rect.y &&
+				       point.x < rect.x + rect.w && point.y < rect.y + rect.h;
+			};
+			if (contains(layout.imageList, action.point)) {
+				const float contentHeight = 42.0f + 56.0f * static_cast<float>(result.state.images.size());
+				const float maximum = std::max(0.0f, contentHeight - layout.imageList.h);
+				result.state.imageList.scrollOffset = std::clamp(
+					result.state.imageList.scrollOffset + static_cast<float>(action.value), 0.0f, maximum
+				);
+				append_command(result, CommandKind::RequestRedraw);
+				break;
+			}
+			if (contains(layout.inspector, action.point)) {
+				std::size_t parameterCount = 0;
+				for (const BackendInfo& backend : result.state.backends) {
+					if (backend.id == result.state.selection.selectedBackend) {
+						parameterCount = static_cast<std::size_t>(std::count_if(
+							backend.params.begin(), backend.params.end(),
+							[](const EncoderParamInfo& param) { return param.relevantForStillImage; }
+						));
+						break;
+					}
+				}
+				const float estimatedHeight = 120.0f + 24.0f * static_cast<float>(result.state.backends.size()) +
+				                              48.0f * static_cast<float>(parameterCount) + 420.0f;
+				const float maximum = std::max(0.0f, estimatedHeight - layout.inspector.h);
+				result.state.layout.inspectorScrollOffset = std::clamp(
+					result.state.layout.inspectorScrollOffset + static_cast<float>(action.value), 0.0f, maximum
+				);
+				append_command(result, CommandKind::RequestRedraw);
+				break;
+			}
 			if (std::optional<PaneId> paneId = pane_at_point(result.state, action.point)) {
 				Pane* pane = find_pane(result.state, *paneId);
 				if (pane != nullptr && pane->image) {
@@ -1025,6 +1159,7 @@ UpdateResult update(AppState state, const Action& action) {
 				}
 			}
 			break;
+		}
 		case ActionKind::KeyPressed:
 			if (action.text == "debug") {
 				result.state.debug.enabled = !result.state.debug.enabled;

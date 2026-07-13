@@ -14,7 +14,7 @@ namespace codec_gui::gui {
 		SliderInt,
 		SliderFloat,
 		NumericInput,
-		Dropdown,
+		SelectionPane,
 		TextInput,
 		TableList,
 		Splitter,

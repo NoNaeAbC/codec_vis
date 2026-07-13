@@ -32,4 +32,6 @@ libva sequence/picture/slice buffers expose the syntax/tool flags now surfaced b
 
 ## Not Encoding Knobs
 
-The DRM render node is an internal device selection detail and is not listed as a HEVC encoding knob. The encode path still uses the default internal device until a separate backend/device picker exists.
+The DRM render node is an internal device selection detail and is not listed as a HEVC encoding knob. Every usable render node is discovered independently and exposed as a distinct backend whose name includes the driver vendor and render-node identity. A failed node does not prevent other nodes from being queried or used.
+
+The controls for each backend come from that device's own encode profiles and `VAConfigAttrib*` values. Rate-control modes, bit depths, chroma layouts, quality range, packed-header support, tiling, and maximum dimensions are therefore never copied from another installed driver. The encode path revalidates the selected profile/format/rate-control combination immediately before creating the VA config so a driver change produces a specific error rather than undefined behaviour.

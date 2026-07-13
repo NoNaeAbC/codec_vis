@@ -165,9 +165,16 @@ void EncodeRunner::run_decode_worker() {
 		}
 
 		try {
+			const auto decodeStart = std::chrono::steady_clock::now();
 			DecodeResult preview = job.backend.decodePreview(job.encode.encoded);
+			job.encode.metadata.decodeSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - decodeStart).count();
 			if (preview.image) {
-				MetricResult metric = compute_quality_metrics(*job.source, *preview.image);
+				auto decoded = std::make_shared<RawImage>(*preview.image);
+				decoded->color = job.encode.comparisonReference->color;
+				preview.image = std::move(decoded);
+				const auto metricStart = std::chrono::steady_clock::now();
+				MetricResult metric = compute_quality_metrics(*job.encode.comparisonReference, *preview.image);
+				job.encode.metadata.metricSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - metricStart).count();
 				job.encode.metadata.psnrY = metric.psnrY;
 				job.encode.metadata.psnrRgb = metric.psnrAll;
 				job.encode.metadata.metrics = std::move(metric.metrics);

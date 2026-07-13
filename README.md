@@ -15,7 +15,9 @@ GPT-5.5 refuses to test the code it writes and did not bother hooking up many en
 - Compare source and encoded results in single, side-by-side, split, blink, diff, and grid views.
 - Sort runs by creation order, size, and other run metadata.
 - Inspect per-backend parameters from the right-side encoder panel.
-- Track encoded byte size, duration, PSNR, and MS-SSIM when available.
+- Select output precision (8/10/12/14-bit), chroma layout, H.273 color description, and explicit tone/gamut mapping before encoding.
+- Track exact encoded byte size, encode/decode/metric duration, PSNR, SSIM, MS-SSIM, PSNR-HVS, and CIEDE2000 when available.
+- Use scratch mode while tuning sliders or keep every result for a comparison series; results and derived images can be scrolled, inspected, and removed.
 
 ## Screenshots
 
@@ -57,6 +59,8 @@ make codec_vis_gui
 ```sh
 make test
 ```
+
+The release-blocking correctness matrix and manual visual protocol are in [docs/QA_PLAN.md](docs/QA_PLAN.md).
 
 ## Run
 

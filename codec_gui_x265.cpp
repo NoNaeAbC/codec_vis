@@ -64,15 +64,23 @@ namespace codec_gui {
 			switch (fmt) {
 				case PixelFormat::YUV420P8:
 				case PixelFormat::YUV420P10LE:
+				case PixelFormat::YUV420P12LE:
+				case PixelFormat::YUV420P14LE:
 					return X265_CSP_I420;
 				case PixelFormat::YUV422P8:
 				case PixelFormat::YUV422P10LE:
+				case PixelFormat::YUV422P12LE:
+				case PixelFormat::YUV422P14LE:
 					return X265_CSP_I422;
 				case PixelFormat::YUV444P8:
 				case PixelFormat::YUV444P10LE:
+				case PixelFormat::YUV444P12LE:
+				case PixelFormat::YUV444P14LE:
 					return X265_CSP_I444;
 				case PixelFormat::Gray8:
 				case PixelFormat::Gray10LE:
+				case PixelFormat::Gray12LE:
+				case PixelFormat::Gray14LE:
 					return X265_CSP_I400;
 			}
 			throw std::invalid_argument("unsupported pixel format");
@@ -90,6 +98,16 @@ namespace codec_gui {
 				case PixelFormat::YUV444P10LE:
 				case PixelFormat::Gray10LE:
 					return 10;
+				case PixelFormat::YUV420P12LE:
+				case PixelFormat::YUV422P12LE:
+				case PixelFormat::YUV444P12LE:
+				case PixelFormat::Gray12LE:
+					return 12;
+				case PixelFormat::YUV420P14LE:
+				case PixelFormat::YUV422P14LE:
+				case PixelFormat::YUV444P14LE:
+				case PixelFormat::Gray14LE:
+					return 14;
 			}
 			throw std::invalid_argument("unsupported pixel format");
 		}
@@ -98,6 +116,8 @@ namespace codec_gui {
 			switch (fmt) {
 				case PixelFormat::Gray8:
 				case PixelFormat::Gray10LE:
+				case PixelFormat::Gray12LE:
+				case PixelFormat::Gray14LE:
 					return 1;
 				default:
 					return 3;
@@ -166,14 +186,26 @@ namespace codec_gui {
 										{"auto", "Auto"},
 										{"main", "Main"},
 										{"main10", "Main 10"},
+										{"main12", "Main 12"},
 										{"mainstillpicture", "Main Still Picture"},
 										{"msp", "Main Still Picture alias"},
 										{"main444-8", "Main 4:4:4 8"},
 										{"main444-stillpicture", "Main 4:4:4 Still Picture"},
 										{"main444-10", "Main 4:4:4 10"},
+										{"main444-12", "Main 4:4:4 12"},
+										{"main422-12", "Main 4:2:2 12"},
 								},
 						.help = "HEVC profile restriction. For HEIC stills, mainstillpicture or main444-stillpicture "
 								"are usually the interesting choices.",
+				},
+				{
+						.name         = "rate-control",
+						.label        = "Rate-control mode",
+						.group        = "Rate Control",
+						.kind         = ParamKind::Enum,
+						.defaultValue = std::string{"crf"},
+						.enumValues   = {{"qp", "Constant QP"}, {"crf", "Constant quality (CRF)"}, {"lossless", "Lossless"}},
+						.help         = "Selects exactly one rate-control strategy. Inactive controls are disabled and are not sent to x265.",
 				},
 				{
 						.name         = "qp",
@@ -184,6 +216,7 @@ namespace codec_gui {
 						.intRange     = IntRange{0, 51, 1},
 						.help         = "Constant quantizer. Lower means larger and higher quality. Very relevant for "
 										"still-image comparisons.",
+						.enabledWhen  = {{"rate-control", {"qp"}, "QP is available only in Constant QP mode."}},
 				},
 				{
 						.name         = "crf",
@@ -194,6 +227,7 @@ namespace codec_gui {
 						.floatRange   = FloatRange{0.0, 51.0, 0.1},
 						.help         = "Constant rate factor. Better for perceptual target quality than exact "
 										"reproducibility.",
+						.enabledWhen  = {{"rate-control", {"crf"}, "CRF is available only in Constant quality mode."}},
 				},
 				{
 						.name         = "lossless",
@@ -202,6 +236,7 @@ namespace codec_gui {
 						.kind         = ParamKind::Bool,
 						.defaultValue = false,
 						.help         = "Enable mathematically lossless coding.",
+						.relevantForStillImage = false,
 				},
 				{
 						.name         = "rd",
@@ -355,6 +390,7 @@ namespace codec_gui {
 						.defaultValue = int64_t{1},
 						.intRange     = IntRange{1, 1000, 1},
 						.help         = "For still-image encoding, force this to 1.",
+						.relevantForStillImage = false,
 				},
 				{
 						.name         = "min-keyint",
@@ -364,6 +400,7 @@ namespace codec_gui {
 						.defaultValue = int64_t{1},
 						.intRange     = IntRange{1, 1000, 1},
 						.help         = "For still-image encoding, force this to 1.",
+						.relevantForStillImage = false,
 				},
 				{
 						.name         = "bframes",
@@ -373,6 +410,7 @@ namespace codec_gui {
 						.defaultValue = int64_t{0},
 						.intRange     = IntRange{0, X265_BFRAME_MAX, 1},
 						.help         = "For still-image encoding, force this to 0.",
+						.relevantForStillImage = false,
 				},
 				{
 						.name         = "ref",
@@ -382,6 +420,7 @@ namespace codec_gui {
 						.defaultValue = int64_t{1},
 						.intRange     = IntRange{1, 16, 1},
 						.help         = "For single-frame encoding, extra references are useless.",
+						.relevantForStillImage = false,
 				},
 		};
 	}
@@ -407,12 +446,15 @@ namespace codec_gui {
 
 		std::string requestedPreset;
 		std::string requestedTune;
+		std::string rateControl = "crf";
 		for (const EncoderParam &p: userParams) {
 			const std::string value = to_x265_value(p.value);
 			if (p.name == "preset") {
 				requestedPreset = value;
 			} else if (p.name == "tune") {
 				requestedTune = value;
+			} else if (p.name == "rate-control") {
+				rateControl = value;
 			}
 		}
 
@@ -444,17 +486,29 @@ namespace codec_gui {
 		param->internalBitDepth = bitDepth;
 		param->fpsNum           = 1;
 		param->fpsDenom         = 1;
+		param->vui.colorPrimaries = static_cast<int>(image.color.primaries);
+		param->vui.transferCharacteristics = static_cast<int>(image.color.transfer);
+		param->vui.matrixCoeffs = static_cast<int>(image.color.matrix);
+		param->vui.bEnableVideoFullRangeFlag = image.color.range == ColorRange::Full ? 1 : 0;
 
 		auto auto_profile = [](PixelFormat format) -> const char* {
 				switch (format) {
 					case PixelFormat::YUV420P8: return "main";
 					case PixelFormat::YUV420P10LE: return "main10";
+					case PixelFormat::YUV420P12LE: return "main12";
+					case PixelFormat::YUV420P14LE: return "main12";
 					case PixelFormat::YUV422P8: return "main422-10";
 					case PixelFormat::YUV422P10LE: return "main422-10";
+					case PixelFormat::YUV422P12LE: return "main422-12";
+					case PixelFormat::YUV422P14LE: return "main422-12";
 					case PixelFormat::YUV444P8: return "main444-8";
 				case PixelFormat::YUV444P10LE: return "main444-10";
+				case PixelFormat::YUV444P12LE: return "main444-12";
+				case PixelFormat::YUV444P14LE: return "main444-12";
 				case PixelFormat::Gray8: return "main";
 				case PixelFormat::Gray10LE: return "main10";
+				case PixelFormat::Gray12LE: return "main12";
+				case PixelFormat::Gray14LE: return "main12";
 			}
 			return "main";
 		};
@@ -464,7 +518,7 @@ namespace codec_gui {
 		for (const EncoderParam &p: userParams) {
 			const std::string value = to_x265_value(p.value);
 
-			if (p.name == "preset" || p.name == "tune") {
+			if (p.name == "preset" || p.name == "tune" || p.name == "rate-control") {
 				continue;
 			}
 
@@ -475,6 +529,21 @@ namespace codec_gui {
 
 			parse_or_throw(api, param.get(), p.name, value);
 		}
+		if (rateControl == "lossless") {
+			parse_or_throw(api, param.get(), "lossless", "1");
+		} else if (rateControl != "qp" && rateControl != "crf") {
+			throw std::invalid_argument("invalid x265 rate-control mode: " + rateControl);
+		}
+
+		// These are still-image invariants, not tunable controls. Re-apply them
+		// after parsing so callers cannot override them through expert params.
+		parse_or_throw(api, param.get(), "keyint", "1");
+		parse_or_throw(api, param.get(), "min-keyint", "1");
+		parse_or_throw(api, param.get(), "bframes", "0");
+		parse_or_throw(api, param.get(), "ref", "1");
+		parse_or_throw(api, param.get(), "scenecut", "0");
+		parse_or_throw(api, param.get(), "open-gop", "0");
+		parse_or_throw(api, param.get(), "rc-lookahead", "0");
 
 		if (requestedProfile == "auto") {
 			requestedProfile = auto_profile(image.format);

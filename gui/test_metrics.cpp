@@ -90,6 +90,10 @@ int main() {
 		EncodedMetadata metadata;
 		metadata.metrics = result.metrics;
 		assert(metric_by_id(metadata, "psnr-y") != nullptr);
+		assert(metric_by_id(metadata, "ssim") != nullptr);
+		assert(metric_by_id(metadata, "ssim")->value.has_value());
+		assert(metric_by_id(metadata, "ms-ssim") != nullptr);
+		assert(metric_by_id(metadata, "ms-ssim")->value.has_value());
 		assert(primary_metric(metadata) != nullptr);
 	}
 	return 0;

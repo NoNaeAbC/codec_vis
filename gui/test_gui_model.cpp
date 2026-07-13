@@ -473,6 +473,27 @@ int main() {
 		assert(result.state.images.back().type == ImageObjectType::EncodedResult);
 		assert(!result.state.images.back().decoded);
 		assert(result.state.images.back().encoded->byteSize == 2);
+
+		// Keeping comparison history is the safe default; scratch replacement is
+		// explicit application workflow state and is captured per run.
+		Action secondStart = start;
+		secondStart.image = source;
+		UpdateResult secondStarted = update(std::move(result.state), secondStart);
+		assert(!secondStarted.state.encodeRuns.back().replacePreviousResult);
+		Action secondCompleted = completed;
+		secondCompleted.encodeCompleted.run = secondStarted.state.encodeRuns.back().id;
+		UpdateResult kept = update(std::move(secondStarted.state), secondCompleted);
+		assert(kept.state.images.size() == 3);
+		Action scratch;
+		scratch.kind = ActionKind::ToggleScratchResults;
+		UpdateResult scratchEnabled = update(std::move(kept.state), scratch);
+		assert(scratchEnabled.state.scratchResults);
+		UpdateResult scratchStarted = update(std::move(scratchEnabled.state), secondStart);
+		assert(scratchStarted.state.encodeRuns.back().replacePreviousResult);
+		Action scratchCompleted = completed;
+		scratchCompleted.encodeCompleted.run = scratchStarted.state.encodeRuns.back().id;
+		UpdateResult replaced = update(std::move(scratchStarted.state), scratchCompleted);
+		assert(replaced.state.images.size() == 2);
 	}
 
 	{

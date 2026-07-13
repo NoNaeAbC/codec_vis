@@ -88,6 +88,10 @@ struct FormatInfo {
 			return {EB_YUV400, MAIN_PROFILE, 8, 1, {1, 1, 1}, {1, 1, 1}};
 		case PixelFormat::Gray10LE:
 			return {EB_YUV400, MAIN_PROFILE, 10, 1, {1, 1, 1}, {1, 1, 1}};
+		case PixelFormat::YUV420P12LE: case PixelFormat::YUV420P14LE:
+		case PixelFormat::YUV422P12LE: case PixelFormat::YUV422P14LE:
+		case PixelFormat::YUV444P12LE: case PixelFormat::YUV444P14LE:
+		case PixelFormat::Gray12LE: case PixelFormat::Gray14LE: break;
 	}
 
 	throw std::runtime_error("unsupported pixel format");
@@ -271,11 +275,11 @@ void force_still_image_config(EbSvtAv1EncConfiguration& cfg, const RawImage& ima
 	cfg.scene_change_detection = 0;
 	cfg.pass                   = 0;
 	cfg.avif                   = true;
-	cfg.color_primaries        = EB_CICP_CP_BT_709;
-	cfg.transfer_characteristics = EB_CICP_TC_SRGB;
-	cfg.matrix_coefficients    = EB_CICP_MC_BT_709;
-	cfg.color_range            = EB_CR_STUDIO_RANGE;
-	cfg.chroma_sample_position = EB_CSP_VERTICAL;
+	cfg.color_primaries        = static_cast<EbColorPrimaries>(image.color.primaries);
+	cfg.transfer_characteristics = static_cast<EbTransferCharacteristics>(image.color.transfer);
+	cfg.matrix_coefficients    = static_cast<EbMatrixCoefficients>(image.color.matrix);
+	cfg.color_range            = image.color.range == ColorRange::Full ? EB_CR_FULL_RANGE : EB_CR_STUDIO_RANGE;
+	cfg.chroma_sample_position = static_cast<EbChromaSamplePosition>(image.color.chroma420Location.value_or(Chroma420SampleLocation::LeftCenter));
 }
 
 [[nodiscard]] EncoderParamInfo bool_param(

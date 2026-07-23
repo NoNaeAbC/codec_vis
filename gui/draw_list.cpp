@@ -145,6 +145,31 @@ std::string format_bytes_both(uint64_t bytes) {
 	return std::to_string(bytes) + " B / " + format_bytes(bytes);
 }
 
+uint64_t raw_image_bytes(const RawImage& image) {
+	uint64_t bytes = 0;
+	for (const ImagePlane& plane : image.planes) {
+		bytes += static_cast<uint64_t>(plane.bytes.size());
+	}
+	return bytes;
+}
+
+std::string format_file_raw_sizes(uint64_t fileBytes, uint64_t rawBytes) {
+	constexpr double KiB = 1024.0;
+	constexpr double MiB = 1024.0 * 1024.0;
+	std::ostringstream oss;
+	oss.setf(std::ios::fixed);
+	if (fileBytes >= static_cast<uint64_t>(MiB) && rawBytes >= static_cast<uint64_t>(MiB)) {
+		oss.precision(2);
+		oss << "F/U " << static_cast<double>(fileBytes) / MiB << "/" << static_cast<double>(rawBytes) / MiB << " MiB";
+	} else if (fileBytes >= static_cast<uint64_t>(KiB) && rawBytes >= static_cast<uint64_t>(KiB)) {
+		oss.precision(1);
+		oss << "F/U " << static_cast<double>(fileBytes) / KiB << "/" << static_cast<double>(rawBytes) / KiB << " KiB";
+	} else {
+		oss << "F/U " << fileBytes << "/" << rawBytes << " B";
+	}
+	return oss.str();
+}
+
 std::string format_encoded_source_ratio(uint64_t encodedBytes, uint64_t sourceBytes) {
 	if (sourceBytes == 0) {
 		return "";
@@ -475,8 +500,13 @@ void draw_image_list(std::vector<DrawCommand>& out, const AppState& state, Rect 
 				detail += "  " + metric;
 			}
 		} else if (image.type == ImageObjectType::Source && image.sourceByteSize) {
-			detail += "  source ";
-			detail += format_bytes(*image.sourceByteSize);
+			if (image.decoded) {
+				detail += "  ";
+				detail += format_file_raw_sizes(*image.sourceByteSize, raw_image_bytes(*image.decoded));
+			} else {
+				detail += "  file ";
+				detail += format_bytes(*image.sourceByteSize);
+			}
 		}
 		const std::size_t paneButtons = std::min<std::size_t>(state.panes.size(), 4);
 		const float reservedButtons = static_cast<float>(paneButtons) * 38.0f +
@@ -976,6 +1006,13 @@ void draw_image_tooltip(std::vector<DrawCommand>& out, const AppState& state, co
 		for (const ParamSummary& param : hovered->encoded->keyParams) {
 			if (lines.size() >= 8) break;
 			lines.push_back(param.name + " = " + param.value);
+		}
+	} else if (hovered->type == ImageObjectType::Source) {
+		if (hovered->sourceByteSize) {
+			lines.push_back("File size: " + format_bytes_both(*hovered->sourceByteSize));
+		}
+		if (hovered->decoded) {
+			lines.push_back("Uncompressed buffer: " + format_bytes_both(raw_image_bytes(*hovered->decoded)));
 		}
 	}
 	lines.push_back("Select then use Delete to remove this entry.");

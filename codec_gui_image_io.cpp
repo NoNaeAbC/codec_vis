@@ -252,157 +252,51 @@ Rgb16Image load_nef_rgb16(const std::filesystem::path& path) {
 	return image;
 }
 
-unsigned char clamp_u8(const double value) {
-	const long rounded = std::lround(value);
-	return static_cast<unsigned char>(std::clamp<long>(rounded, 0, 255));
-}
-
-unsigned short clamp_u10(const double value) {
-	const long rounded = std::lround(value);
-	return static_cast<unsigned short>(std::clamp<long>(rounded, 0, 1023));
-}
-
-struct YCbCr {
-	unsigned char y;
-	unsigned char cb;
-	unsigned char cr;
-};
-
-struct YCbCr10 {
-	unsigned short y;
-	unsigned short cb;
-	unsigned short cr;
-};
-
-YCbCr rgb_to_bt709_limited(const double r, const double g, const double b) {
-	const double yFull = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-	const double y = 16.0 + 219.0 * yFull / 255.0;
-	const double cb = 128.0 + 224.0 * (b - yFull) / (2.0 * (255.0 - 255.0 * 0.0722));
-	const double cr = 128.0 + 224.0 * (r - yFull) / (2.0 * (255.0 - 255.0 * 0.2126));
-	return {clamp_u8(y), clamp_u8(cb), clamp_u8(cr)};
-}
-
-YCbCr10 rgb16_to_bt709_limited_10(const double r, const double g, const double b) {
-	const double yFull = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-	const double y = 64.0 + 876.0 * yFull / 65535.0;
-	const double cb = 512.0 + 896.0 * (b - yFull) / (2.0 * (65535.0 - 65535.0 * 0.0722));
-	const double cr = 512.0 + 896.0 * (r - yFull) / (2.0 * (65535.0 - 65535.0 * 0.2126));
-	return {clamp_u10(y), clamp_u10(cb), clamp_u10(cr)};
-}
-
 void store_u16le(std::vector<unsigned char>& bytes, const std::size_t sampleIndex, const unsigned short value) {
 	bytes[sampleIndex * 2 + 0] = static_cast<unsigned char>(value & 0xffu);
 	bytes[sampleIndex * 2 + 1] = static_cast<unsigned char>(value >> 8u);
 }
 
-RawImage rgb_to_yuv420_bt709_limited(const RgbImage& rgb) {
+RawImage rgb8_to_planar_source(const RgbImage& rgb) {
 	if (rgb.width <= 0 || rgb.height <= 0) {
-		throw std::runtime_error("JPEG dimensions must be positive");
+		throw std::runtime_error("image dimensions must be positive");
 	}
-
-	const int width = (rgb.width + 1) & ~1;
-	const int height = (rgb.height + 1) & ~1;
 	RawImage image;
-	image.width = width;
-	image.height = height;
-	image.format = PixelFormat::YUV420P8;
-	image.color = {ColorPrimaries::BT709, TransferCharacteristics::SRGB, MatrixCoefficients::BT709, ColorRange::Limited, Chroma420SampleLocation::LeftCenter};
-	image.planes[0].strideBytes = width;
-	image.planes[1].strideBytes = width / 2;
-	image.planes[2].strideBytes = width / 2;
-	image.planes[0].bytes.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height));
-	image.planes[1].bytes.resize(static_cast<std::size_t>(width / 2) * static_cast<std::size_t>(height / 2));
-	image.planes[2].bytes.resize(static_cast<std::size_t>(width / 2) * static_cast<std::size_t>(height / 2));
-
-	auto rgb_at = [&](const int x, const int y) -> const unsigned char* {
-		const int sx = std::min(x, rgb.width - 1);
-		const int sy = std::min(y, rgb.height - 1);
-		return rgb.rgb.data() + (static_cast<std::size_t>(sy) * rgb.width + sx) * 3;
-	};
-
-	for (int y = 0; y < height; ++y) {
-		for (int x = 0; x < width; ++x) {
-			const unsigned char* p = rgb_at(x, y);
-			image.planes[0].bytes[static_cast<std::size_t>(y) * width + x] =
-				rgb_to_bt709_limited(p[0], p[1], p[2]).y;
-		}
+	image.width = rgb.width;
+	image.height = rgb.height;
+	image.format = PixelFormat::RGBP8;
+	image.color = {ColorPrimaries::BT709, TransferCharacteristics::SRGB, MatrixCoefficients::Identity, ColorRange::Full, std::nullopt};
+	for (ImagePlane& plane : image.planes) {
+		plane.strideBytes = image.width;
+		plane.bytes.resize(static_cast<std::size_t>(image.width) * image.height);
 	}
-
-	for (int y = 0; y < height / 2; ++y) {
-		for (int x = 0; x < width / 2; ++x) {
-			double r = 0.0;
-			double g = 0.0;
-			double b = 0.0;
-			for (int dy = 0; dy < 2; ++dy) {
-				for (int dx = 0; dx < 2; ++dx) {
-					const unsigned char* p = rgb_at(x * 2 + dx, y * 2 + dy);
-					r += p[0];
-					g += p[1];
-					b += p[2];
-				}
-			}
-			const YCbCr c = rgb_to_bt709_limited(r * 0.25, g * 0.25, b * 0.25);
-			const auto i = static_cast<std::size_t>(y) * (width / 2) + x;
-			image.planes[1].bytes[i] = c.cb;
-			image.planes[2].bytes[i] = c.cr;
-		}
+	for (std::size_t i = 0, pixels = static_cast<std::size_t>(image.width) * image.height; i < pixels; ++i) {
+		image.planes[0].bytes[i] = rgb.rgb[i * 3 + 0];
+		image.planes[1].bytes[i] = rgb.rgb[i * 3 + 1];
+		image.planes[2].bytes[i] = rgb.rgb[i * 3 + 2];
 	}
 	return image;
 }
 
-RawImage rgb16_to_yuv420p10_bt709_limited(const Rgb16Image& rgb) {
-	if (rgb.width <= 0 || rgb.height <= 0) {
-		throw std::runtime_error("RAW dimensions must be positive");
+RawImage rgb16_to_planar_source(const Rgb16Image& rgb, int sourceBitDepth) {
+	if (rgb.width <= 0 || rgb.height <= 0 || (sourceBitDepth != 14 && sourceBitDepth != 16)) {
+		throw std::runtime_error("unsupported high-bit-depth RGB source");
 	}
-
-	const int width = (rgb.width + 1) & ~1;
-	const int height = (rgb.height + 1) & ~1;
 	RawImage image;
-	image.width = width;
-	image.height = height;
-	image.format = PixelFormat::YUV420P10LE;
-	image.color = {ColorPrimaries::BT709, TransferCharacteristics::SRGB, MatrixCoefficients::BT709, ColorRange::Limited, Chroma420SampleLocation::LeftCenter};
-	image.planes[0].strideBytes = width * 2;
-	image.planes[1].strideBytes = width;
-	image.planes[2].strideBytes = width;
-	image.planes[0].bytes.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 2);
-	image.planes[1].bytes.resize(static_cast<std::size_t>(width / 2) * static_cast<std::size_t>(height / 2) * 2);
-	image.planes[2].bytes.resize(static_cast<std::size_t>(width / 2) * static_cast<std::size_t>(height / 2) * 2);
-
-	auto rgb_at = [&](const int x, const int y) -> const unsigned short* {
-		const int sx = std::min(x, rgb.width - 1);
-		const int sy = std::min(y, rgb.height - 1);
-		return rgb.rgb.data() + (static_cast<std::size_t>(sy) * rgb.width + sx) * 3;
-	};
-
-	for (int y = 0; y < height; ++y) {
-		for (int x = 0; x < width; ++x) {
-			const unsigned short* p = rgb_at(x, y);
-			store_u16le(
-				image.planes[0].bytes,
-				static_cast<std::size_t>(y) * width + x,
-				rgb16_to_bt709_limited_10(p[0], p[1], p[2]).y
-			);
-		}
+	image.width = rgb.width;
+	image.height = rgb.height;
+	image.format = sourceBitDepth == 14 ? PixelFormat::RGBP14LE : PixelFormat::RGBP16LE;
+	image.color = {ColorPrimaries::BT709, TransferCharacteristics::SRGB, MatrixCoefficients::Identity, ColorRange::Full, std::nullopt};
+	for (ImagePlane& plane : image.planes) {
+		plane.strideBytes = image.width * 2;
+		plane.bytes.resize(static_cast<std::size_t>(image.width) * image.height * 2);
 	}
-
-	for (int y = 0; y < height / 2; ++y) {
-		for (int x = 0; x < width / 2; ++x) {
-			double r = 0.0;
-			double g = 0.0;
-			double b = 0.0;
-			for (int dy = 0; dy < 2; ++dy) {
-				for (int dx = 0; dx < 2; ++dx) {
-					const unsigned short* p = rgb_at(x * 2 + dx, y * 2 + dy);
-					r += p[0];
-					g += p[1];
-					b += p[2];
-				}
-			}
-			const YCbCr10 c = rgb16_to_bt709_limited_10(r * 0.25, g * 0.25, b * 0.25);
-			const auto i = static_cast<std::size_t>(y) * (width / 2) + x;
-			store_u16le(image.planes[1].bytes, i, c.cb);
-			store_u16le(image.planes[2].bytes, i, c.cr);
+	const uint32_t targetMaximum = (1u << sourceBitDepth) - 1u;
+	for (std::size_t i = 0, pixels = static_cast<std::size_t>(image.width) * image.height; i < pixels; ++i) {
+		for (int plane = 0; plane < 3; ++plane) {
+			const uint32_t source = rgb.rgb[i * 3 + static_cast<std::size_t>(plane)];
+			const uint16_t value = static_cast<uint16_t>((source * targetMaximum + 32767u) / 65535u);
+			store_u16le(image.planes[plane].bytes, i, value);
 		}
 	}
 	return image;
@@ -432,16 +326,16 @@ void dump_to_file(const std::filesystem::path& path, const std::vector<std::byte
 
 RawImage load_input_image(const std::filesystem::path& path) {
 	if (has_extension(path, ".nef")) {
-		return rgb16_to_yuv420p10_bt709_limited(load_nef_rgb16(path));
+		return rgb16_to_planar_source(load_nef_rgb16(path), 14);
 	}
 	if (has_extension(path, ".png")) {
 		PngImage png = load_png_rgb(path);
 		return png.sixteenBit
-			? rgb16_to_yuv420p10_bt709_limited(png.rgb16)
-			: rgb_to_yuv420_bt709_limited(png.rgb8);
+			? rgb16_to_planar_source(png.rgb16, 16)
+			: rgb8_to_planar_source(png.rgb8);
 	}
 	if (has_extension(path, ".jpg") || has_extension(path, ".jpeg")) {
-		return rgb_to_yuv420_bt709_limited(load_jpeg_rgb(path));
+		return rgb8_to_planar_source(load_jpeg_rgb(path));
 	}
 	throw std::runtime_error("unsupported input format: " + path.string());
 }

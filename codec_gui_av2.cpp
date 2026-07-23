@@ -59,6 +59,7 @@ struct FormatInfo {
 		case PixelFormat::YUV422P12LE: case PixelFormat::YUV422P14LE:
 		case PixelFormat::YUV444P12LE: case PixelFormat::YUV444P14LE:
 		case PixelFormat::Gray12LE: case PixelFormat::Gray14LE: break;
+		default: break;
 	}
 
 	throw std::runtime_error("unsupported pixel format");

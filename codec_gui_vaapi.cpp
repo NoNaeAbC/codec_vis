@@ -771,11 +771,11 @@ bool is_420(PixelFormat format) {
 }
 
 int plane_width(const RawImage& image, int plane) {
-	return plane == 0 || is_444(image.format) ? image.width : image.width / 2;
+	return plane == 0 || is_444(image.format) ? image.width : (image.width + 1) / 2;
 }
 
 int plane_height(const RawImage& image, int plane) {
-	return plane == 0 || is_444(image.format) || is_422(image.format) ? image.height : image.height / 2;
+	return plane == 0 || is_444(image.format) || is_422(image.format) ? image.height : (image.height + 1) / 2;
 }
 
 PixelFormat vaapi_pixel_format(int bitDepth, std::string_view chroma) {
@@ -794,12 +794,6 @@ PixelFormat vaapi_pixel_format(int bitDepth, std::string_view chroma) {
 void validate_yuv_image(const RawImage& image) {
 	if (image.width <= 0 || image.height <= 0) {
 		throw std::runtime_error("image dimensions must be positive");
-	}
-	if ((is_420(image.format) || is_422(image.format)) && (image.width & 1) != 0) {
-		throw std::runtime_error("VA-API subsampled chroma input requires even width");
-	}
-	if (is_420(image.format) && (image.height & 1) != 0) {
-		throw std::runtime_error("VA-API YUV420 input requires even height");
 	}
 	const int bps = bit_depth(image.format) == 8 ? 1 : 2;
 	for (int plane = 0; plane < 3; ++plane) {
@@ -870,16 +864,21 @@ RawImage convert_yuv_format(const RawImage& image, PixelFormat targetFormat) {
 				} else if (is_444(image.format) && is_420(targetFormat)) {
 					for (int dy = 0; dy < 2; ++dy) {
 						for (int dx = 0; dx < 2; ++dx) {
-							sample += read_sample(image.planes[plane], x * 2 + dx, y * 2 + dy, srcBps);
+							sample += read_sample(
+								image.planes[plane],
+								std::min(x * 2 + dx, image.width - 1),
+								std::min(y * 2 + dy, image.height - 1),
+								srcBps
+							);
 						}
 					}
 					sample = (sample + 2) / 4;
 				} else if (is_444(image.format) && is_422(targetFormat)) {
 					sample = (read_sample(image.planes[plane], x * 2, y, srcBps) +
-					          read_sample(image.planes[plane], x * 2 + 1, y, srcBps) + 1) / 2;
+					          read_sample(image.planes[plane], std::min(x * 2 + 1, image.width - 1), y, srcBps) + 1) / 2;
 				} else if (is_422(image.format) && is_420(targetFormat)) {
 					sample = (read_sample(image.planes[plane], x, y * 2, srcBps) +
-					          read_sample(image.planes[plane], x, y * 2 + 1, srcBps) + 1) / 2;
+					          read_sample(image.planes[plane], x, std::min(y * 2 + 1, image.height - 1), srcBps) + 1) / 2;
 				} else if (is_420(image.format) && is_422(targetFormat)) {
 					sample = read_sample(image.planes[plane], x, y / 2, srcBps);
 				} else {
@@ -1385,24 +1384,25 @@ void upload_yuv_to_surface(VADisplay dpy, VASurfaceID surface, const RawImage& i
 					const uint8_t* srcY = image.planes[0].bytes.data() + static_cast<std::size_t>(y) * image.planes[0].strideBytes;
 					const uint8_t* srcU = image.planes[1].bytes.data() + static_cast<std::size_t>(y) * image.planes[1].strideBytes;
 					const uint8_t* srcV = image.planes[2].bytes.data() + static_cast<std::size_t>(y) * image.planes[2].strideBytes;
-					for (int x = 0; x < image.width / 2; ++x) {
+					for (int x = 0; x < plane_width(image, 1); ++x) {
+						const int secondLuma = std::min(x * 2 + 1, image.width - 1);
 						if (derived.image.format.fourcc == VA_FOURCC_YUY2) {
 							dst[x * 4 + 0] = srcY[x * 2 + 0];
 							dst[x * 4 + 1] = srcU[x];
-							dst[x * 4 + 2] = srcY[x * 2 + 1];
+							dst[x * 4 + 2] = srcY[secondLuma];
 							dst[x * 4 + 3] = srcV[x];
 						} else {
 							dst[x * 4 + 0] = srcU[x];
 							dst[x * 4 + 1] = srcY[x * 2 + 0];
 							dst[x * 4 + 2] = srcV[x];
-							dst[x * 4 + 3] = srcY[x * 2 + 1];
+							dst[x * 4 + 3] = srcY[secondLuma];
 						}
 					}
 				}
 			} else {
 				for (int plane = 0; plane < 3; ++plane) {
 					for (int y = 0; y < image.height; ++y) {
-						const int width = plane == 0 ? image.width : image.width / 2;
+						const int width = plane_width(image, plane);
 						uint8_t* dst = base + derived.image.offsets[plane] + static_cast<std::size_t>(y) * derived.image.pitches[plane];
 						const uint8_t* src = image.planes[plane].bytes.data() + static_cast<std::size_t>(y) * image.planes[plane].strideBytes;
 						std::memcpy(dst, src, static_cast<std::size_t>(width));
@@ -1415,13 +1415,13 @@ void upload_yuv_to_surface(VADisplay dpy, VASurfaceID surface, const RawImage& i
 				const uint8_t* srcY = image.planes[0].bytes.data() + static_cast<std::size_t>(y) * image.planes[0].strideBytes;
 				const uint8_t* srcU = image.planes[1].bytes.data() + static_cast<std::size_t>(y) * image.planes[1].strideBytes;
 				const uint8_t* srcV = image.planes[2].bytes.data() + static_cast<std::size_t>(y) * image.planes[2].strideBytes;
-				for (int x = 0; x < image.width / 2; ++x) {
+				for (int x = 0; x < plane_width(image, 1); ++x) {
 					uint16_t y0 = 0;
 					uint16_t y1 = 0;
 					uint16_t u = 0;
 					uint16_t v = 0;
 					std::memcpy(&y0, srcY + x * 4, 2);
-					std::memcpy(&y1, srcY + x * 4 + 2, 2);
+					std::memcpy(&y1, srcY + std::min(x * 2 + 1, image.width - 1) * 2, 2);
 					std::memcpy(&u, srcU + x * 2, 2);
 					std::memcpy(&v, srcV + x * 2, 2);
 					y0 = static_cast<uint16_t>((y0 & 0x03ffu) << 6u);
@@ -1451,17 +1451,19 @@ void upload_yuv_to_surface(VADisplay dpy, VASurfaceID surface, const RawImage& i
 			}
 		}
 	}
-	for (int y = 0; y < image.height / 2; ++y) {
+	const int chromaWidth = plane_width(image, 1);
+	const int chromaHeight = plane_height(image, 1);
+	for (int y = 0; y < chromaHeight; ++y) {
 		uint8_t* dst = base + derived.image.offsets[1] + static_cast<std::size_t>(y) * derived.image.pitches[1];
 		const uint8_t* srcU = image.planes[1].bytes.data() + static_cast<std::size_t>(y) * image.planes[1].strideBytes;
 		const uint8_t* srcV = image.planes[2].bytes.data() + static_cast<std::size_t>(y) * image.planes[2].strideBytes;
 		if (depth == 8) {
-			for (int x = 0; x < image.width / 2; ++x) {
+			for (int x = 0; x < chromaWidth; ++x) {
 				dst[x * 2 + 0] = srcU[x];
 				dst[x * 2 + 1] = srcV[x];
 			}
 		} else {
-			for (int x = 0; x < image.width / 2; ++x) {
+			for (int x = 0; x < chromaWidth; ++x) {
 				uint16_t u = 0;
 				uint16_t v = 0;
 				std::memcpy(&u, srcU + x * 2, 2);

@@ -95,6 +95,8 @@ int format_bit_depth(PixelFormat format) {
 		case PixelFormat::YUV422P14LE:
 		case PixelFormat::YUV444P14LE:
 		case PixelFormat::Gray14LE: return 14;
+		case PixelFormat::YUV444P16LE: return 16;
+		default: break;
 	}
 	throw std::invalid_argument("unsupported raw pixel format");
 }

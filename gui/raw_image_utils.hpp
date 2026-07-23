@@ -15,6 +15,9 @@ namespace codec_gui::gui {
 		case PixelFormat::Gray12LE:
 		case PixelFormat::Gray14LE:
 			return 1;
+		case PixelFormat::RGBP8:
+		case PixelFormat::RGBP14LE:
+		case PixelFormat::RGBP16LE:
 		case PixelFormat::YUV420P8:
 		case PixelFormat::YUV420P10LE:
 		case PixelFormat::YUV420P12LE:
@@ -27,6 +30,7 @@ namespace codec_gui::gui {
 		case PixelFormat::YUV444P10LE:
 		case PixelFormat::YUV444P12LE:
 		case PixelFormat::YUV444P14LE:
+		case PixelFormat::YUV444P16LE:
 			return 3;
 	}
 	return 0;
@@ -34,11 +38,14 @@ namespace codec_gui::gui {
 
 [[nodiscard]] inline int bytes_per_sample(PixelFormat format) {
 	switch (format) {
+		case PixelFormat::RGBP8:
 		case PixelFormat::YUV420P8:
 		case PixelFormat::YUV422P8:
 		case PixelFormat::YUV444P8:
 		case PixelFormat::Gray8:
 			return 1;
+		case PixelFormat::RGBP14LE:
+		case PixelFormat::RGBP16LE:
 		case PixelFormat::YUV420P10LE:
 		case PixelFormat::YUV420P12LE:
 		case PixelFormat::YUV420P14LE:
@@ -48,6 +55,7 @@ namespace codec_gui::gui {
 		case PixelFormat::YUV444P10LE:
 		case PixelFormat::YUV444P12LE:
 		case PixelFormat::YUV444P14LE:
+		case PixelFormat::YUV444P16LE:
 		case PixelFormat::Gray10LE:
 		case PixelFormat::Gray12LE:
 		case PixelFormat::Gray14LE:
@@ -68,7 +76,13 @@ namespace codec_gui::gui {
 
 [[nodiscard]] inline bool is_444(PixelFormat format) {
 	return format == PixelFormat::YUV444P8 || format == PixelFormat::YUV444P10LE ||
-	       format == PixelFormat::YUV444P12LE || format == PixelFormat::YUV444P14LE;
+	       format == PixelFormat::YUV444P12LE || format == PixelFormat::YUV444P14LE ||
+	       format == PixelFormat::YUV444P16LE;
+}
+
+[[nodiscard]] inline bool is_rgb(PixelFormat format) {
+	return format == PixelFormat::RGBP8 || format == PixelFormat::RGBP14LE ||
+	       format == PixelFormat::RGBP16LE;
 }
 
 [[nodiscard]] inline bool is_gray(PixelFormat format) {
@@ -83,6 +97,7 @@ namespace codec_gui::gui {
 
 [[nodiscard]] inline int bit_depth(PixelFormat format) {
 	switch (format) {
+		case PixelFormat::RGBP8:
 		case PixelFormat::YUV420P8:
 		case PixelFormat::YUV422P8:
 		case PixelFormat::YUV444P8:
@@ -95,15 +110,19 @@ namespace codec_gui::gui {
 		case PixelFormat::YUV422P12LE:
 		case PixelFormat::YUV444P12LE:
 		case PixelFormat::Gray12LE: return 12;
+		case PixelFormat::RGBP14LE:
 		case PixelFormat::YUV420P14LE:
 		case PixelFormat::YUV422P14LE:
 		case PixelFormat::YUV444P14LE:
 		case PixelFormat::Gray14LE: return 14;
+		case PixelFormat::RGBP16LE:
+		case PixelFormat::YUV444P16LE: return 16;
 	}
 	return 8;
 }
 
 [[nodiscard]] inline PixelFormat pixel_format_for(int bitDepth, bool yuv444) {
+	if (bitDepth == 16 && yuv444) return PixelFormat::YUV444P16LE;
 	if (bitDepth == 14) return yuv444 ? PixelFormat::YUV444P14LE : PixelFormat::YUV420P14LE;
 	if (bitDepth == 12) return yuv444 ? PixelFormat::YUV444P12LE : PixelFormat::YUV420P12LE;
 	if (bitDepth == 10) return yuv444 ? PixelFormat::YUV444P10LE : PixelFormat::YUV420P10LE;
@@ -115,14 +134,14 @@ namespace codec_gui::gui {
 }
 
 [[nodiscard]] inline int plane_width(const RawImage& image, int plane) {
-	if (plane == 0 || is_444(image.format)) {
+	if (plane == 0 || is_444(image.format) || is_rgb(image.format)) {
 		return image.width;
 	}
 	return (image.width + 1) / 2;
 }
 
 [[nodiscard]] inline int plane_height(const RawImage& image, int plane) {
-	if (plane == 0 || is_444(image.format) || is_422(image.format)) {
+	if (plane == 0 || is_444(image.format) || is_422(image.format) || is_rgb(image.format)) {
 		return image.height;
 	}
 	return (image.height + 1) / 2;

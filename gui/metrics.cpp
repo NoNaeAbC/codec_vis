@@ -63,12 +63,15 @@ std::optional<VmafPixelFormat> vmaf_pixel_format(PixelFormat format) {
 		case PixelFormat::YUV444P10LE:
 		case PixelFormat::YUV444P12LE:
 		case PixelFormat::YUV444P14LE:
+		case PixelFormat::YUV444P16LE:
 			return VMAF_PIX_FMT_YUV444P;
 		case PixelFormat::Gray8:
 		case PixelFormat::Gray10LE:
 		case PixelFormat::Gray12LE:
 		case PixelFormat::Gray14LE:
 			return VMAF_PIX_FMT_YUV400P;
+		default:
+			break;
 	}
 	return std::nullopt;
 }
@@ -95,6 +98,10 @@ int metric_bit_depth(PixelFormat format) {
 		case PixelFormat::YUV444P14LE:
 		case PixelFormat::Gray14LE:
 			return 14;
+		case PixelFormat::YUV444P16LE:
+			return 16;
+		default:
+			break;
 	}
 	return 8;
 }

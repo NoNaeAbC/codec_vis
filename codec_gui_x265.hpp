@@ -80,6 +80,9 @@ namespace codec_gui {
 	};
 
 	enum class PixelFormat {
+		RGBP8,
+		RGBP14LE,
+		RGBP16LE,
 		YUV420P8,
 		YUV420P10LE,
 		YUV420P12LE,
@@ -92,6 +95,7 @@ namespace codec_gui {
 		YUV444P10LE,
 		YUV444P12LE,
 		YUV444P14LE,
+		YUV444P16LE,
 		Gray8,
 		Gray10LE,
 		Gray12LE,

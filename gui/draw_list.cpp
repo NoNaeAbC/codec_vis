@@ -380,6 +380,9 @@ std::optional<uint32_t> pixel_sample_at(const ImagePlane& plane, int x, int y, i
 
 const char* pixel_format_label(PixelFormat format) {
 	switch (format) {
+		case PixelFormat::RGBP8: return "RGB-8";
+		case PixelFormat::RGBP14LE: return "RGB-14";
+		case PixelFormat::RGBP16LE: return "RGB-16";
 		case PixelFormat::YUV420P8: return "YUV420";
 		case PixelFormat::YUV420P10LE: return "YUV420-10";
 		case PixelFormat::YUV420P12LE: return "YUV420-12";
@@ -392,6 +395,7 @@ const char* pixel_format_label(PixelFormat format) {
 		case PixelFormat::YUV444P10LE: return "YUV444-10";
 		case PixelFormat::YUV444P12LE: return "YUV444-12";
 		case PixelFormat::YUV444P14LE: return "YUV444-14";
+		case PixelFormat::YUV444P16LE: return "YUV444-16";
 		case PixelFormat::Gray8: return "Gray";
 		case PixelFormat::Gray10LE: return "Gray10";
 		case PixelFormat::Gray12LE: return "Gray12";

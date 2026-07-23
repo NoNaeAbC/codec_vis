@@ -82,6 +82,8 @@ namespace codec_gui {
 				case PixelFormat::Gray12LE:
 				case PixelFormat::Gray14LE:
 					return X265_CSP_I400;
+				default:
+					break;
 			}
 			throw std::invalid_argument("unsupported pixel format");
 		}
@@ -108,6 +110,8 @@ namespace codec_gui {
 				case PixelFormat::YUV444P14LE:
 				case PixelFormat::Gray14LE:
 					return 14;
+				default:
+					break;
 			}
 			throw std::invalid_argument("unsupported pixel format");
 		}
@@ -497,6 +501,7 @@ namespace codec_gui {
 				case PixelFormat::Gray10LE: return "main10";
 				case PixelFormat::Gray12LE: return "main12";
 				case PixelFormat::Gray14LE: return "main12";
+				default: break;
 			}
 			return "main";
 		};

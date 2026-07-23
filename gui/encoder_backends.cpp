@@ -179,7 +179,7 @@ CapabilityResult query_jpeg2000_backend() {
 CapabilityResult query_jpegxl_backend() {
 	return query_software_capabilities<query_jpegxl_parameters>(
 		"libjxl",
-		{{{"source", "Source"}, {"8", "8-bit"}, {"10", "10-bit"}, {"12", "12-bit"}, {"14", "14-bit"}}, "source",
+		{{{"source", "Source"}, {"8", "8-bit"}, {"10", "10-bit"}, {"12", "12-bit"}, {"14", "14-bit"}, {"16", "16-bit"}}, "source",
 		 {}, "", true, true, false, false, true}
 	);
 }
@@ -408,6 +408,10 @@ EncodeResult run_backend_encode(const EncoderBackend& backend, const RawImage& i
 	}
 	ColorTransformOptions transform;
 	transform.target = image.color;
+	if (is_rgb(image.format)) {
+		transform.target.matrix = MatrixCoefficients::BT709;
+		transform.target.range = ColorRange::Limited;
+	}
 	if (primaries == "bt709") transform.target.primaries = ColorPrimaries::BT709;
 	else if (primaries == "display-p3") transform.target.primaries = ColorPrimaries::DisplayP3;
 	else if (primaries == "bt2020") transform.target.primaries = ColorPrimaries::BT2020;
@@ -486,11 +490,11 @@ PixelFormat output_format(PixelFormat source, int depth, std::string_view chroma
 		else if (is_422(source)) chroma = "422";
 		else chroma = "444";
 	}
-	if (depth != 8 && depth != 10 && depth != 12 && depth != 14) throw std::invalid_argument("output bit depth must be 8, 10, 12, or 14");
-	if (chroma == "420") return depth == 8 ? PixelFormat::YUV420P8 : depth == 10 ? PixelFormat::YUV420P10LE : depth == 12 ? PixelFormat::YUV420P12LE : PixelFormat::YUV420P14LE;
-	if (chroma == "422") return depth == 8 ? PixelFormat::YUV422P8 : depth == 10 ? PixelFormat::YUV422P10LE : depth == 12 ? PixelFormat::YUV422P12LE : PixelFormat::YUV422P14LE;
-	if (chroma == "444") return depth == 8 ? PixelFormat::YUV444P8 : depth == 10 ? PixelFormat::YUV444P10LE : depth == 12 ? PixelFormat::YUV444P12LE : PixelFormat::YUV444P14LE;
-	if (chroma == "400") return depth == 8 ? PixelFormat::Gray8 : depth == 10 ? PixelFormat::Gray10LE : depth == 12 ? PixelFormat::Gray12LE : PixelFormat::Gray14LE;
+	if (depth != 8 && depth != 10 && depth != 12 && depth != 14 && depth != 16) throw std::invalid_argument("output bit depth must be 8, 10, 12, 14, or 16");
+	if (chroma == "420" && depth <= 14) return depth == 8 ? PixelFormat::YUV420P8 : depth == 10 ? PixelFormat::YUV420P10LE : depth == 12 ? PixelFormat::YUV420P12LE : PixelFormat::YUV420P14LE;
+	if (chroma == "422" && depth <= 14) return depth == 8 ? PixelFormat::YUV422P8 : depth == 10 ? PixelFormat::YUV422P10LE : depth == 12 ? PixelFormat::YUV422P12LE : PixelFormat::YUV422P14LE;
+	if (chroma == "444") return depth == 8 ? PixelFormat::YUV444P8 : depth == 10 ? PixelFormat::YUV444P10LE : depth == 12 ? PixelFormat::YUV444P12LE : depth == 14 ? PixelFormat::YUV444P14LE : PixelFormat::YUV444P16LE;
+	if (chroma == "400" && depth <= 14) return depth == 8 ? PixelFormat::Gray8 : depth == 10 ? PixelFormat::Gray10LE : depth == 12 ? PixelFormat::Gray12LE : PixelFormat::Gray14LE;
 	throw std::invalid_argument("unsupported chroma subsampling: " + std::string{chroma});
 }
 

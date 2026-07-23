@@ -1,4 +1,6 @@
 #include "codec_gui_x265.hpp"
+#include "codec_gui_image_io.hpp"
+#include "gui/raw_image_conversion.hpp"
 
 #include <algorithm>
 #include <array>
@@ -690,18 +692,36 @@ int main(int argc, char **argv) try {
 		return 0;
 	}
 
-	const codec_gui::RawImage image = options.input.has_value()
-	                                      ? load_input_image(*options.input)
-	                                      : make_test_pattern();
-
 	if (options.vaapiAv1Only) {
 		validate_av1_params(options.av1Params);
+		const codec_gui::RawImage source = options.input.has_value()
+		                                       ? codec_gui::load_input_image(*options.input)
+		                                       : make_test_pattern();
+		int targetDepth = 10;
+		for (const codec_gui::EncoderParam& param : options.av1Params) {
+			if (param.name == "bit-depth") {
+				targetDepth = std::stoi(std::get<std::string>(param.value));
+			}
+		}
+		codec_gui::gui::ColorTransformOptions transform;
+		transform.target = source.color;
+		if (source.color.matrix == codec_gui::MatrixCoefficients::Identity) {
+			transform.target.matrix = codec_gui::MatrixCoefficients::BT709;
+			transform.target.range = codec_gui::ColorRange::Limited;
+		}
+		const codec_gui::PixelFormat targetFormat =
+			targetDepth == 8 ? codec_gui::PixelFormat::YUV420P8 : codec_gui::PixelFormat::YUV420P10LE;
+		const codec_gui::RawImage image =
+			codec_gui::gui::transform_raw_image(source, targetFormat, transform);
 		const codec_gui::EncodedImage encoded =
 			codec_gui::encode_vaapi_av1_still_image(image, options.av1Params);
 		dump_to_file(options.output, encoded.hevcAnnexB);
 		return 0;
 	}
 
+	const codec_gui::RawImage image = options.input.has_value()
+	                                      ? load_input_image(*options.input)
+	                                      : make_test_pattern();
 	const std::string x265Profile =
 			image.format == codec_gui::PixelFormat::YUV420P10LE ? "main10" : "mainstillpicture";
 

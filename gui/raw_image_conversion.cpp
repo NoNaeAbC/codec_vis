@@ -213,6 +213,21 @@ std::vector<uint8_t> raw_image_to_rgba8(const RawImage& image) {
 	};
 
 	switch (image.format) {
+		case PixelFormat::RGBP8:
+		case PixelFormat::RGBP14LE:
+		case PixelFormat::RGBP16LE: {
+			const int sampleBytes = bytes_per_sample(image.format);
+			const double scale = 255.0 / max_sample_value(image.format);
+			for (int y = 0; y < image.height; ++y) {
+				for (int x = 0; x < image.width; ++x) {
+					const uint8_t r = clamp_byte(sample_or_default(image.planes[0], x, y, sampleBytes, 0) * scale);
+					const uint8_t g = clamp_byte(sample_or_default(image.planes[1], x, y, sampleBytes, 0) * scale);
+					const uint8_t b = clamp_byte(sample_or_default(image.planes[2], x, y, sampleBytes, 0) * scale);
+					store(x, y, r, g, b);
+				}
+			}
+			break;
+		}
 		case PixelFormat::YUV420P8:
 		case PixelFormat::YUV420P10LE:
 		case PixelFormat::YUV420P12LE:
@@ -242,7 +257,8 @@ std::vector<uint8_t> raw_image_to_rgba8(const RawImage& image) {
 		case PixelFormat::YUV444P8:
 		case PixelFormat::YUV444P10LE:
 		case PixelFormat::YUV444P12LE:
-		case PixelFormat::YUV444P14LE: {
+		case PixelFormat::YUV444P14LE:
+		case PixelFormat::YUV444P16LE: {
 			const int sampleBytes = bytes_per_sample(image.format);
 			const uint32_t depthScale = 1u << (bit_depth(image.format) - 8);
 			const uint32_t neutralY = 16u * depthScale;
@@ -341,7 +357,8 @@ RawImage convert_raw_image_format(const RawImage& image, PixelFormat targetForma
 }
 
 RawImage transform_raw_image(const RawImage& image, PixelFormat targetFormat, const ColorTransformOptions& options) {
-	if (image.color.primaries == options.target.primaries &&
+	if (!is_rgb(image.format) &&
+	    image.color.primaries == options.target.primaries &&
 	    image.color.transfer == options.target.transfer &&
 	    image.color.matrix == options.target.matrix &&
 	    image.color.range == options.target.range) {
@@ -359,8 +376,9 @@ RawImage transform_raw_image(const RawImage& image, PixelFormat targetFormat, co
 	    options.target.matrix == MatrixCoefficients::Unspecified) {
 		throw std::invalid_argument("color transform requires explicit target primaries, transfer, and matrix");
 	}
-	if (image.color.matrix == MatrixCoefficients::Identity || options.target.matrix == MatrixCoefficients::Identity) {
-		throw std::invalid_argument("identity/GBR matrix transforms require an RGB planar pixel format");
+	if ((image.color.matrix == MatrixCoefficients::Identity && !is_rgb(image.format)) ||
+	    options.target.matrix == MatrixCoefficients::Identity) {
+		throw std::invalid_argument("identity matrix metadata requires an RGB planar pixel format");
 	}
 	const bool dynamicRangeReduction = is_hdr(image.color.transfer) && !is_hdr(options.target.transfer);
 	const bool gamutReduction = wider_than_bt709(image.color.primaries) && options.target.primaries == ColorPrimaries::BT709;
@@ -408,13 +426,19 @@ RawImage transform_raw_image(const RawImage& image, PixelFormat targetFormat, co
 
 	for (int y = 0; y < out.height; ++y) {
 		for (int x = 0; x < out.width; ++x) {
-			const uint32_t yy = source_sample(image, 0, x, y);
 			double rp = 0.0;
 			double gp = 0.0;
 			double bp = 0.0;
-			if (is_gray(image.format)) {
+			if (is_rgb(image.format)) {
+				const double maximum = max_sample_value(image.format);
+				rp = sample_or_default(image.planes[0], x, y, sourceBps, 0) / maximum;
+				gp = sample_or_default(image.planes[1], x, y, sourceBps, 0) / maximum;
+				bp = sample_or_default(image.planes[2], x, y, sourceBps, 0) / maximum;
+			} else if (is_gray(image.format)) {
+				const uint32_t yy = source_sample(image, 0, x, y);
 				rp = gp = bp = std::clamp((static_cast<double>(yy) - sourceScale.yOffset) / sourceScale.yScale, 0.0, 1.0);
 			} else {
+				const uint32_t yy = source_sample(image, 0, x, y);
 				const int cx = (is_420(image.format) || is_422(image.format)) ? x / 2 : x;
 				const int cy = is_420(image.format) ? y / 2 : y;
 				const double yp = std::clamp((static_cast<double>(yy) - sourceScale.yOffset) / sourceScale.yScale, 0.0, 1.0);

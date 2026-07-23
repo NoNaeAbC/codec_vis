@@ -275,8 +275,8 @@ $(DAV2D_BRIDGE_OBJ): gui/dav2d_bridge.c gui/dav2d_bridge.h | build
 build/gui_main.o: gui/main_gui.cpp gui/app_state.hpp gui/app_commands.hpp gui/draw_list.hpp gui/layout.hpp gui/render_vulkan.hpp gui/text_atlas.hpp gui/text_shaper.hpp gui/ui_interaction.hpp gui/wayland_window.hpp gui/viewer_model.hpp codec_gui_image_io.hpp gui/encoder_backends.hpp gui/encode_runner.hpp | build
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(CODEC_CFLAGS) $(GUI_CFLAGS) -Ibuild $(DEPFLAGS) -c -o $@ gui/main_gui.cpp
 
-codec_vis_cli: main.cpp $(CODEC_BACKEND_SRCS) codec_gui_x265.hpp | build
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(CODEC_CFLAGS) -o $@ main.cpp $(CODEC_BACKEND_SRCS) $(CODEC_LIBS) $(LDFLAGS)
+codec_vis_cli: main.cpp codec_gui_image_io.cpp gui/raw_image_conversion.cpp $(CODEC_BACKEND_SRCS) codec_gui_x265.hpp | build
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(CODEC_CFLAGS) -o $@ main.cpp codec_gui_image_io.cpp gui/raw_image_conversion.cpp $(CODEC_BACKEND_SRCS) $(CODEC_LIBS) $(LDFLAGS)
 
 codec_vis_gui: build/gui_main.o build/gui_app_state.o build/gui_app_commands.o build/gui_platform_portal.o build/gui_encode_runner.o build/gui_metrics.o build/gui_image_ops.o build/gui_raw_image_conversion.o build/gui_viewer_model.o build/gui_layout.o build/gui_draw_list.o build/gui_ui_interaction.o build/gui_ui_widgets.o build/gui_wayland_window.o build/gui_render_vulkan.o build/gui_text_shaper.o build/gui_text_atlas.o $(WAYLAND_PROTOCOL_OBJS) build/codec_gui_image_io.o build/gui_encoder_backends.o build/gui_preview_decoders.o $(DAV2D_BRIDGE_OBJ) $(CODEC_BACKEND_SRCS) | build/rect.vert.spv build/rect.frag.spv build/text.vert.spv build/text.frag.spv build/image.frag.spv
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(CODEC_CFLAGS) -o $@ $^ $(CODEC_LIBS) $(GUI_LIBS) $(LDFLAGS)

@@ -121,6 +121,7 @@ namespace codec_gui::gui {
 		int height = 0;
 		PixelFormat pixelFormat = PixelFormat::YUV420P8;
 		ColorMetadata color;
+		std::optional<uint64_t> sourceByteSize;
 		std::shared_ptr<const RawImage> decoded;
 		std::optional<EncodedMetadata> encoded;
 		std::optional<DerivedMetadata> derived;
@@ -362,6 +363,7 @@ namespace codec_gui::gui {
 
 	struct SourceLoadedPayload {
 		std::filesystem::path path;
+		std::optional<uint64_t> fileByteSize;
 		std::shared_ptr<const RawImage> image;
 	};
 

@@ -474,6 +474,9 @@ void draw_image_list(std::vector<DrawCommand>& out, const AppState& state, Rect 
 			if (!metric.empty()) {
 				detail += "  " + metric;
 			}
+		} else if (image.type == ImageObjectType::Source && image.sourceByteSize) {
+			detail += "  source ";
+			detail += format_bytes(*image.sourceByteSize);
 		}
 		const std::size_t paneButtons = std::min<std::size_t>(state.panes.size(), 4);
 		const float reservedButtons = static_cast<float>(paneButtons) * 38.0f +

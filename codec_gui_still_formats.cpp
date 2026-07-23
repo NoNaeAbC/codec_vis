@@ -558,8 +558,7 @@ std::vector<EncoderParamInfo> query_jpeg2000_parameters() {
 		{.name = "quality", .label = "Quality", .group = "Rate Control", .kind = ParamKind::Int, .defaultValue = int64_t{50}, .intRange = IntRange{1, 100, 1}, .help = "Approximate compression quality. Ignored when Lossless is enabled."},
 		{.name = "lossless", .label = "Lossless", .group = "Rate Control", .kind = ParamKind::Bool, .defaultValue = false, .help = "Use reversible 5-3 wavelet and lossless final layer."},
 		{.name = "num-resolutions", .label = "Resolutions", .group = "Wavelet", .kind = ParamKind::Int, .defaultValue = int64_t{6}, .intRange = IntRange{1, 33, 1}, .help = "Number of DWT resolution levels."},
-		{.name = "codeblock-width", .label = "Codeblock W", .group = "Codeblocks", .kind = ParamKind::Int, .defaultValue = int64_t{64}, .intRange = IntRange{4, 1024, 1}, .help = "Initial codeblock width."},
-		{.name = "codeblock-height", .label = "Codeblock H", .group = "Codeblocks", .kind = ParamKind::Int, .defaultValue = int64_t{64}, .intRange = IntRange{4, 1024, 1}, .help = "Initial codeblock height."},
+		{.name = "codeblock-size", .label = "Codeblock size", .group = "Codeblocks", .kind = ParamKind::Enum, .defaultValue = std::string{"64"}, .enumValues = {{"4", "4×4"}, {"8", "8×8"}, {"16", "16×16"}, {"32", "32×32"}, {"64", "64×64"}}, .help = "Square JPEG 2000 codeblocks satisfying the power-of-two and 4096-sample limits."},
 		{.name = "progression", .label = "Progression", .group = "Ordering", .kind = ParamKind::Enum, .defaultValue = std::string{"LRCP"}, .enumValues = {{"LRCP", "LRCP"}, {"RLCP", "RLCP"}, {"RPCL", "RPCL"}, {"PCRL", "PCRL"}, {"CPRL", "CPRL"}}, .help = "JPEG 2000 progression order."},
 		{.name = "mct", .label = "MCT", .group = "Color", .kind = ParamKind::Bool, .defaultValue = true, .help = "Multiple component transform for RGB."},
 		{.name = "tile-width", .label = "Tile W", .group = "Tiling", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{0, 65535, 1}, .help = "0 disables tiling; otherwise tile width."},
@@ -585,8 +584,9 @@ EncodedImage encode_jpeg2000_still_image(const RawImage& image, std::span<const 
 		++maxResolutions;
 	}
 	params.numresolution = std::clamp(requestedResolutions, 1, maxResolutions);
-	params.cblockw_init = static_cast<int>(param_value<int64_t>(encoderParams, "codeblock-width", 64));
-	params.cblockh_init = static_cast<int>(param_value<int64_t>(encoderParams, "codeblock-height", 64));
+	const int codeblockSize = std::stoi(param_value<std::string>(encoderParams, "codeblock-size", "64"));
+	params.cblockw_init = codeblockSize;
+	params.cblockh_init = codeblockSize;
 	params.tcp_mct = param_value<bool>(encoderParams, "mct", true) ? 1 : 0;
 	const std::string progression = param_value<std::string>(encoderParams, "progression", "LRCP");
 	if (progression == "RLCP") params.prog_order = OPJ_RLCP;
@@ -996,7 +996,7 @@ std::vector<EncoderParamInfo> query_x264_parameters() {
 	return {
 		{.name = "preset", .label = "Preset", .group = "Speed / Search", .kind = ParamKind::Enum, .defaultValue = std::string{"medium"}, .enumValues = {{"ultrafast", "Ultrafast"}, {"superfast", "Superfast"}, {"veryfast", "Veryfast"}, {"faster", "Faster"}, {"fast", "Fast"}, {"medium", "Medium"}, {"slow", "Slow"}, {"slower", "Slower"}, {"veryslow", "Veryslow"}, {"placebo", "Placebo"}}, .help = "x264 preset."},
 		{.name = "tune", .label = "Tune", .group = "Speed / Search", .kind = ParamKind::Enum, .defaultValue = std::string{"stillimage"}, .enumValues = {{"stillimage", "Still image"}, {"psnr", "PSNR"}, {"ssim", "SSIM"}, {"grain", "Grain"}, {"film", "Film"}, {"animation", "Animation"}, {"fastdecode", "Fast decode"}, {"zerolatency", "Zero latency"}}, .help = "x264 tune."},
-		{.name = "profile", .label = "Profile", .group = "Bitstream", .kind = ParamKind::Enum, .defaultValue = std::string{"high"}, .enumValues = {{"baseline", "Baseline"}, {"main", "Main"}, {"high", "High"}, {"high10", "High 10"}, {"high422", "High 4:2:2"}, {"high444", "High 4:4:4"}}, .help = "H.264 profile constraint."},
+		{.name = "profile", .label = "Profile", .group = "Bitstream", .kind = ParamKind::Enum, .defaultValue = std::string{"high"}, .enumValues = {{"baseline", "Baseline"}, {"main", "Main"}, {"high", "High"}}, .help = "Profiles compatible with this backend's fixed 8-bit 4:2:0 input path."},
 		{.name = "qp", .label = "QP", .group = "Rate Control", .kind = ParamKind::Int, .defaultValue = int64_t{22}, .intRange = IntRange{0, 51, 1}, .help = "Constant quantizer. 0 is lossless when supported by profile/pixel format."},
 		{.name = "cabac", .label = "CABAC", .group = "Entropy", .kind = ParamKind::Bool, .defaultValue = true, .help = "Enable CABAC entropy coding."},
 		{.name = "8x8dct", .label = "8x8 DCT", .group = "Transform", .kind = ParamKind::Bool, .defaultValue = true, .help = "Enable 8x8 transform."},

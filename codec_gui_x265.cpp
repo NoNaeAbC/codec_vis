@@ -184,19 +184,8 @@ namespace codec_gui {
 						.enumValues =
 								{
 										{"auto", "Auto"},
-										{"main", "Main"},
-										{"main10", "Main 10"},
-										{"main12", "Main 12"},
-										{"mainstillpicture", "Main Still Picture"},
-										{"msp", "Main Still Picture alias"},
-										{"main444-8", "Main 4:4:4 8"},
-										{"main444-stillpicture", "Main 4:4:4 Still Picture"},
-										{"main444-10", "Main 4:4:4 10"},
-										{"main444-12", "Main 4:4:4 12"},
-										{"main422-12", "Main 4:2:2 12"},
 								},
-						.help = "HEVC profile restriction. For HEIC stills, mainstillpicture or main444-stillpicture "
-								"are usually the interesting choices.",
+						.help = "The profile is derived from the selected bit depth and chroma layout so an incompatible restriction cannot be selected.",
 				},
 				{
 						.name         = "rate-control",
@@ -326,9 +315,8 @@ namespace codec_gui {
 								{
 										{"8", "8"},
 										{"16", "16"},
-										{"32", "32"},
 								},
-						.help = "Minimum coding unit size.",
+						.help = "Minimum coding unit sizes valid with every selectable CTU size.",
 				},
 				{
 						.name         = "tu-intra-depth",

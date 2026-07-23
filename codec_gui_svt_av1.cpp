@@ -356,6 +356,20 @@ void force_still_image_config(EbSvtAv1EncConfiguration& cfg, const RawImage& ima
 	return p;
 }
 
+[[nodiscard]] EncoderParamInfo enabled_when(
+	EncoderParamInfo parameter,
+	std::string controller,
+	std::vector<std::string> acceptedValues,
+	std::string explanation
+) {
+	parameter.enabledWhen.push_back({
+		std::move(controller),
+		std::move(acceptedValues),
+		std::move(explanation),
+	});
+	return parameter;
+}
+
 } // namespace
 
 std::vector<EncoderParamInfo> query_svt_av1_parameters() {
@@ -368,23 +382,31 @@ std::vector<EncoderParamInfo> query_svt_av1_parameters() {
 			{-1, 13, 1},
 			"SVT-AV1 encoder preset. Lower is slower and higher quality; higher is faster."
 		),
-		float_param(
+		enum_param(
+			"rate-control",
+			"Mode",
+			"Rate Control",
+			"crf",
+			{{"crf", "Constant quality (CRF)"}, {"cqp", "Constant QP"}, {"lossless", "Lossless"}},
+			"Select one mutually exclusive SVT-AV1 rate-control strategy."
+		),
+		enabled_when(float_param(
 			"crf",
 			"CRF",
 			"Rate Control",
 			35.0,
 			{1.0, 70.0, 0.25},
 			"Constant rate factor. Lower values improve quality and increase size."
-		),
-		int_param(
+		), "rate-control", {"crf"}, "CRF applies only in constant-quality mode."),
+		enabled_when(int_param(
 			"qp",
 			"QP",
 			"Rate Control",
 			35,
 			{1, 63, 1},
 			"Initial quantizer. Used directly when adaptive quantization is disabled."
-		),
-		enum_param(
+		), "rate-control", {"cqp"}, "QP applies only in constant-QP mode."),
+		enabled_when(enum_param(
 			"aq-mode",
 			"AQ mode",
 			"Rate Control",
@@ -395,7 +417,7 @@ std::vector<EncoderParamInfo> query_svt_av1_parameters() {
 				{"2", "Delta-Q / CRF"},
 			},
 			"Adaptive quantization mode. SVT-AV1 CRF mode uses aq-mode 2."
-		),
+		), "rate-control", {"crf"}, "Adaptive quantization applies only in CRF mode."),
 		enum_param(
 			"tune",
 			"Tune",
@@ -450,34 +472,11 @@ std::vector<EncoderParamInfo> query_svt_av1_parameters() {
 			"Screen-content detection level."
 		),
 		bool_param(
-			"lossless",
-			"Lossless",
-			"Rate Control",
-			false,
-			"Enable AV1 lossless coding."
-		),
-		bool_param(
 			"enable-qm",
 			"Quant matrices",
 			"Quantization",
 			false,
 			"Enable quantization matrices."
-		),
-		int_param(
-			"qm-min",
-			"QM min",
-			"Quantization",
-			8,
-			{0, 15, 1},
-			"Minimum quantization matrix flatness."
-		),
-		int_param(
-			"qm-max",
-			"QM max",
-			"Quantization",
-			15,
-			{0, 15, 1},
-			"Maximum quantization matrix flatness."
 		),
 		int_param(
 			"sharpness",
@@ -537,7 +536,15 @@ EncodedImage encode_svt_av1_still_image(const RawImage& image, std::span<const E
 
 	force_still_image_config(cfg, image, info);
 
+	const auto rateControl = std::find_if(params.begin(), params.end(), [](const EncoderParam& param) {
+		return param.name == "rate-control";
+	});
+	const std::string rateControlMode =
+		rateControl == params.end() ? std::string{} : std::get<std::string>(rateControl->value);
 	for (const EncoderParam& param : params) {
+		if (param.name == "rate-control") {
+			continue;
+		}
 		if (is_structural_param(param.name)) {
 			throw std::runtime_error(
 				"parameter '" + param.name + "' is controlled by encode_svt_av1_still_image"
@@ -545,6 +552,13 @@ EncodedImage encode_svt_av1_still_image(const RawImage& image, std::span<const E
 		}
 
 		parse_or_throw(cfg, param.name, param_value_to_string(param.value));
+	}
+	if (rateControlMode == "cqp") {
+		parse_or_throw(cfg, "aq-mode", "0");
+	} else if (rateControlMode == "lossless") {
+		parse_or_throw(cfg, "lossless", "1");
+	} else if (!rateControlMode.empty() && rateControlMode != "crf") {
+		throw std::invalid_argument("unsupported SVT-AV1 rate-control mode: " + rateControlMode);
 	}
 
 	force_still_image_config(cfg, image, info);

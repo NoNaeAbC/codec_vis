@@ -241,8 +241,6 @@ std::vector<EncoderParamInfo> query_av2_parameters() {
 		bool_param("enable-intrabc", "IntraBC", "Tools", false, "Enable intra block copy screen-content search."),
 		bool_param("enable-rect-partitions", "Rect partitions", "Tools", false, "Enable rectangular partition search."),
 		bool_param("enable-1to4-partitions", "1:4 partitions", "Tools", false, "Enable 1:4 and 4:1 partition search."),
-		int_param("min-partition-size", "Min partition", "Tools", 64, {4, 128, 4}, "Minimum partition size."),
-		int_param("max-partition-size", "Max partition", "Tools", 128, {4, 128, 4}, "Maximum partition size."),
 		int_param("tile-columns", "Tile columns", "Execution", 0, {0, 6, 1}, "Log2 tile column count."),
 		int_param("tile-rows", "Tile rows", "Execution", 0, {0, 6, 1}, "Log2 tile row count."),
 	};

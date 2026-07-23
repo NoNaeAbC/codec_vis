@@ -275,6 +275,14 @@ std::shared_ptr<const RawImage> copy_uvg_picture_to_raw(
 
 std::vector<EncoderParamInfo> query_uvg266_parameters() {
 	return {
+		enum_param(
+			"bit-depth",
+			"Bit depth",
+			"Output Format",
+			std::to_string(UVG_BIT_DEPTH),
+			{{std::to_string(UVG_BIT_DEPTH), std::to_string(UVG_BIT_DEPTH) + "-bit"}},
+			"Bit depth compiled into this uvg266 library."
+		),
 		int_param("qp", "QP", "Rate Control", 48, {0, 63, 1}, "Quantization parameter."),
 		enum_param(
 			"preset",

@@ -9,6 +9,7 @@
 #include <chrono>
 #include <exception>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -50,6 +51,11 @@ std::vector<Action> execute_command(const Command& command, const AppState& stat
 				action.kind = ActionKind::SourceLoaded;
 				action.sourceLoaded.path = command.path;
 				action.sourceLoaded.image = std::make_shared<RawImage>(load_input_image(command.path));
+				std::error_code sizeError;
+				const uintmax_t fileSize = std::filesystem::file_size(command.path, sizeError);
+				if (!sizeError && fileSize <= std::numeric_limits<uint64_t>::max()) {
+					action.sourceLoaded.fileByteSize = static_cast<uint64_t>(fileSize);
+				}
 				actions.push_back(std::move(action));
 				break;
 			}

@@ -587,6 +587,7 @@ UpdateResult update(AppState state, const Action& action) {
 			source.height = action.sourceLoaded.image->height;
 			source.pixelFormat = action.sourceLoaded.image->format;
 			source.color = color_metadata(action.sourceLoaded.image->color);
+			source.sourceByteSize = action.sourceLoaded.fileByteSize;
 			source.decoded = action.sourceLoaded.image;
 			result.state.images.erase(
 				std::remove_if(result.state.images.begin(), result.state.images.end(), [](const ImageObject& image) {

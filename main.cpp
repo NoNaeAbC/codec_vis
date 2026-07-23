@@ -539,7 +539,7 @@ struct CliOptions {
 };
 
 codec_gui::ParamValue parse_av1_param_value(std::string_view name, std::string_view value) {
-	if (name == "rate-control" || name == "bit-depth" || name == "tx-mode") {
+	if (name == "rate-control" || name == "bit-depth" || name == "chroma-subsampling" || name == "tx-mode") {
 		return std::string(value);
 	}
 	if (value == "true") return true;

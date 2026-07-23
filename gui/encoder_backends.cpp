@@ -27,7 +27,19 @@ constexpr BackendId JPEGXR{12};
 constexpr BackendId PNG{13};
 constexpr BackendId X264_H264_INTRA{14};
 
-void append_output_controls(std::vector<EncoderParamInfo>& params);
+struct OutputControlPolicy {
+	std::vector<EnumValue> bitDepths;
+	std::string defaultBitDepth;
+	std::vector<EnumValue> chromaFormats;
+	std::string defaultChroma;
+	bool colorPrimaries = false;
+	bool transfer = false;
+	bool matrix = false;
+	bool range = false;
+	bool toneMapping = false;
+};
+
+void append_output_controls(std::vector<EncoderParamInfo>& params, const OutputControlPolicy& policy);
 PixelFormat output_format(PixelFormat source, int depth, std::string_view chroma);
 
 std::string param_value_to_string(const ParamValue& value) {
@@ -92,79 +104,102 @@ std::vector<std::string> capability_details(const std::vector<EncoderParamInfo>&
 }
 
 template <auto QueryFn>
-CapabilityResult query_software_capabilities(std::string implementation) {
+CapabilityResult query_software_capabilities(std::string implementation, const OutputControlPolicy& policy) {
 	CapabilityResult result;
 	result.snapshot.implementation = std::move(implementation);
 	result.snapshot.available = true;
 	result.params = QueryFn();
-	append_output_controls(result.params);
+	append_output_controls(result.params, policy);
 	result.snapshot.details = capability_details(result.params);
 	return result;
 }
 
-template <auto QueryFn>
-CapabilityResult query_hardware_capabilities(std::string implementation) {
-	CapabilityResult result;
-	try {
-		result.params = QueryFn();
-		append_output_controls(result.params);
-		result.snapshot.implementation = std::move(implementation);
-		result.snapshot.available = true;
-		result.snapshot.details = capability_details(result.params);
-	} catch (const std::exception& e) {
-		result.snapshot.implementation = std::move(implementation);
-		result.snapshot.available = false;
-		result.snapshot.error = e.what();
-	}
-	return result;
-}
-
 CapabilityResult query_x265_backend() {
-	return query_software_capabilities<query_x265_parameters>("x265");
+	return query_software_capabilities<query_x265_parameters>(
+		"x265",
+		{{{"8", "8-bit"}, {"10", "10-bit"}, {"12", "12-bit"}}, "12",
+		 {{"source", "Source"}, {"420", "4:2:0"}, {"422", "4:2:2"}, {"444", "4:4:4"}, {"400", "Monochrome"}}, "source",
+		 true, true, true, true, true}
+	);
 }
 
 CapabilityResult query_vvenc_backend() {
-	return query_software_capabilities<query_vvenc_parameters>("VVenC");
+	return query_software_capabilities<query_vvenc_parameters>(
+		"VVenC",
+		{{{"8", "8-bit"}, {"10", "10-bit"}}, "10",
+		 {{"420", "4:2:0"}, {"400", "Monochrome"}}, "420"}
+	);
 }
 
 CapabilityResult query_svt_av1_backend() {
-	return query_software_capabilities<query_svt_av1_parameters>("SVT-AV1");
+	return query_software_capabilities<query_svt_av1_parameters>(
+		"SVT-AV1",
+		{{{"8", "8-bit"}, {"10", "10-bit"}}, "10",
+		 {{"source", "Source"}, {"420", "4:2:0"}, {"422", "4:2:2"}, {"444", "4:4:4"}, {"400", "Monochrome"}}, "source",
+		 true, true, true, true, true}
+	);
 }
 
 CapabilityResult query_uvg266_backend() {
-	return query_software_capabilities<query_uvg266_parameters>("uvg266");
+	return query_software_capabilities<query_uvg266_parameters>(
+		"uvg266",
+		{{}, "",
+		 {{"420", "4:2:0"}, {"400", "Monochrome"}}, "420",
+		 true, true, true, true, true}
+	);
 }
 
 CapabilityResult query_av2_backend() {
-	return query_software_capabilities<query_av2_parameters>("AVM AV2");
+	return query_software_capabilities<query_av2_parameters>(
+		"AVM AV2",
+		{{{"8", "8-bit"}, {"10", "10-bit"}}, "10",
+		 {{"source", "Source"}, {"420", "4:2:0"}, {"422", "4:2:2"}, {"444", "4:4:4"}, {"400", "Monochrome"}}, "source",
+		 true, true, true, true, true}
+	);
 }
 
 CapabilityResult query_jpegls_backend() {
-	return query_software_capabilities<query_jpegls_parameters>("CharLS JPEG-LS");
+	return query_software_capabilities<query_jpegls_parameters>(
+		"CharLS JPEG-LS", {{{"8", "8-bit"}}, "8"}
+	);
 }
 
 CapabilityResult query_jpeg_backend() {
-	return query_software_capabilities<query_jpeg_parameters>("libjpeg");
+	return query_software_capabilities<query_jpeg_parameters>(
+		"libjpeg", {{{"8", "8-bit"}}, "8"}
+	);
 }
 
 CapabilityResult query_jpeg2000_backend() {
-	return query_software_capabilities<query_jpeg2000_parameters>("OpenJPEG");
+	return query_software_capabilities<query_jpeg2000_parameters>(
+		"OpenJPEG", {{{"8", "8-bit"}}, "8"}
+	);
 }
 
 CapabilityResult query_jpegxl_backend() {
-	return query_software_capabilities<query_jpegxl_parameters>("libjxl");
+	return query_software_capabilities<query_jpegxl_parameters>(
+		"libjxl",
+		{{{"source", "Source"}, {"8", "8-bit"}, {"10", "10-bit"}, {"12", "12-bit"}, {"14", "14-bit"}}, "source",
+		 {}, "", true, true, false, false, true}
+	);
 }
 
 CapabilityResult query_jpegxr_backend() {
-	return query_software_capabilities<query_jpegxr_parameters>("jxrlib");
+	return query_software_capabilities<query_jpegxr_parameters>(
+		"jxrlib", {{{"8", "8-bit"}}, "8"}
+	);
 }
 
 CapabilityResult query_png_backend() {
-	return query_software_capabilities<query_png_parameters>("libpng");
+	return query_software_capabilities<query_png_parameters>(
+		"libpng", {{{"8", "8-bit"}}, "8"}
+	);
 }
 
 CapabilityResult query_x264_backend() {
-	return query_software_capabilities<query_x264_parameters>("x264");
+	return query_software_capabilities<query_x264_parameters>(
+		"x264", {{{"8", "8-bit"}}, "8", {{"420", "4:2:0"}}, "420"}
+	);
 }
 
 std::string vaapi_backend_name(std::string_view codec, const VaapiDeviceInfo& device) {
@@ -179,7 +214,10 @@ CapabilityResult query_vaapi_backend(const VaapiDeviceInfo& device, bool av1) {
 	result.snapshot.implementation = vaapi_backend_name(av1 ? "AV1" : "HEVC", device);
 	try {
 		result.params = av1 ? query_vaapi_av1_parameters(device.path) : query_vaapi_hevc_parameters(device.path);
-		append_output_controls(result.params);
+		append_output_controls(
+			result.params,
+			{{}, "", {}, "", true, true, true, true, true}
+		);
 		result.snapshot.available = true;
 		result.snapshot.details = capability_details(result.params);
 		result.snapshot.details.insert(result.snapshot.details.begin(), "Render node: " + device.path);
@@ -327,7 +365,6 @@ std::vector<BackendInfo> query_backend_infos(std::span<const EncoderBackend> bac
 		info.kind = backend.kind;
 		info.capabilities = std::move(caps.snapshot);
 		info.params = std::move(caps.params);
-		append_output_controls(info.params);
 		infos.push_back(std::move(info));
 	}
 	return infos;
@@ -427,19 +464,19 @@ EncodeResult run_backend_encode(const EncoderBackend& backend, const RawImage& i
 namespace codec_gui::gui {
 namespace {
 
-void append_output_controls(std::vector<EncoderParamInfo>& params) {
+void append_output_controls(std::vector<EncoderParamInfo>& params, const OutputControlPolicy& policy) {
 	auto has = [&](std::string_view name) {
 		return std::any_of(params.begin(), params.end(), [&](const EncoderParamInfo& param) { return param.name == name; });
 	};
-	if (!has("bit-depth")) params.push_back({.name="bit-depth", .label="Output bit depth", .group="Output Format", .kind=ParamKind::Enum, .defaultValue=std::string{"source"}, .enumValues={{"source","Source"},{"8","8-bit"},{"10","10-bit"},{"12","12-bit"},{"14","14-bit (validated by backend)"}}, .help="Explicit coded sample precision. 12- and 14-bit images remain high precision during conversion; the selected encoder must advertise or accept that precision."});
-	if (!has("chroma-subsampling")) params.push_back({.name="chroma-subsampling", .label="Chroma subsampling", .group="Output Format", .kind=ParamKind::Enum, .defaultValue=std::string{"source"}, .enumValues={{"source","Source"},{"420","4:2:0"},{"422","4:2:2"},{"444","4:4:4"},{"400","Monochrome"}}, .help="Explicit output chroma layout. Conversion is performed before encoding and never passes through RGB8."});
-	if (!has("color-primaries")) params.push_back({.name="color-primaries", .label="Target primaries", .group="Color Transform", .kind=ParamKind::Enum, .defaultValue=std::string{"source"}, .enumValues={{"source","Source"},{"bt709","BT.709"},{"display-p3","Display P3"},{"bt2020","BT.2020"}}, .help="H.273 colour_primaries for the target plus a real linear-light gamut conversion; this is not metadata-only signaling."});
-	if (!has("transfer")) params.push_back({.name="transfer", .label="Target transfer / EOTF", .group="Color Transform", .kind=ParamKind::Enum, .defaultValue=std::string{"source"}, .enumValues={{"source","Source"},{"srgb","sRGB"},{"bt709","BT.709"},{"linear","Linear"},{"pq","PQ (H.273 16)"},{"hlg","HLG (H.273 18)"}}, .help="Explicit H.273 transfer characteristics. PQ is defined by H.273 for 10-, 12-, 14-, and 16-bit systems."});
-	if (!has("matrix")) params.push_back({.name="matrix", .label="Target matrix", .group="Color Transform", .kind=ParamKind::Enum, .defaultValue=std::string{"source"}, .enumValues={{"source","Source"},{"bt709","BT.709"},{"bt2020nc","BT.2020 non-constant"}}, .help="Explicit H.273 matrix coefficients used for the actual RGB/Y'CbCr conversion and bitstream signaling."});
-	if (!has("range")) params.push_back({.name="range", .label="Signal range", .group="Color Transform", .kind=ParamKind::Enum, .defaultValue=std::string{"source"}, .enumValues={{"source","Source"},{"limited","Limited"},{"full","Full"}}, .help="Explicit full or limited range. Limited-range code values follow the bit-depth-generic H.273 equations."});
-	if (!has("tone-map")) params.push_back({.name="tone-map", .label="Tone / gamut mapping", .group="Color Transform", .kind=ParamKind::Enum, .defaultValue=std::string{"none"}, .enumValues={{"none","None (reject narrowing)"},{"clip","Explicit clip"},{"reinhard","Reinhard"}}, .help="Required when converting HDR to SDR or a wider gamut to BT.709. None rejects the conversion instead of applying an implicit mapping."});
-	if (!has("source-peak-nits")) params.push_back({.name="source-peak-nits", .label="Source peak luminance", .group="Color Transform", .kind=ParamKind::Float, .defaultValue=1000.0, .floatRange=FloatRange{80.0,10000.0,10.0}, .help="Explicit source peak luminance used for HDR transforms, in cd/m²."});
-	if (!has("target-peak-nits")) params.push_back({.name="target-peak-nits", .label="Target peak luminance", .group="Color Transform", .kind=ParamKind::Float, .defaultValue=203.0, .floatRange=FloatRange{80.0,10000.0,10.0}, .help="Explicit target peak luminance used by tone mapping, in cd/m²."});
+	if (!has("bit-depth") && !policy.bitDepths.empty()) params.push_back({.name="bit-depth", .label="Output bit depth", .group="Output Format", .kind=ParamKind::Enum, .defaultValue=policy.defaultBitDepth, .enumValues=policy.bitDepths, .help="Explicit coded sample precision supported by this encoder implementation."});
+	if (!has("chroma-subsampling") && !policy.chromaFormats.empty()) params.push_back({.name="chroma-subsampling", .label="Chroma subsampling", .group="Output Format", .kind=ParamKind::Enum, .defaultValue=policy.defaultChroma, .enumValues=policy.chromaFormats, .help="Explicit output chroma layout supported by this encoder implementation."});
+	if (policy.colorPrimaries && !has("color-primaries")) params.push_back({.name="color-primaries", .label="Target primaries", .group="Color Transform", .kind=ParamKind::Enum, .defaultValue=std::string{"source"}, .enumValues={{"source","Source"},{"bt709","BT.709"},{"display-p3","Display P3"},{"bt2020","BT.2020"}}, .help="H.273 colour_primaries for the target plus a real linear-light gamut conversion; this is not metadata-only signaling."});
+	if (policy.transfer && !has("transfer")) params.push_back({.name="transfer", .label="Target transfer / EOTF", .group="Color Transform", .kind=ParamKind::Enum, .defaultValue=std::string{"source"}, .enumValues={{"source","Source"},{"srgb","sRGB"},{"bt709","BT.709"},{"linear","Linear"},{"pq","PQ (H.273 16)"},{"hlg","HLG (H.273 18)"}}, .help="Explicit H.273 transfer characteristics. PQ is defined by H.273 for 10-, 12-, 14-, and 16-bit systems."});
+	if (policy.matrix && !has("matrix")) params.push_back({.name="matrix", .label="Target matrix", .group="Color Transform", .kind=ParamKind::Enum, .defaultValue=std::string{"source"}, .enumValues={{"source","Source"},{"bt709","BT.709"},{"bt2020nc","BT.2020 non-constant"}}, .help="Explicit H.273 matrix coefficients used for the actual RGB/Y'CbCr conversion and bitstream signaling."});
+	if (policy.range && !has("range")) params.push_back({.name="range", .label="Signal range", .group="Color Transform", .kind=ParamKind::Enum, .defaultValue=std::string{"source"}, .enumValues={{"source","Source"},{"limited","Limited"},{"full","Full"}}, .help="Explicit full or limited range. Limited-range code values follow the bit-depth-generic H.273 equations."});
+	if (policy.toneMapping && !has("tone-map")) params.push_back({.name="tone-map", .label="Tone / gamut mapping", .group="Color Transform", .kind=ParamKind::Enum, .defaultValue=std::string{"none"}, .enumValues={{"none","None (reject narrowing)"},{"clip","Explicit clip"},{"reinhard","Reinhard"}}, .help="Required when converting HDR to SDR or a wider gamut to BT.709. None rejects the conversion instead of applying an implicit mapping."});
+	if (policy.toneMapping && !has("source-peak-nits")) params.push_back({.name="source-peak-nits", .label="Source peak luminance", .group="Color Transform", .kind=ParamKind::Float, .defaultValue=1000.0, .floatRange=FloatRange{80.0,10000.0,10.0}, .help="Explicit source peak luminance used by tone and gamut mapping, in cd/m²."});
+	if (policy.toneMapping && !has("target-peak-nits")) params.push_back({.name="target-peak-nits", .label="Target peak luminance", .group="Color Transform", .kind=ParamKind::Float, .defaultValue=203.0, .floatRange=FloatRange{80.0,10000.0,10.0}, .help="Explicit target peak luminance used by tone and gamut mapping, in cd/m²."});
 }
 
 PixelFormat output_format(PixelFormat source, int depth, std::string_view chroma) {

@@ -1866,7 +1866,7 @@ std::vector<EncoderParamInfo> query_vaapi_hevc_parameters(std::string_view devic
 		bool_param("scc", "SCC", "Profile / Level", false, "Use HEVC Screen Content Coding profiles where supported."),
 		int_param("level-idc", "Level IDC", "Profile / Level", 120, {30, 255, 3}, "HEVC general_level_idc value."),
 		bool_param("high-tier", "High tier", "Profile / Level", false, "Set HEVC general_tier_flag."),
-		enum_param("bit-depth", "Bit depth", "Compression", "source", {{"source", "Source"}, {"8", "8-bit"}, {"10", "10-bit"}}, "Encode bit depth."),
+		enum_param("bit-depth", "Bit depth", "Compression", supports10 ? "10" : "8", {{"8", "8-bit"}, {"10", "10-bit"}}, "Encode bit depth."),
 		enum_param(
 			"chroma-subsampling",
 			"Chroma subsampling",
@@ -1942,9 +1942,10 @@ std::vector<EncoderParamInfo> query_vaapi_hevc_parameters(std::string_view devic
 		}
 	}
 	if (EncoderParamInfo* depth = find_param("bit-depth")) {
-		depth->enumValues = {{"source", "Source"}};
+		depth->enumValues.clear();
 		if (supports8) depth->enumValues.push_back({"8", "8-bit"});
 		if (supports10) depth->enumValues.push_back({"10", "10-bit"});
+		depth->defaultValue = supports10 ? std::string{"10"} : std::string{"8"};
 	}
 	if (EncoderParamInfo* chroma = find_param("chroma-subsampling")) {
 		chroma->enumValues.clear();
@@ -2189,7 +2190,8 @@ std::vector<EncoderParamInfo> query_vaapi_av1_parameters(std::string_view device
 		int_param("icq-quality", "ICQ quality", "Rate Control", 25, {1, 51, 1}, "VA-API intelligent constant-quality factor; 1 is highest quality and 51 is lowest."),
 		int_param("bitrate-kbps", "Bitrate", "Rate Control", 10000, {1, 1000000, 1000}, "Target bitrate for CBR/VBR modes."),
 		automatic_int_param("level-idx", "Level index", "Profile / Level", -1, {-1, 23, 1}, "Auto is an application-only sentinel that selects the lowest valid AV1 level for the image. Explicit values 0..23 map to AV1 levels 2.0..7.3; -1 is never written as seq_level_idx."),
-		enum_param("bit-depth", "Bit depth", "Compression", "source", {{"source", "Source"}, {"8", "8-bit"}, {"10", "10-bit"}}, "Encode bit depth."),
+		enum_param("bit-depth", "Bit depth", "Compression", supports10 ? "10" : "8", {{"8", "8-bit"}, {"10", "10-bit"}}, "Encode bit depth."),
+		enum_param("chroma-subsampling", "Chroma subsampling", "Output Format", "420", {{"420", "4:2:0"}}, "VA-API AV1 Profile 0 output is 4:2:0."),
 		bool_param("disable-cdf-update", "Disable CDF update", "Coding Tools", false, "Disable AV1 CDF updates for the still frame."),
 		bool_param("cdef", "CDEF", "Filters", true, "Enable AV1 constrained directional enhancement filtering."),
 		int_param("loop-filter-level", "Loop filter level", "Filters", 0, {0, 63, 1}, "AV1 luma loop filter level."),
@@ -2234,9 +2236,10 @@ std::vector<EncoderParamInfo> query_vaapi_av1_parameters(std::string_view device
 		}
 	}
 	if (EncoderParamInfo* depth = find_param("bit-depth")) {
-		depth->enumValues = {{"source", "Source"}};
+		depth->enumValues.clear();
 		if (supports8) depth->enumValues.push_back({"8", "8-bit"});
 		if (supports10) depth->enumValues.push_back({"10", "10-bit"});
+		depth->defaultValue = supports10 ? std::string{"10"} : std::string{"8"};
 	}
 	if (caps.tileSupport == 0) {
 		out.erase(std::remove_if(out.begin(), out.end(), [](const EncoderParamInfo& param) {
@@ -2260,6 +2263,10 @@ std::vector<EncoderParamInfo> query_vaapi_av1_parameters() {
 }
 
 EncodedImage encode_vaapi_av1_still_image(const RawImage& image, std::span<const EncoderParam> params, std::string_view device) {
+	const std::string chroma = get_param<std::string>(params, "chroma-subsampling", "420");
+	if (chroma != "420") {
+		throw std::invalid_argument("VA-API AV1 Profile 0 accepts only 4:2:0 output");
+	}
 	const int targetDepth = requested_bit_depth(params, image);
 	if (targetDepth != 8 && targetDepth != 10) {
 		throw std::runtime_error("VA-API AV1 accepts 8-bit or 10-bit input");

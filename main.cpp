@@ -3,11 +3,13 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <charconv>
 #include <cmath>
 #include <csetjmp>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cctype>
 #include <cstring>
 #include <filesystem>
@@ -16,6 +18,7 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -240,6 +243,11 @@ codec_gui::RawImage rgb_to_yuv420_bt709_limited(const RgbImage &rgb) {
 	image.width  = width;
 	image.height = height;
 	image.format = codec_gui::PixelFormat::YUV420P8;
+	image.color.primaries = codec_gui::ColorPrimaries::BT709;
+	image.color.transfer = codec_gui::TransferCharacteristics::SRGB;
+	image.color.matrix = codec_gui::MatrixCoefficients::BT709;
+	image.color.range = codec_gui::ColorRange::Limited;
+	image.color.chroma420Location = codec_gui::Chroma420SampleLocation::Center;
 
 	image.planes[0].strideBytes = width;
 	image.planes[1].strideBytes = width / 2;
@@ -299,6 +307,11 @@ codec_gui::RawImage rgb16_to_yuv420p10_bt709_limited(const Rgb16Image &rgb) {
 	image.width  = width;
 	image.height = height;
 	image.format = codec_gui::PixelFormat::YUV420P10LE;
+	image.color.primaries = codec_gui::ColorPrimaries::BT709;
+	image.color.transfer = codec_gui::TransferCharacteristics::SRGB;
+	image.color.matrix = codec_gui::MatrixCoefficients::BT709;
+	image.color.range = codec_gui::ColorRange::Limited;
+	image.color.chroma420Location = codec_gui::Chroma420SampleLocation::Center;
 
 	image.planes[0].strideBytes = width * 2;
 	image.planes[1].strideBytes = width;
@@ -368,6 +381,11 @@ codec_gui::RawImage make_test_pattern() {
 
 	image.width  = WIDTH;
 	image.height = HEIGHT;
+	image.color.primaries = codec_gui::ColorPrimaries::BT709;
+	image.color.transfer = codec_gui::TransferCharacteristics::SRGB;
+	image.color.matrix = codec_gui::MatrixCoefficients::BT709;
+	image.color.range = codec_gui::ColorRange::Limited;
+	image.color.chroma420Location = codec_gui::Chroma420SampleLocation::Center;
 
 	image.planes[0].bytes.resize(HEIGHT * WIDTH);
 	image.planes[0].strideBytes = WIDTH;
@@ -402,29 +420,177 @@ codec_gui::RawImage make_test_pattern() {
 	return image;
 }
 
+struct CliOptions {
+	bool vaapiAv1Only = false;
+	bool listVaapiAv1Params = false;
+	std::optional<std::filesystem::path> input;
+	std::filesystem::path output = "file_vaapi.av1";
+	std::vector<codec_gui::EncoderParam> av1Params;
+};
+
+codec_gui::ParamValue parse_av1_param_value(std::string_view name, std::string_view value) {
+	if (name == "rate-control" || name == "bit-depth" || name == "tx-mode") {
+		return std::string(value);
+	}
+	if (value == "true") return true;
+	if (value == "false") return false;
+	int64_t integer = 0;
+	const char* begin = value.data();
+	const char* end = begin + value.size();
+	const auto [position, error] = std::from_chars(begin, end, integer);
+	if (error == std::errc{} && position == end) return integer;
+	return std::string(value);
+}
+
+codec_gui::EncoderParam parse_av1_param(std::string_view argument) {
+	const std::size_t separator = argument.find('=');
+	if (separator == std::string_view::npos || separator == 0 || separator + 1 == argument.size()) {
+		throw std::invalid_argument("--av1-param expects NAME=VALUE");
+	}
+	return {
+		std::string(argument.substr(0, separator)),
+		parse_av1_param_value(argument.substr(0, separator), argument.substr(separator + 1)),
+	};
+}
+
+CliOptions parse_cli_options(int argc, char** argv) {
+	CliOptions options;
+	for (int index = 1; index < argc; ++index) {
+		const std::string_view argument = argv[index];
+		if (argument == "--help" || argument == "-h") {
+			std::cout
+				<< "Usage: codec_vis_cli [OPTIONS] [INPUT.jpg|INPUT.jpeg|INPUT.nef]\n"
+				   "Encode an input image, or a generated pattern when no input is given.\n\n"
+				   "  --vaapi-av1-only            Run only the VA-API AV1 backend\n"
+				   "  --av1-param NAME=VALUE      Pass a backend parameter; repeatable\n"
+				   "  --output PATH               Output path for --vaapi-av1-only\n"
+				   "  --list-vaapi-av1-params     List parameters advertised by the GPU\n";
+			std::exit(0);
+		}
+		if (argument == "--vaapi-av1-only") {
+			options.vaapiAv1Only = true;
+			continue;
+		}
+		if (argument == "--list-vaapi-av1-params") {
+			options.listVaapiAv1Params = true;
+			continue;
+		}
+		if (argument == "--output" || argument == "--av1-param") {
+			if (++index >= argc) {
+				throw std::invalid_argument(std::string(argument) + " requires an argument");
+			}
+			if (argument == "--output") {
+				options.output = argv[index];
+			} else {
+				options.av1Params.push_back(parse_av1_param(argv[index]));
+			}
+			continue;
+		}
+		if (!argument.empty() && argument.front() == '-') {
+			throw std::invalid_argument("unknown option: " + std::string(argument));
+		}
+		if (options.input.has_value()) {
+			throw std::invalid_argument("expected at most one input file");
+		}
+		options.input = std::filesystem::path(argument);
+	}
+	if ((!options.av1Params.empty() || options.output != "file_vaapi.av1") && !options.vaapiAv1Only) {
+		throw std::invalid_argument("--av1-param and --output require --vaapi-av1-only");
+	}
+	return options;
+}
+
+void print_vaapi_av1_parameters() {
+	for (const codec_gui::EncoderParamInfo& param : codec_gui::query_vaapi_av1_parameters()) {
+		std::cout << param.name;
+		if (!param.enumValues.empty()) {
+			std::cout << '=';
+			for (std::size_t index = 0; index < param.enumValues.size(); ++index) {
+				if (index != 0) std::cout << '|';
+				std::cout << param.enumValues[index].value;
+			}
+		} else if (param.intRange.has_value()) {
+			std::cout << '=' << param.intRange->min << ".." << param.intRange->max;
+		} else if (param.kind == codec_gui::ParamKind::Bool) {
+			std::cout << "=false|true";
+		}
+		std::cout << '\n';
+	}
+}
+
+void validate_av1_params(std::span<const codec_gui::EncoderParam> params) {
+	const std::vector<codec_gui::EncoderParamInfo> advertised =
+		codec_gui::query_vaapi_av1_parameters();
+	for (std::size_t index = 0; index < params.size(); ++index) {
+		const codec_gui::EncoderParam& param = params[index];
+		if (std::any_of(params.begin(), params.begin() + static_cast<std::ptrdiff_t>(index),
+		                [&](const codec_gui::EncoderParam& earlier) { return earlier.name == param.name; })) {
+			throw std::invalid_argument("duplicate AV1 parameter: " + param.name);
+		}
+		const auto definition = std::find_if(
+			advertised.begin(),
+			advertised.end(),
+			[&](const codec_gui::EncoderParamInfo& candidate) { return candidate.name == param.name; }
+		);
+		if (definition == advertised.end()) {
+			throw std::invalid_argument("AV1 parameter is not advertised by the selected GPU: " + param.name);
+		}
+		switch (definition->kind) {
+			case codec_gui::ParamKind::Bool:
+				if (!std::holds_alternative<bool>(param.value)) {
+					throw std::invalid_argument("AV1 parameter " + param.name + " expects true or false");
+				}
+				break;
+			case codec_gui::ParamKind::Int: {
+				const int64_t* value = std::get_if<int64_t>(&param.value);
+				if (value == nullptr) {
+					throw std::invalid_argument("AV1 parameter " + param.name + " expects an integer");
+				}
+				if (definition->intRange.has_value() &&
+				    (*value < definition->intRange->min || *value > definition->intRange->max)) {
+					throw std::invalid_argument(
+						"AV1 parameter " + param.name + " is outside " +
+						std::to_string(definition->intRange->min) + ".." +
+						std::to_string(definition->intRange->max)
+					);
+				}
+				break;
+			}
+			case codec_gui::ParamKind::Enum: {
+				const std::string* value = std::get_if<std::string>(&param.value);
+				if (value == nullptr ||
+				    std::none_of(definition->enumValues.begin(), definition->enumValues.end(),
+				                 [&](const codec_gui::EnumValue& option) { return option.value == *value; })) {
+					throw std::invalid_argument("AV1 parameter " + param.name + " has an unsupported value");
+				}
+				break;
+			}
+			default:
+				throw std::invalid_argument("AV1 parameter type is unsupported by this CLI: " + param.name);
+		}
+	}
+}
+
 } // namespace
 
 int main(int argc, char **argv) try {
-	if (argc > 1) {
-		const std::string argument = argv[1];
-		if (argument == "--help" || argument == "-h") {
-			std::cout << "Usage: codec_vis_cli [INPUT.jpg|INPUT.jpeg|INPUT.nef]\n"
-			             "Encode an input image, or a generated test pattern when no input is given.\n";
-			return 0;
-		}
-		if (!argument.empty() && argument.front() == '-') {
-			std::cerr << "codec_vis_cli: unknown option: " << argument << '\n';
-			return 2;
-		}
-	}
-	if (argc > 2) {
-		std::cerr << "codec_vis_cli: expected at most one input file (try --help)\n";
-		return 2;
+	const CliOptions options = parse_cli_options(argc, argv);
+	if (options.listVaapiAv1Params) {
+		print_vaapi_av1_parameters();
+		return 0;
 	}
 
-	const codec_gui::RawImage image = argc > 1
-	                                      ? load_input_image(argv[1])
+	const codec_gui::RawImage image = options.input.has_value()
+	                                      ? load_input_image(*options.input)
 	                                      : make_test_pattern();
+
+	if (options.vaapiAv1Only) {
+		validate_av1_params(options.av1Params);
+		const codec_gui::EncodedImage encoded =
+			codec_gui::encode_vaapi_av1_still_image(image, options.av1Params);
+		dump_to_file(options.output, encoded.hevcAnnexB);
+		return 0;
+	}
 
 	const std::string x265Profile =
 			image.format == codec_gui::PixelFormat::YUV420P10LE ? "main10" : "mainstillpicture";
@@ -479,8 +645,8 @@ int main(int argc, char **argv) try {
 	try {
 		codec_gui::EncodedImage encoded_vaapi_av1 = codec_gui::encode_vaapi_av1_still_image(
 				image, std::array{
-							   codec_gui::EncoderParam{"qp", int64_t{35}},
-							   codec_gui::EncoderParam{"quality-level", int64_t{4}},
+							   codec_gui::EncoderParam{"qindex", int64_t{35}},
+							   codec_gui::EncoderParam{"target-usage", int64_t{4}},
 					   });
 
 		dump_to_file("file_vaapi.av1", encoded_vaapi_av1.hevcAnnexB);

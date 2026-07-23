@@ -62,6 +62,12 @@ struct BitWriter {
 	std::vector<uint8_t> bytes;
 	int bitOffset = 0;
 
+	[[nodiscard]] uint32_t bit_position() const {
+		return static_cast<uint32_t>(
+			bytes.size() * 8u - (bitOffset == 0 ? 0u : static_cast<unsigned int>(8 - bitOffset))
+		);
+	}
+
 	void bit(bool value) {
 		if (bitOffset == 0) {
 			bytes.push_back(0);
@@ -442,12 +448,84 @@ Av1TileLayout av1_tile_layout(int width, int height, bool use128, uint32_t reque
 	layout.minRowLog2 = minTilesLog2 > layout.colLog2 ? minTilesLog2 - layout.colLog2 : 0;
 	const uint32_t requestedRowLog2 = floor_log2_u32(next_power_of_two_u32(std::clamp<uint32_t>(requestedRows, 1, 64)));
 	layout.rowLog2 = std::clamp<uint32_t>(std::max(requestedRowLog2, layout.minRowLog2), layout.minRowLog2, layout.maxRowLog2);
-	layout.cols = 1u << layout.colLog2;
-	layout.rows = 1u << layout.rowLog2;
+	const uint32_t tileWidthSb = ceil_div_u32(sbCols, 1u << layout.colLog2);
+	const uint32_t tileHeightSb = ceil_div_u32(sbRows, 1u << layout.rowLog2);
+	layout.cols = ceil_div_u32(sbCols, tileWidthSb);
+	layout.rows = ceil_div_u32(sbRows, tileHeightSb);
+	const uint32_t finalTileWidthSb = sbCols - (layout.cols - 1u) * tileWidthSb;
+	const uint32_t finalTileHeightSb = sbRows - (layout.rows - 1u) * tileHeightSb;
+	if (std::min(tileWidthSb, finalTileWidthSb) < 2u ||
+	    std::min(tileHeightSb, finalTileHeightSb) < 2u) {
+		throw std::runtime_error(
+			"VA-API AV1 tile layout " + std::to_string(layout.cols) + "x" + std::to_string(layout.rows) +
+			" for picture " + std::to_string(width) + "x" + std::to_string(height) +
+			" produces a tile smaller than 2x2 superblocks"
+		);
+	}
+	constexpr uint32_t explicitTileDimensionCapacity = 63u;
+	if (layout.cols > explicitTileDimensionCapacity || layout.rows > explicitTileDimensionCapacity) {
+		// VAEncPictureParameterBufferAV1 exposes 63 explicit entries for each
+		// tile dimension.
+		throw std::runtime_error(
+			"VA-API AV1 supports at most 63 explicit tile columns or rows; normalized layout is " +
+			std::to_string(layout.cols) + "x" + std::to_string(layout.rows)
+		);
+	}
+	if (layout.cols * layout.rows > 128u) {
+		throw std::runtime_error(
+			"VA-API AV1 supports at most 128 tiles in a single tile group; normalized layout is " +
+			std::to_string(layout.cols) + "x" + std::to_string(layout.rows)
+		);
+	}
 	return layout;
 }
 
-std::vector<std::byte> av1_sequence_header_obu(int width, int height, int depth, uint8_t levelIdx, bool highTier, bool use128, bool filterIntra, bool intraEdge, bool cdef, bool restoration) {
+void fill_av1_tile_dimensions(
+	VAEncPictureParameterBufferAV1& pic,
+	int width,
+	int height,
+	bool use128,
+	const Av1TileLayout& tiles
+) {
+	const uint32_t sbSize = use128 ? 128u : 64u;
+	const uint32_t sbCols = ceil_div_u32(static_cast<uint32_t>(width), sbSize);
+	const uint32_t sbRows = ceil_div_u32(static_cast<uint32_t>(height), sbSize);
+	const uint32_t tileWidthSb = 1u + ((sbCols - 1u) >> tiles.colLog2);
+	for (uint32_t col = 0; col < tiles.cols; ++col) {
+		const uint32_t startSb = std::min<uint32_t>(col * tileWidthSb, sbCols);
+		const uint32_t endSb = col + 1u == tiles.cols ? sbCols : std::min<uint32_t>((col + 1u) * tileWidthSb, sbCols);
+		pic.width_in_sbs_minus_1[col] = static_cast<uint16_t>(std::max<uint32_t>(1, endSb - startSb) - 1u);
+	}
+	const uint32_t tileHeightSb = 1u + ((sbRows - 1u) >> tiles.rowLog2);
+	for (uint32_t row = 0; row < tiles.rows; ++row) {
+		const uint32_t startSb = std::min<uint32_t>(row * tileHeightSb, sbRows);
+		const uint32_t endSb = row + 1u == tiles.rows ? sbRows : std::min<uint32_t>((row + 1u) * tileHeightSb, sbRows);
+		pic.height_in_sbs_minus_1[row] = static_cast<uint16_t>(std::max<uint32_t>(1, endSb - startSb) - 1u);
+	}
+}
+
+uint8_t av1_chroma_sample_position(const ColorDescription& color) {
+	if (!color.chroma420Location.has_value()) return 0;
+	switch (*color.chroma420Location) {
+		case Chroma420SampleLocation::LeftCenter: return 1;
+		case Chroma420SampleLocation::TopLeft: return 2;
+		default: return 0;
+	}
+}
+
+std::vector<std::byte> av1_sequence_header_obu(
+	int width,
+	int height,
+	int depth,
+	uint8_t levelIdx,
+	bool highTier,
+	bool use128,
+	bool filterIntra,
+	bool intraEdge,
+	bool cdef,
+	bool restoration,
+	const ColorDescription& color
+) {
 	const int widthBits = bits_required(static_cast<uint32_t>(width - 1));
 	const int heightBits = bits_required(static_cast<uint32_t>(height - 1));
 	BitWriter bw;
@@ -482,16 +560,53 @@ std::vector<std::byte> av1_sequence_header_obu(int width, int height, int depth,
 	bw.bit(restoration);
 	bw.bit(depth == 10);
 	bw.bit(false);
-	bw.bit(false);
-	bw.bit(false);
-	bw.bits(0, 2);
+	const bool colorDescriptionPresent =
+		color.primaries != ColorPrimaries::Unspecified ||
+		color.transfer != TransferCharacteristics::Unspecified ||
+		color.matrix != MatrixCoefficients::Unspecified;
+	bw.bit(colorDescriptionPresent);
+	if (colorDescriptionPresent) {
+		bw.bits(static_cast<uint8_t>(color.primaries), 8);
+		bw.bits(static_cast<uint8_t>(color.transfer), 8);
+		bw.bits(static_cast<uint8_t>(color.matrix), 8);
+	}
+	bw.bit(color.range == ColorRange::Full);
+	bw.bits(av1_chroma_sample_position(color), 2);
 	bw.bit(false);
 	bw.bit(false);
 	bw.trailing_bits();
 	return make_av1_obu(1, bw.bytes);
 }
 
-std::vector<std::byte> av1_frame_header_obu(int width, int height, bool use128, const Av1TileLayout& tiles, int qindex, bool disableCdf, bool screenContent, bool intrabc, bool palette, int txMode, int filterLevel, bool cdef) {
+struct Av1FrameHeaderObu {
+	std::vector<std::byte> bytes;
+	uint32_t bitOffsetQindex = 0;
+	uint32_t bitOffsetLoopFilterParams = 0;
+	uint32_t bitOffsetCdefParams = 0;
+	uint32_t sizeInBitsCdefParams = 0;
+	uint32_t sizeInBits = 0;
+	uint32_t bitOffsetReducedTxSet = 0;
+};
+
+Av1FrameHeaderObu av1_frame_header_obu(
+	int width,
+	int height,
+	bool use128,
+	const Av1TileLayout& tiles,
+	int qindex,
+	bool disableCdf,
+	bool screenContent,
+	bool intrabc,
+	bool palette,
+	int txMode,
+	int filterLevel,
+	bool cdef,
+	int cdefBits,
+	bool reducedTxSet
+) {
+	// One byte for the OBU header and four bytes for the fixed-width LEB128
+	// payload size precede every syntax offset recorded below.
+	constexpr uint32_t obuPrefixBits = 5u * 8u;
 	BitWriter bw;
 	bw.bit(false);
 	bw.bits(0, 2);
@@ -523,18 +638,20 @@ std::vector<std::byte> av1_frame_header_obu(int width, int height, bool use128, 
 		bw.bits(0, static_cast<int>(tiles.colLog2 + tiles.rowLog2));
 		bw.bits(tiles.tileSizeBytesMinus1, 2);
 	}
+	Av1FrameHeaderObu out;
+	out.bitOffsetQindex = obuPrefixBits + bw.bit_position();
 	bw.bits(static_cast<uint32_t>(qindex), 8);
-	bw.bit(false);
-	bw.bit(false);
-	bw.bit(false);
-	bw.bit(false);
-	bw.bit(false);
-	bw.bit(false);
+	bw.bit(false); // delta_q_y_dc.delta_coded
+	bw.bit(false); // delta_q_u_dc.delta_coded
+	bw.bit(false); // delta_q_u_ac.delta_coded
+	bw.bit(false); // using_qmatrix
+	bw.bit(false); // segmentation_enabled
 	const bool codedLossless = qindex == 0;
 	if (qindex > 0) {
-		bw.bit(false);
+		bw.bit(false); // delta_q_present
 	}
 	if (!codedLossless && !intrabc) {
+		out.bitOffsetLoopFilterParams = obuPrefixBits + bw.bit_position();
 		bw.bits(static_cast<uint32_t>(filterLevel), 6);
 		bw.bits(static_cast<uint32_t>(filterLevel), 6);
 		if (filterLevel != 0) {
@@ -545,17 +662,29 @@ std::vector<std::byte> av1_frame_header_obu(int width, int height, bool use128, 
 		bw.bit(false);
 	}
 	if (!codedLossless && !intrabc && cdef) {
+		out.bitOffsetCdefParams = obuPrefixBits + bw.bit_position();
+		const uint32_t cdefStart = bw.bit_position();
 		bw.bits(0, 2);
-		bw.bits(0, 2);
-		bw.bits(0, 4);
-		bw.bits(0, 2);
-		bw.bits(0, 4);
-		bw.bits(0, 2);
+		bw.bits(static_cast<uint32_t>(cdefBits), 2);
+		for (int i = 0; i < (1 << cdefBits); ++i) {
+			bw.bits(0, 4);
+			bw.bits(0, 2);
+			bw.bits(0, 4);
+			bw.bits(0, 2);
+		}
+		out.sizeInBitsCdefParams = bw.bit_position() - cdefStart;
 	}
-	bw.bit(txMode != 0);
+	if (!codedLossless) {
+		bw.bit(txMode != 0);
+	}
+	out.bitOffsetReducedTxSet = obuPrefixBits + bw.bit_position();
+	bw.bit(reducedTxSet);
 	(void)palette;
-	bw.trailing_bits();
-	return make_av1_obu(3, bw.bytes, true);
+	bw.bit(true);
+	out.sizeInBits = obuPrefixBits + bw.bit_position();
+	bw.byte_align_zero();
+	out.bytes = make_av1_obu(3, bw.bytes, true);
+	return out;
 }
 
 uint8_t av1_level_idx_for_picture(int width, int height) {
@@ -563,17 +692,40 @@ uint8_t av1_level_idx_for_picture(int width, int height) {
 	struct LevelLimit {
 		uint8_t idx;
 		uint64_t maxPictureSamples;
+		uint32_t maxWidth;
+		uint32_t maxHeight;
 	};
 	constexpr LevelLimit levels[] = {
-		{0, 147456},   {1, 278784},   {4, 665856},   {5, 1065024},
-		{8, 2359296},  {12, 8912896}, {16, 35651584}, {20, 35651584},
+		{0, 147456, 2048, 1152},
+		{1, 278784, 2816, 1584},
+		{4, 665856, 4352, 2448},
+		{5, 1065024, 5504, 3096},
+		{8, 2359296, 6144, 3456},
+		{12, 8912896, 8192, 4352},
+		{16, 35651584, 16384, 8704},
 	};
 	for (const LevelLimit& level : levels) {
-		if (samples <= level.maxPictureSamples) {
+		if (samples <= level.maxPictureSamples &&
+		    static_cast<uint32_t>(width) <= level.maxWidth &&
+		    static_cast<uint32_t>(height) <= level.maxHeight) {
 			return level.idx;
 		}
 	}
-	return 20;
+	throw std::runtime_error(
+		"AV1 picture dimensions " + std::to_string(width) + "x" + std::to_string(height) +
+		" exceed the level 6.x/7.x maximum picture geometry"
+	);
+}
+
+bool av1_picture_fits_level(uint8_t levelIdx, int width, int height) {
+	const uint8_t lowestEquivalentLevel =
+		levelIdx == 0 ? 0 :
+		levelIdx <= 3 ? 1 :
+		levelIdx == 4 ? 4 :
+		levelIdx <= 7 ? 5 :
+		levelIdx <= 11 ? 8 :
+		levelIdx <= 15 ? 12 : 16;
+	return av1_level_idx_for_picture(width, height) <= lowestEquivalentLevel;
 }
 
 uint8_t av1_level_idx_from_params(std::span<const EncoderParam> params, int width, int height) {
@@ -581,7 +733,17 @@ uint8_t av1_level_idx_from_params(std::span<const EncoderParam> params, int widt
 	if (requested < 0) {
 		return av1_level_idx_for_picture(width, height);
 	}
-	return static_cast<uint8_t>(std::clamp<int64_t>(requested, 0, 23));
+	if (requested > 23) {
+		throw std::runtime_error("AV1 level index must be between 0 and 23");
+	}
+	const uint8_t levelIdx = static_cast<uint8_t>(requested);
+	if (!av1_picture_fits_level(levelIdx, width, height)) {
+		throw std::runtime_error(
+			"AV1 level index " + std::to_string(requested) + " is too low for picture dimensions " +
+			std::to_string(width) + "x" + std::to_string(height)
+		);
+	}
+	return levelIdx;
 }
 
 int bit_depth(PixelFormat format) {
@@ -1335,7 +1497,15 @@ uint32_t vaapi_rate_control_mode(std::string_view value) {
 	throw std::runtime_error("unsupported VA-API rate control mode: " + std::string(value));
 }
 
-BufferGuard create_misc_rate_control(VADisplay dpy, VAContextID ctx, uint32_t rcMode, uint32_t qp, uint32_t bitrateKbps) {
+BufferGuard create_misc_rate_control(
+	VADisplay dpy,
+	VAContextID ctx,
+	uint32_t rcMode,
+	uint32_t qp,
+	uint32_t bitrateKbps,
+	uint32_t maxQp = 51,
+	uint32_t qualityFactor = 0
+) {
 	std::vector<std::byte> bytes(sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterRateControl));
 	auto* misc = reinterpret_cast<VAEncMiscParameterBuffer*>(bytes.data());
 	auto* rc = reinterpret_cast<VAEncMiscParameterRateControl*>(misc->data);
@@ -1345,9 +1515,11 @@ BufferGuard create_misc_rate_control(VADisplay dpy, VAContextID ctx, uint32_t rc
 	rc->window_size = 1000u;
 	rc->initial_qp = qp;
 	rc->min_qp = 1;
-	rc->max_qp = 51;
-	rc->ICQ_quality_factor = std::clamp<uint32_t>(qp, 1, 51);
-	rc->quality_factor = qp;
+	rc->max_qp = maxQp;
+	const uint32_t selectedQualityFactor =
+		qualityFactor == 0 ? std::clamp<uint32_t>(qp, 1, 51) : std::clamp<uint32_t>(qualityFactor, 1, 51);
+	rc->ICQ_quality_factor = selectedQualityFactor;
+	rc->quality_factor = selectedQualityFactor;
 	return create_raw_buffer(dpy, ctx, VAEncMiscParameterBufferType, bytes);
 }
 
@@ -1356,7 +1528,9 @@ BufferGuard create_frame_rate(VADisplay dpy, VAContextID ctx) {
 	auto* misc = reinterpret_cast<VAEncMiscParameterBuffer*>(bytes.data());
 	auto* fr = reinterpret_cast<VAEncMiscParameterFrameRate*>(misc->data);
 	misc->type = VAEncMiscParameterTypeFrameRate;
-	fr->framerate = 1;
+	// libva packs the numerator in the low 16 bits and denominator in the
+	// high 16 bits. Use 1/1 for still-image encoding.
+	fr->framerate = 1u | (1u << 16u);
 	return create_raw_buffer(dpy, ctx, VAEncMiscParameterBufferType, bytes);
 }
 
@@ -1687,7 +1861,7 @@ std::vector<EncoderParamInfo> query_vaapi_hevc_parameters(std::string_view devic
 	std::vector<EncoderParamInfo> out{
 		enum_param("rate-control", "Mode", "Rate Control", rateControls.front().value, rateControls, "VA-API rate-control mode advertised by this driver."),
 		int_param("qpi", "QP", "Rate Control", 35, {0, 51, 1}, "I-picture quantization parameter for still-image encoding."),
-		int_param("bitrate-kbps", "Bitrate", "Rate Control", 10000, {1, 1000000, 1000}, "Target bitrate for CBR/VBR/ICQ modes."),
+		int_param("bitrate-kbps", "Bitrate", "Rate Control", 10000, {1, 1000000, 1000}, "Target bitrate for CBR/VBR modes."),
 		int_param("target-usage", "Target usage", "Speed / Quality", 4, {0, 7, 1}, "VA quality level: 1 highest quality, 7 fastest, 0 driver default."),
 		bool_param("scc", "SCC", "Profile / Level", false, "Use HEVC Screen Content Coding profiles where supported."),
 		int_param("level-idc", "Level IDC", "Profile / Level", 120, {30, 255, 3}, "HEVC general_level_idc value."),
@@ -2012,22 +2186,44 @@ std::vector<EncoderParamInfo> query_vaapi_av1_parameters(std::string_view device
 	std::vector<EncoderParamInfo> out{
 		enum_param("rate-control", "Mode", "Rate Control", rateControls.front().value, rateControls, "VA-API rate-control mode advertised by this driver."),
 		int_param("qindex", "Q index", "Rate Control", 128, {0, 255, 1}, "AV1 base quantizer index for CQP still-image encoding."),
-		int_param("bitrate-kbps", "Bitrate", "Rate Control", 10000, {1, 1000000, 1000}, "Target bitrate for CBR/VBR/ICQ modes."),
+		int_param("icq-quality", "ICQ quality", "Rate Control", 25, {1, 51, 1}, "VA-API intelligent constant-quality factor; 1 is highest quality and 51 is lowest."),
+		int_param("bitrate-kbps", "Bitrate", "Rate Control", 10000, {1, 1000000, 1000}, "Target bitrate for CBR/VBR modes."),
 		automatic_int_param("level-idx", "Level index", "Profile / Level", -1, {-1, 23, 1}, "Auto is an application-only sentinel that selects the lowest valid AV1 level for the image. Explicit values 0..23 map to AV1 levels 2.0..7.3; -1 is never written as seq_level_idx."),
 		enum_param("bit-depth", "Bit depth", "Compression", "source", {{"source", "Source"}, {"8", "8-bit"}, {"10", "10-bit"}}, "Encode bit depth."),
 		bool_param("disable-cdf-update", "Disable CDF update", "Coding Tools", false, "Disable AV1 CDF updates for the still frame."),
 		bool_param("cdef", "CDEF", "Filters", true, "Enable AV1 constrained directional enhancement filtering."),
 		int_param("loop-filter-level", "Loop filter level", "Filters", 0, {0, 63, 1}, "AV1 luma loop filter level."),
 		enum_param("tx-mode", "TX mode", "Transform", "largest", {{"largest", "Largest"}}, "AV1 transform mode."),
-		int_param("tile-columns", "Tile columns", "Partitioning", 1, {1, 64, 1}, "Number of AV1 tile columns."),
-		int_param("tile-rows", "Tile rows", "Partitioning", 1, {1, 64, 1}, "Number of AV1 tile rows."),
+		int_param("tile-columns", "Tile columns", "Partitioning", 1, {1, 32, 1}, "Requested AV1 uniform-spacing column target; the actual count follows AV1 superblock rounding and every tile must remain at least 2x2 superblocks."),
+		int_param("tile-rows", "Tile rows", "Partitioning", 1, {1, 32, 1}, "Requested AV1 uniform-spacing row target; the actual count follows AV1 superblock rounding and every tile must remain at least 2x2 superblocks."),
 	};
+	if (caps.qualityRange != 0) {
+		out.push_back(int_param(
+			"target-usage",
+			"Target usage",
+			"Speed / Quality",
+			std::min<int64_t>(4, caps.qualityRange),
+			{0, static_cast<int64_t>(caps.qualityRange), 1},
+			"VA quality level: 1 is the highest quality, larger values favor speed, and 0 selects the driver default."
+		));
+	}
 	auto find_param = [&](std::string_view name) -> EncoderParamInfo* {
 		const auto it = std::find_if(out.begin(), out.end(), [&](const EncoderParamInfo& param) { return param.name == name; });
 		return it == out.end() ? nullptr : &*it;
 	};
 	if (EncoderParamInfo* qindex = find_param("qindex")) {
-		qindex->enabledWhen.push_back({"rate-control", {"cqp", "icq"}, "Q index is used directly by CQP and as the quality factor by ICQ."});
+		if ((caps.rateControl & VA_RC_CQP) != 0) {
+			qindex->enabledWhen.push_back({"rate-control", {"cqp"}, "Q index applies only to CQP."});
+		} else {
+			out.erase(std::remove_if(out.begin(), out.end(), [](const EncoderParamInfo& param) { return param.name == "qindex"; }), out.end());
+		}
+	}
+	if (EncoderParamInfo* quality = find_param("icq-quality")) {
+		if ((caps.rateControl & VA_RC_ICQ) != 0) {
+			quality->enabledWhen.push_back({"rate-control", {"icq"}, "ICQ quality applies only to ICQ."});
+		} else {
+			out.erase(std::remove_if(out.begin(), out.end(), [](const EncoderParamInfo& param) { return param.name == "icq-quality"; }), out.end());
+		}
 	}
 	if (EncoderParamInfo* bitrate = find_param("bitrate-kbps")) {
 		if ((caps.rateControl & (VA_RC_VBR | VA_RC_CBR)) == 0) {
@@ -2048,10 +2244,12 @@ std::vector<EncoderParamInfo> query_vaapi_av1_parameters(std::string_view device
 		}), out.end());
 	} else {
 		if (EncoderParamInfo* columns = find_param("tile-columns"); columns != nullptr && caps.maxTileCols != 0) {
-			columns->intRange->max = std::min<int64_t>(columns->intRange->max, caps.maxTileCols);
+			const uint32_t maxPowerOfTwo = 1u << floor_log2_u32(std::min<uint32_t>(caps.maxTileCols, 63u));
+			columns->intRange->max = std::min<int64_t>(columns->intRange->max, maxPowerOfTwo);
 		}
 		if (EncoderParamInfo* rows = find_param("tile-rows"); rows != nullptr && caps.maxTileRows != 0) {
-			rows->intRange->max = std::min<int64_t>(rows->intRange->max, caps.maxTileRows);
+			const uint32_t maxPowerOfTwo = 1u << floor_log2_u32(std::min<uint32_t>(caps.maxTileRows, 63u));
+			rows->intRange->max = std::min<int64_t>(rows->intRange->max, maxPowerOfTwo);
 		}
 	}
 	return out;
@@ -2072,7 +2270,10 @@ EncodedImage encode_vaapi_av1_still_image(const RawImage& image, std::span<const
 	const uint32_t pixelFormat = depth == 8 ? VA_FOURCC_NV12 : VA_FOURCC_P010;
 	const uint32_t qindex = static_cast<uint32_t>(std::clamp<int64_t>(get_int_param_alias(params, "qindex", "qp", 128), 0, 255));
 	const uint32_t rcMode = vaapi_rate_control_mode(get_param<std::string>(params, "rate-control", "cqp"));
+	const uint32_t headerQindex = rcMode == VA_RC_CQP ? qindex : std::max<uint32_t>(1, qindex);
+	const uint32_t icqQuality = static_cast<uint32_t>(std::clamp<int64_t>(get_int_param(params, "icq-quality", 25), 1, 51));
 	const uint32_t bitrateKbps = static_cast<uint32_t>(std::clamp<int64_t>(get_int_param(params, "bitrate-kbps", 10000), 1, 1000000));
+	const uint32_t targetUsage = static_cast<uint32_t>(std::max<int64_t>(0, get_int_param(params, "target-usage", 4)));
 	const uint8_t levelIdx = av1_level_idx_from_params(params, encodeImage.width, encodeImage.height);
 	const bool highTier = false;
 	const bool use128 = false;
@@ -2086,8 +2287,9 @@ EncodedImage encode_vaapi_av1_still_image(const RawImage& image, std::span<const
 	const bool restoration = false;
 	const int filterLevel = static_cast<int>(std::clamp<int64_t>(get_int_param(params, "loop-filter-level", 0), 0, 63));
 	const int txMode = 1;
-	const uint32_t tileCols = static_cast<uint32_t>(std::clamp<int64_t>(get_int_param(params, "tile-columns", 1), 1, 64));
-	const uint32_t tileRows = static_cast<uint32_t>(std::clamp<int64_t>(get_int_param(params, "tile-rows", 1), 1, 64));
+	const bool reducedTxSet = false;
+	const uint32_t tileCols = static_cast<uint32_t>(std::clamp<int64_t>(get_int_param(params, "tile-columns", 1), 1, 32));
+	const uint32_t tileRows = static_cast<uint32_t>(std::clamp<int64_t>(get_int_param(params, "tile-rows", 1), 1, 32));
 	const Av1TileLayout tiles = av1_tile_layout(encodeImage.width, encodeImage.height, use128, tileCols, tileRows);
 
 	VaEncodeObjects va(
@@ -2099,7 +2301,7 @@ EncodedImage encode_vaapi_av1_still_image(const RawImage& image, std::span<const
 		VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_PICTURE,
 		rcMode
 	);
-	require_tile_configuration(va.display.dpy, VAProfileAV1Profile0, tileCols, tileRows, device);
+	require_tile_configuration(va.display.dpy, VAProfileAV1Profile0, tiles.cols, tiles.rows, device);
 	upload_yuv_to_surface(va.display.dpy, va.input.surface, encodeImage);
 	checked(vaSyncSurface(va.display.dpy, va.input.surface), "sync AV1 input surface");
 
@@ -2109,6 +2311,7 @@ EncodedImage encode_vaapi_av1_still_image(const RawImage& image, std::span<const
 	seq.seq_tier = highTier ? 1 : 0;
 	seq.intra_period = 1;
 	seq.ip_period = 1;
+	seq.bits_per_second = rcMode == VA_RC_CQP ? 0u : bitrateKbps * 1000u;
 	seq.seq_fields.bits.still_picture = 1;
 	seq.seq_fields.bits.use_128x128_superblock = use128 ? 1u : 0u;
 	seq.seq_fields.bits.enable_filter_intra = filterIntra ? 1u : 0u;
@@ -2141,31 +2344,22 @@ EncodedImage encode_vaapi_av1_still_image(const RawImage& image, std::span<const
 	pic.picture_flags.bits.palette_mode_enable = palette ? 1u : 0u;
 	pic.picture_flags.bits.allow_screen_content_tools = screenContent ? 1u : 0u;
 	pic.picture_flags.bits.force_integer_mv = 0;
-	pic.filter_level[0] = static_cast<uint8_t>(filterLevel);
-	pic.filter_level[1] = static_cast<uint8_t>(filterLevel);
-	pic.base_qindex = static_cast<uint8_t>(qindex);
-	pic.min_base_qindex = static_cast<uint8_t>(std::max<uint32_t>(1, qindex));
-	pic.max_base_qindex = static_cast<uint8_t>(std::max<uint32_t>(1, qindex));
+	pic.picture_flags.bits.reduced_tx_set = reducedTxSet ? 1u : 0u;
+	const int headerFilterLevel = rcMode == VA_RC_CQP ? filterLevel : 63;
+	const int headerCdefBits = rcMode == VA_RC_CQP ? 0 : 3;
+	pic.filter_level[0] = static_cast<uint8_t>(rcMode == VA_RC_CQP ? filterLevel : 255);
+	pic.filter_level[1] = static_cast<uint8_t>(rcMode == VA_RC_CQP ? filterLevel : 255);
+	pic.filter_level_u = static_cast<uint8_t>(rcMode == VA_RC_CQP ? 0 : 255);
+	pic.filter_level_v = static_cast<uint8_t>(rcMode == VA_RC_CQP ? 0 : 255);
+	pic.base_qindex = static_cast<uint8_t>(headerQindex);
+	pic.min_base_qindex = static_cast<uint8_t>(rcMode == VA_RC_CQP ? std::max<uint32_t>(1, qindex) : 1u);
+	pic.max_base_qindex = static_cast<uint8_t>(rcMode == VA_RC_CQP ? std::max<uint32_t>(1, qindex) : 255u);
 	pic.mode_control_flags.bits.tx_mode = static_cast<uint32_t>(txMode);
 	pic.tile_cols = static_cast<uint8_t>(tiles.cols);
 	pic.tile_rows = static_cast<uint8_t>(tiles.rows);
-	const uint32_t sbSize = use128 ? 128u : 64u;
-	const uint32_t sbCols = ceil_div_u32(static_cast<uint32_t>(encodeImage.width), sbSize);
-	const uint32_t sbRows = ceil_div_u32(static_cast<uint32_t>(encodeImage.height), sbSize);
-	const uint32_t tileWidthSb = 1u + ((sbCols - 1u) >> tiles.colLog2);
-	for (uint32_t col = 0; col < tiles.cols; ++col) {
-		const uint32_t startSb = std::min<uint32_t>(col * tileWidthSb, sbCols);
-		const uint32_t endSb = col + 1 == tiles.cols ? sbCols : std::min<uint32_t>((col + 1u) * tileWidthSb, sbCols);
-		pic.width_in_sbs_minus_1[col] = static_cast<uint16_t>(std::max<uint32_t>(1, endSb - startSb) - 1u);
-	}
-	const uint32_t tileHeightSb = 1u + ((sbRows - 1u) >> tiles.rowLog2);
-	for (uint32_t row = 0; row < tiles.rows; ++row) {
-		const uint32_t startSb = std::min<uint32_t>(row * tileHeightSb, sbRows);
-		const uint32_t endSb = row + 1 == tiles.rows ? sbRows : std::min<uint32_t>((row + 1u) * tileHeightSb, sbRows);
-		pic.height_in_sbs_minus_1[row] = static_cast<uint16_t>(std::max<uint32_t>(1, endSb - startSb) - 1u);
-	}
+	fill_av1_tile_dimensions(pic, encodeImage.width, encodeImage.height, use128, tiles);
 	pic.cdef_damping_minus_3 = 0;
-	pic.cdef_bits = 0;
+	pic.cdef_bits = static_cast<uint8_t>(headerCdefBits);
 	pic.loop_restoration_flags.bits.yframe_restoration_type = restoration ? 1u : 0u;
 	pic.loop_restoration_flags.bits.cbframe_restoration_type = restoration ? 1u : 0u;
 	pic.loop_restoration_flags.bits.crframe_restoration_type = restoration ? 1u : 0u;
@@ -2186,33 +2380,56 @@ EncodedImage encode_vaapi_av1_still_image(const RawImage& image, std::span<const
 		filterIntra,
 		intraEdge,
 		cdef,
-		restoration
+		restoration,
+		encodeImage.color
 	);
-	const std::vector<std::byte> frameHeader = av1_frame_header_obu(
+	const Av1FrameHeaderObu frameHeader = av1_frame_header_obu(
 		encodeImage.width,
 		encodeImage.height,
 		use128,
 		tiles,
-		static_cast<int>(qindex),
+		static_cast<int>(headerQindex),
 		disableCdf,
 		screenContent,
 		intrabc,
 		palette,
 		txMode == 1 ? 0 : 1,
-		filterLevel,
-		cdef
+		headerFilterLevel,
+		cdef,
+		headerCdefBits,
+		reducedTxSet
 	);
-	pic.size_in_bits_frame_hdr_obu = 0;
+	if (rcMode != VA_RC_CQP) {
+		pic.bit_offset_qindex = frameHeader.bitOffsetQindex;
+		pic.bit_offset_loopfilter_params = frameHeader.bitOffsetLoopFilterParams;
+		pic.bit_offset_cdef_params = frameHeader.bitOffsetCdefParams;
+		pic.size_in_bits_cdef_params = frameHeader.sizeInBitsCdefParams;
+		// The OBU size offset is relative to the start of the packed headers.
+		pic.byte_offset_frame_hdr_obu_size = static_cast<uint32_t>(sequenceHeader.size() + 1u);
+		pic.size_in_bits_frame_hdr_obu = frameHeader.sizeInBits;
+	}
 	pic.tile_group_obu_hdr_info.bits.obu_has_size_field = 1;
 	auto seqBuf = create_buffer(va.display.dpy, va.context.id, VAEncSequenceParameterBufferType, seq);
-	auto rcBuf = create_misc_rate_control(va.display.dpy, va.context.id, rcMode, qindex, bitrateKbps);
+	// Zero leaves the misc-layer QP limit unset; AV1 limits are carried by the
+	// picture's min_base_qindex and max_base_qindex fields.
+	auto rcBuf = create_misc_rate_control(va.display.dpy, va.context.id, rcMode, headerQindex, bitrateKbps, 0u, icqQuality);
+	auto frameRateBuf = create_frame_rate(va.display.dpy, va.context.id);
+	BufferGuard qualityBuf;
+	const uint32_t qualityRange = query_profile_capabilities(va.display.dpy, VAProfileAV1Profile0).qualityRange;
+	if (qualityRange != 0) {
+		qualityBuf = create_quality_level(va.display.dpy, va.context.id, std::min(targetUsage, qualityRange));
+	}
 	auto picBuf = create_buffer(va.display.dpy, va.context.id, VAEncPictureParameterBufferType, pic);
 	auto packedSeq = create_packed_header(va.display.dpy, va.context.id, VAEncPackedHeaderAV1_SPS, sequenceHeader);
-	auto packedPic = create_packed_header(va.display.dpy, va.context.id, VAEncPackedHeaderAV1_PPS, frameHeader);
+	auto packedPic = create_packed_header(va.display.dpy, va.context.id, VAEncPackedHeaderAV1_PPS, frameHeader.bytes);
 	auto tileBuf = create_buffer(va.display.dpy, va.context.id, VAEncSliceParameterBufferType, tileGroup);
-	VABufferID buffers[] = {
+	std::vector<VABufferID> buffers{
 		seqBuf.id,
 		rcBuf.id,
+		frameRateBuf.id,
+	};
+	if (qualityBuf.id != VA_INVALID_ID) buffers.push_back(qualityBuf.id);
+	const VABufferID remainingBuffers[] = {
 		picBuf.id,
 		packedSeq.params.id,
 		packedSeq.data.id,
@@ -2220,8 +2437,9 @@ EncodedImage encode_vaapi_av1_still_image(const RawImage& image, std::span<const
 		packedPic.data.id,
 		tileBuf.id,
 	};
+	buffers.insert(buffers.end(), std::begin(remainingBuffers), std::end(remainingBuffers));
 	checked(vaBeginPicture(va.display.dpy, va.context.id, va.input.surface), "begin AV1 picture");
-	checked(vaRenderPicture(va.display.dpy, va.context.id, buffers, static_cast<int>(std::size(buffers))), "render AV1 picture");
+	checked(vaRenderPicture(va.display.dpy, va.context.id, buffers.data(), static_cast<int>(buffers.size())), "render AV1 picture");
 	checked(vaEndPicture(va.display.dpy, va.context.id), "end AV1 picture");
 
 	const std::vector<std::byte> encodedTileGroup = collect_coded_buffer(va.display.dpy, va.coded.id);

@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cctype>
 #include <csetjmp>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -17,6 +19,7 @@
 
 extern "C" {
 #include <jpeglib.h>
+#include <png.h>
 }
 
 namespace codec_gui {
@@ -45,6 +48,108 @@ struct Rgb16Image {
 	int height = 0;
 	std::vector<unsigned short> rgb;
 };
+
+struct PngImage {
+	bool sixteenBit = false;
+	RgbImage rgb8;
+	Rgb16Image rgb16;
+};
+
+struct PngAllocations {
+	void* pixels = nullptr;
+	png_bytep* rows = nullptr;
+};
+
+PngImage load_png_rgb(const std::filesystem::path& path) {
+	FILE* file = std::fopen(path.c_str(), "rb");
+	if (file == nullptr) throw std::runtime_error("failed to open PNG file: " + path.string());
+
+	png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+	if (png == nullptr) {
+		std::fclose(file);
+		throw std::runtime_error("failed to create PNG decoder");
+	}
+	png_infop info = png_create_info_struct(png);
+	if (info == nullptr) {
+		png_destroy_read_struct(&png, nullptr, nullptr);
+		std::fclose(file);
+		throw std::runtime_error("failed to create PNG metadata decoder");
+	}
+
+	PngAllocations* allocations = static_cast<PngAllocations*>(std::calloc(1, sizeof(PngAllocations)));
+	if (allocations == nullptr) {
+		png_destroy_read_struct(&png, &info, nullptr);
+		std::fclose(file);
+		throw std::runtime_error("out of memory creating PNG decoder");
+	}
+	if (setjmp(png_jmpbuf(png)) != 0) {
+		std::free(allocations->rows);
+		std::free(allocations->pixels);
+		std::free(allocations);
+		png_destroy_read_struct(&png, &info, nullptr);
+		std::fclose(file);
+		throw std::runtime_error("PNG decode failed: " + path.string());
+	}
+
+	png_init_io(png, file);
+	png_read_info(png, info);
+	const png_uint_32 width = png_get_image_width(png, info);
+	const png_uint_32 height = png_get_image_height(png, info);
+	const int sourceBitDepth = png_get_bit_depth(png, info);
+	const int colorType = png_get_color_type(png, info);
+	if (width == 0 || height == 0 ||
+	    width > static_cast<png_uint_32>(std::numeric_limits<int>::max()) ||
+	    height > static_cast<png_uint_32>(std::numeric_limits<int>::max())) {
+		png_error(png, "invalid PNG dimensions");
+	}
+	if (colorType == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png);
+	if (colorType == PNG_COLOR_TYPE_GRAY && sourceBitDepth < 8) png_set_expand_gray_1_2_4_to_8(png);
+	const bool hasTransparency = png_get_valid(png, info, PNG_INFO_tRNS) != 0;
+	if (hasTransparency) png_set_tRNS_to_alpha(png);
+	if (colorType == PNG_COLOR_TYPE_GRAY || colorType == PNG_COLOR_TYPE_GRAY_ALPHA) png_set_gray_to_rgb(png);
+	if ((colorType & PNG_COLOR_MASK_ALPHA) != 0 || hasTransparency) png_set_strip_alpha(png);
+	if (sourceBitDepth == 16 && std::endian::native == std::endian::little) png_set_swap(png);
+	(void)png_set_interlace_handling(png);
+	png_read_update_info(png, info);
+
+	const int bitDepth = png_get_bit_depth(png, info);
+	const int channels = png_get_channels(png, info);
+	const png_size_t rowBytes = png_get_rowbytes(png, info);
+	if ((bitDepth != 8 && bitDepth != 16) || channels != 3 ||
+	    rowBytes != static_cast<png_size_t>(width) * 3u * static_cast<unsigned int>(bitDepth / 8) ||
+	    height > std::numeric_limits<std::size_t>::max() / rowBytes) {
+		png_error(png, "unsupported PNG output layout");
+	}
+	const std::size_t byteCount = static_cast<std::size_t>(height) * rowBytes;
+	allocations->pixels = std::malloc(byteCount);
+	allocations->rows = static_cast<png_bytep*>(std::malloc(static_cast<std::size_t>(height) * sizeof(png_bytep)));
+	if (allocations->pixels == nullptr || allocations->rows == nullptr) png_error(png, "out of memory decoding PNG");
+	for (png_uint_32 y = 0; y < height; ++y) {
+		allocations->rows[y] = static_cast<png_bytep>(allocations->pixels) + static_cast<std::size_t>(y) * rowBytes;
+	}
+	png_read_image(png, allocations->rows);
+	png_read_end(png, info);
+	png_destroy_read_struct(&png, &info, nullptr);
+	std::fclose(file);
+	std::free(allocations->rows);
+
+	PngImage image;
+	image.sixteenBit = bitDepth == 16;
+	if (image.sixteenBit) {
+		image.rgb16.width = static_cast<int>(width);
+		image.rgb16.height = static_cast<int>(height);
+		image.rgb16.rgb.resize(byteCount / sizeof(unsigned short));
+		std::memcpy(image.rgb16.rgb.data(), allocations->pixels, byteCount);
+	} else {
+		image.rgb8.width = static_cast<int>(width);
+		image.rgb8.height = static_cast<int>(height);
+		image.rgb8.rgb.resize(byteCount);
+		std::memcpy(image.rgb8.rgb.data(), allocations->pixels, byteCount);
+	}
+	std::free(allocations->pixels);
+	std::free(allocations);
+	return image;
+}
 
 bool has_extension(const std::filesystem::path& path, const std::string& extension) {
 	std::string ext = path.extension().string();
@@ -328,6 +433,12 @@ void dump_to_file(const std::filesystem::path& path, const std::vector<std::byte
 RawImage load_input_image(const std::filesystem::path& path) {
 	if (has_extension(path, ".nef")) {
 		return rgb16_to_yuv420p10_bt709_limited(load_nef_rgb16(path));
+	}
+	if (has_extension(path, ".png")) {
+		PngImage png = load_png_rgb(path);
+		return png.sixteenBit
+			? rgb16_to_yuv420p10_bt709_limited(png.rgb16)
+			: rgb_to_yuv420_bt709_limited(png.rgb8);
 	}
 	if (has_extension(path, ".jpg") || has_extension(path, ".jpeg")) {
 		return rgb_to_yuv420_bt709_limited(load_jpeg_rgb(path));

@@ -345,10 +345,6 @@ std::vector<uint8_t> raw_to_rgb8(const RawImage& image) {
 	return rgb;
 }
 
-std::shared_ptr<const RawImage> embedded_preview(const RawImage& image) {
-	return std::make_shared<RawImage>(image);
-}
-
 std::vector<std::byte> bytes_from_u8(const std::vector<uint8_t>& in) {
 	std::vector<std::byte> out(in.size());
 	std::memcpy(out.data(), in.data(), in.size());
@@ -361,39 +357,6 @@ std::vector<uint8_t> read_temp_file(const std::filesystem::path& path) {
 		throw std::runtime_error("failed to read temporary encoded file: " + path.string());
 	}
 	return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-}
-
-EncodedImage encoded_with_preview(std::vector<std::byte> bytes, const RawImage& preview) {
-	EncodedImage encoded;
-	encoded.hevcAnnexB = std::move(bytes);
-	encoded.previewImage = embedded_preview(preview);
-	return encoded;
-}
-
-RawImage rgb8_to_yuv444(const std::vector<uint8_t>& rgb, int width, int height) {
-	RawImage image;
-	image.width = width;
-	image.height = height;
-	image.format = PixelFormat::YUV444P8;
-	image.color.range = ColorRange::Limited;
-	for (int p = 0; p < 3; ++p) {
-		image.planes[p].strideBytes = width;
-		image.planes[p].bytes.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height));
-	}
-	for (int y = 0; y < height; ++y) {
-		for (int x = 0; x < width; ++x) {
-			const std::size_t i = (static_cast<std::size_t>(y) * width + x) * 3;
-			const double r = rgb[i + 0];
-			const double g = rgb[i + 1];
-			const double b = rgb[i + 2];
-			const double yy = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-			const auto o = static_cast<std::size_t>(y) * width + x;
-			image.planes[0].bytes[o] = clamp_u8(16.0 + 219.0 * yy / 255.0);
-			image.planes[1].bytes[o] = clamp_u8(128.0 + 224.0 * (b - yy) / (2.0 * (255.0 - 255.0 * 0.0722)));
-			image.planes[2].bytes[o] = clamp_u8(128.0 + 224.0 * (r - yy) / (2.0 * (255.0 - 255.0 * 0.2126)));
-		}
-	}
-	return image;
 }
 
 RawImage rgb8_to_yuv420(const std::vector<uint8_t>& rgb, int width, int height) {
@@ -460,7 +423,10 @@ RawImage yuv420p8_image_for_x264(const RawImage& image) {
 }
 
 EncodedImage encode_jpeg_like(const RawImage& image, std::span<const EncoderParam> params) {
-	const std::vector<uint8_t> rgb = raw_to_rgb8(image);
+	const JxlInputPixels rgb = raw_to_jxl_pixels(image);
+	if (rgb.bitDepth != 8 && rgb.bitDepth != 12) {
+		throw std::invalid_argument("libjpeg DCT encoding supports 8-bit or 12-bit RGB input");
+	}
 	const int quality = static_cast<int>(param_value<int64_t>(params, "quality", 50));
 	jpeg_compress_struct cinfo{};
 	jpeg_error_mgr jerr{};
@@ -474,7 +440,8 @@ EncodedImage encode_jpeg_like(const RawImage& image, std::span<const EncoderPara
 	cinfo.input_components = 3;
 	cinfo.in_color_space = JCS_RGB;
 	jpeg_set_defaults(&cinfo);
-	jpeg_set_quality(&cinfo, std::clamp(quality, 1, 100), TRUE);
+	cinfo.data_precision = rgb.bitDepth;
+	jpeg_set_quality(&cinfo, std::clamp(quality, 1, 100), rgb.bitDepth == 8 ? TRUE : FALSE);
 	cinfo.optimize_coding = param_value<bool>(params, "optimize", true) ? TRUE : FALSE;
 	cinfo.arith_code = param_value<bool>(params, "arithmetic", false) ? TRUE : FALSE;
 	cinfo.smoothing_factor = static_cast<int>(param_value<int64_t>(params, "smoothing", 0));
@@ -488,15 +455,28 @@ EncodedImage encode_jpeg_like(const RawImage& image, std::span<const EncoderPara
 	}
 	jpeg_start_compress(&cinfo, TRUE);
 	while (cinfo.next_scanline < cinfo.image_height) {
-		JSAMPROW row = const_cast<JSAMPROW>(rgb.data() + static_cast<std::size_t>(cinfo.next_scanline) * image.width * 3);
-		jpeg_write_scanlines(&cinfo, &row, 1);
+		if (rgb.bitDepth == 8) {
+			JSAMPROW row = const_cast<JSAMPROW>(
+				rgb.bytes.data() + static_cast<std::size_t>(cinfo.next_scanline) * image.width * 3
+			);
+			jpeg_write_scanlines(&cinfo, &row, 1);
+		} else {
+			J12SAMPROW row = reinterpret_cast<J12SAMPROW>(
+				const_cast<uint8_t*>(rgb.bytes.data()) +
+				static_cast<std::size_t>(cinfo.next_scanline) * image.width * 3 * 2
+			);
+			jpeg12_write_scanlines(&cinfo, &row, 1);
+		}
 	}
 	jpeg_finish_compress(&cinfo);
 	std::vector<std::byte> bytes(memSize);
 	std::memcpy(bytes.data(), mem, memSize);
 	std::free(mem);
 	jpeg_destroy_compress(&cinfo);
-	return encoded_with_preview(std::move(bytes), rgb8_to_yuv444(rgb, image.width, image.height));
+	EncodedImage encoded;
+	encoded.hevcAnnexB = std::move(bytes);
+	encoded.codedColor = image.color;
+	return encoded;
 }
 
 void png_write_callback(png_structp png, png_bytep data, png_size_t length) {
@@ -509,7 +489,7 @@ void png_write_callback(png_structp png, png_bytep data, png_size_t length) {
 
 std::vector<EncoderParamInfo> query_jpegls_parameters() {
 	return {
-		{.name = "near", .label = "NEAR", .group = "Coding", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{0, 15, 1}, .help = "JPEG-LS near-lossless error tolerance. 0 is lossless."},
+		{.name = "near", .label = "NEAR", .group = "Coding", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{0, 127, 1}, .help = "JPEG-LS near-lossless error tolerance. 0 is lossless; 127 is valid at every exposed precision."},
 		{.name = "color-transform", .label = "Color transform", .group = "Coding", .kind = ParamKind::Enum, .defaultValue = std::string{"none"}, .enumValues = {{"none", "None"}, {"hp1", "HP1"}, {"hp2", "HP2"}, {"hp3", "HP3"}}, .help = "Optional HP reversible color transform. Not part of baseline JPEG-LS interchange."},
 		{.name = "even-size", .label = "Even size", .group = "Bitstream", .kind = ParamKind::Bool, .defaultValue = false, .help = "Pad the destination to even byte size."},
 		{.name = "version-comment", .label = "Version comment", .group = "Bitstream", .kind = ParamKind::Bool, .defaultValue = false, .help = "Include CharLS version comment segment."},
@@ -518,9 +498,9 @@ std::vector<EncoderParamInfo> query_jpegls_parameters() {
 }
 
 EncodedImage encode_jpegls_still_image(const RawImage& image, std::span<const EncoderParam> params) {
-	const std::vector<uint8_t> rgb = raw_to_rgb8(image);
+	const JxlInputPixels rgb = raw_to_jxl_pixels(image);
 	charls::jpegls_encoder encoder;
-	encoder.frame_info({static_cast<uint32_t>(image.width), static_cast<uint32_t>(image.height), 8, 3})
+	encoder.frame_info({static_cast<uint32_t>(image.width), static_cast<uint32_t>(image.height), rgb.bitDepth, 3})
 		.interleave_mode(charls::interleave_mode::sample)
 		.near_lossless(static_cast<int32_t>(param_value<int64_t>(params, "near", 0)));
 	const std::string transform = param_value<std::string>(params, "color-transform", "none");
@@ -534,9 +514,14 @@ EncodedImage encode_jpegls_still_image(const RawImage& image, std::span<const En
 	encoder.encoding_options(options);
 	std::vector<uint8_t> out(encoder.estimated_destination_size());
 	encoder.destination(out);
-	const std::size_t written = encoder.encode(rgb, static_cast<uint32_t>(image.width * 3));
+	const std::size_t written = encoder.encode(
+		rgb.bytes, static_cast<uint32_t>(image.width * 3 * (rgb.bitDepth == 8 ? 1 : 2))
+	);
 	out.resize(written);
-	return encoded_with_preview(bytes_from_u8(out), rgb8_to_yuv444(rgb, image.width, image.height));
+	EncodedImage encoded;
+	encoded.hevcAnnexB = bytes_from_u8(out);
+	encoded.codedColor = image.color;
+	return encoded;
 }
 
 std::vector<EncoderParamInfo> query_jpeg_parameters() {
@@ -569,7 +554,7 @@ std::vector<EncoderParamInfo> query_jpeg2000_parameters() {
 }
 
 EncodedImage encode_jpeg2000_still_image(const RawImage& image, std::span<const EncoderParam> encoderParams) {
-	const std::vector<uint8_t> rgb = raw_to_rgb8(image);
+	const JxlInputPixels rgb = raw_to_jxl_pixels(image);
 	opj_cparameters_t params{};
 	opj_set_default_encoder_parameters(&params);
 	params.tcp_numlayers = 1;
@@ -609,7 +594,7 @@ EncodedImage encode_jpeg2000_still_image(const RawImage& image, std::span<const 
 		c.dy = 1;
 		c.w = static_cast<OPJ_UINT32>(image.width);
 		c.h = static_cast<OPJ_UINT32>(image.height);
-		c.prec = 8;
+		c.prec = static_cast<OPJ_UINT32>(rgb.bitDepth);
 		c.sgnd = 0;
 	}
 	std::unique_ptr<opj_image_t, decltype(&opj_image_destroy)> ojImage(opj_image_create(3, cmpt, OPJ_CLRSPC_SRGB), opj_image_destroy);
@@ -620,9 +605,14 @@ EncodedImage encode_jpeg2000_still_image(const RawImage& image, std::span<const 
 		for (int x = 0; x < image.width; ++x) {
 			const std::size_t src = (static_cast<std::size_t>(y) * image.width + x) * 3;
 			const std::size_t dst = static_cast<std::size_t>(y) * image.width + x;
-			ojImage->comps[0].data[dst] = rgb[src + 0];
-			ojImage->comps[1].data[dst] = rgb[src + 1];
-			ojImage->comps[2].data[dst] = rgb[src + 2];
+			auto sample = [&](std::size_t index) {
+				if (rgb.bitDepth == 8) return static_cast<int>(rgb.bytes[index]);
+				const std::size_t offset = index * 2;
+				return static_cast<int>(rgb.bytes[offset] | (static_cast<uint16_t>(rgb.bytes[offset + 1]) << 8u));
+			};
+			ojImage->comps[0].data[dst] = sample(src + 0);
+			ojImage->comps[1].data[dst] = sample(src + 1);
+			ojImage->comps[2].data[dst] = sample(src + 2);
 		}
 	}
 	std::filesystem::path path = std::filesystem::temp_directory_path() / "codec_vis_tmp.jp2";
@@ -634,7 +624,10 @@ EncodedImage encode_jpeg2000_still_image(const RawImage& image, std::span<const 
 	}
 	const std::vector<uint8_t> file = read_temp_file(path);
 	std::filesystem::remove(path);
-	return encoded_with_preview(bytes_from_u8(file), rgb8_to_yuv444(rgb, image.width, image.height));
+	EncodedImage encoded;
+	encoded.hevcAnnexB = bytes_from_u8(file);
+	encoded.codedColor = image.color;
+	return encoded;
 }
 
 std::vector<EncoderParamInfo> query_jpegxl_parameters() {
@@ -888,7 +881,10 @@ std::vector<EncoderParamInfo> query_jpegxr_parameters() {
 }
 
 EncodedImage encode_jpegxr_still_image(const RawImage& image, std::span<const EncoderParam> params) {
-	const std::vector<uint8_t> rgb = raw_to_rgb8(image);
+	const JxlInputPixels rgb = raw_to_jxl_pixels(image);
+	if (rgb.bitDepth != 8 && rgb.bitDepth != 16) {
+		throw std::invalid_argument("JPEG XR supports 8-bit or 16-bit RGB input in this implementation");
+	}
 	std::filesystem::path path = std::filesystem::temp_directory_path() / "codec_vis_tmp.jxr";
 	WMPStream* stream = nullptr;
 	if (CreateWS_File(&stream, path.c_str(), "wb") != 0) throw std::runtime_error("jxrlib CreateWS_File failed");
@@ -927,10 +923,15 @@ EncodedImage encode_jpegxr_still_image(const RawImage& image, std::span<const En
 	scp.cNumOfSliceMinus1H = static_cast<U32>(tilesY - 1);
 	for (int i = 0; i < tilesX; ++i) scp.uiTileX[i] = static_cast<U32>(std::max(1, (image.width + 15) / 16 / tilesX));
 	for (int i = 0; i < tilesY; ++i) scp.uiTileY[i] = static_cast<U32>(std::max(1, (image.height + 15) / 16 / tilesY));
+	const PKPixelFormatGUID pixelFormat =
+		rgb.bitDepth == 8 ? GUID_PKPixelFormat24bppRGB : GUID_PKPixelFormat48bppRGB;
 	if (enc->Initialize(enc, stream, &scp, sizeof(scp)) != 0 ||
-	    enc->SetPixelFormat(enc, GUID_PKPixelFormat24bppRGB) != 0 ||
+	    enc->SetPixelFormat(enc, pixelFormat) != 0 ||
 	    enc->SetSize(enc, image.width, image.height) != 0 ||
-	    enc->WritePixels(enc, static_cast<U32>(image.height), const_cast<U8*>(rgb.data()), static_cast<U32>(image.width * 3)) != 0 ||
+	    enc->WritePixels(
+		    enc, static_cast<U32>(image.height), const_cast<U8*>(rgb.bytes.data()),
+		    static_cast<U32>(image.width * 3 * (rgb.bitDepth == 8 ? 1 : 2))
+	    ) != 0 ||
 	    enc->Terminate(enc) != 0) {
 		throw std::runtime_error("jxrlib encode failed");
 	}
@@ -938,7 +939,10 @@ EncodedImage encode_jpegxr_still_image(const RawImage& image, std::span<const En
 	streamGuard.release();
 	const std::vector<uint8_t> file = read_temp_file(path);
 	std::filesystem::remove(path);
-	return encoded_with_preview(bytes_from_u8(file), rgb8_to_yuv444(rgb, image.width, image.height));
+	EncodedImage encoded;
+	encoded.hevcAnnexB = bytes_from_u8(file);
+	encoded.codedColor = image.color;
+	return encoded;
 }
 
 std::vector<EncoderParamInfo> query_png_parameters() {
@@ -952,7 +956,10 @@ std::vector<EncoderParamInfo> query_png_parameters() {
 }
 
 EncodedImage encode_png_still_image(const RawImage& image, std::span<const EncoderParam> params) {
-	const std::vector<uint8_t> rgb = raw_to_rgb8(image);
+	const JxlInputPixels rgb = raw_to_jxl_pixels(image);
+	if (rgb.bitDepth != 8 && rgb.bitDepth != 16) {
+		throw std::invalid_argument("PNG supports 8-bit or 16-bit RGB input");
+	}
 	std::vector<std::byte> out;
 	png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
 	if (!png) throw std::runtime_error("png_create_write_struct failed");
@@ -983,15 +990,21 @@ EncodedImage encode_png_still_image(const RawImage& image, std::span<const Encod
 	else if (filters == "avg") png_set_filter(png, PNG_FILTER_TYPE_BASE, PNG_FILTER_AVG);
 	else if (filters == "paeth") png_set_filter(png, PNG_FILTER_TYPE_BASE, PNG_FILTER_PAETH);
 	else png_set_filter(png, PNG_FILTER_TYPE_BASE, PNG_ALL_FILTERS);
-	png_set_IHDR(png, info, image.width, image.height, 8, PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+	png_set_IHDR(png, info, image.width, image.height, rgb.bitDepth, PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+	if (rgb.bitDepth == 16) png_set_swap(png);
 	png_write_info(png, info);
 	for (int y = 0; y < image.height; ++y) {
-		png_bytep row = const_cast<png_bytep>(rgb.data() + static_cast<std::size_t>(y) * image.width * 3);
+		png_bytep row = const_cast<png_bytep>(
+			rgb.bytes.data() + static_cast<std::size_t>(y) * image.width * 3 * (rgb.bitDepth == 8 ? 1 : 2)
+		);
 		png_write_rows(png, &row, 1);
 	}
 	png_write_end(png, info);
 	png_destroy_write_struct(&png, &info);
-	return encoded_with_preview(std::move(out), rgb8_to_yuv444(rgb, image.width, image.height));
+	EncodedImage encoded;
+	encoded.hevcAnnexB = std::move(out);
+	encoded.codedColor = image.color;
+	return encoded;
 }
 
 std::vector<EncoderParamInfo> query_x264_parameters() {

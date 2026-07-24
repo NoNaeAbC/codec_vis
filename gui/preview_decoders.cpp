@@ -110,7 +110,8 @@ PixelFormat yuv444_format_for_depth(int bitDepth) {
 	if (bitDepth == 10) return PixelFormat::YUV444P10LE;
 	if (bitDepth == 12) return PixelFormat::YUV444P12LE;
 	if (bitDepth == 14) return PixelFormat::YUV444P14LE;
-	throw std::invalid_argument("JPEG XL preview supports integer 8-, 10-, 12-, and 14-bit images; codestream reports " + std::to_string(bitDepth) + " bits");
+	if (bitDepth == 16) return PixelFormat::YUV444P16LE;
+	throw std::invalid_argument("preview supports integer 8-, 10-, 12-, 14-, and 16-bit images; codestream reports " + std::to_string(bitDepth) + " bits");
 }
 
 PixelFormat gray_format_for_depth(int bitDepth) {
@@ -144,7 +145,8 @@ std::shared_ptr<const RawImage> jxl_pixels_to_preview(
 	int height,
 	int bitDepth,
 	uint32_t channels,
-	const ColorDescription& color
+	const ColorDescription& color,
+	double inputMaximum
 ) {
 	if (channels != 1 && channels != 3) throw std::invalid_argument("unsupported JPEG XL color channel count: " + std::to_string(channels));
 	const int bytesPerSample = bitDepth == 8 ? 1 : 2;
@@ -154,7 +156,6 @@ std::shared_ptr<const RawImage> jxl_pixels_to_preview(
 	// libjxl's default UINT16 output uses the full 0..65535 container range,
 	// independently of the codestream precision. Converting that normalized
 	// value back to the declared depth preserves all 10/12/14-bit information.
-	const double inputMaximum = bytesPerSample == 1 ? 255.0 : 65535.0;
 	const double scale = static_cast<double>(1u << (bitDepth - 8));
 	const double yOffset = color.range == ColorRange::Full ? 0.0 : 16.0 * scale;
 	const double yScale = color.range == ColorRange::Full ? maximum : 219.0 * scale;
@@ -195,6 +196,16 @@ std::shared_ptr<const RawImage> jxl_pixels_to_preview(
 		store_preview_sample(image->planes[2], pixel, quantize(cOffset + cScale * cr), bytesPerSample);
 	}
 	return image;
+}
+
+ColorDescription rgb_preview_color(const EncodedImage& encoded) {
+	if (encoded.codedColor) return *encoded.codedColor;
+	ColorDescription color;
+	color.primaries = ColorPrimaries::BT709;
+	color.transfer = TransferCharacteristics::SRGB;
+	color.matrix = MatrixCoefficients::BT709;
+	color.range = ColorRange::Limited;
+	return color;
 }
 
 ColorDescription color_description_from_jxl(const JxlColorEncoding& profile) {
@@ -285,12 +296,6 @@ void png_read_callback(png_structp png, png_bytep data, png_size_t length) {
 	}
 	std::memcpy(data, reader->data + reader->offset, length);
 	reader->offset += length;
-}
-
-uint8_t opj_component_u8(const opj_image_comp_t& comp, std::size_t index) {
-	const int value = comp.data[index];
-	const int maxValue = comp.prec <= 8 ? 255 : ((1 << std::min<int>(comp.prec, 16)) - 1);
-	return clamp_u8(static_cast<double>(value) * 255.0 / static_cast<double>(std::max(1, maxValue)));
 }
 
 struct IvfFrame {
@@ -548,12 +553,16 @@ DecodeResult decode_jpegls_preview(const EncodedImage& encoded) {
 		const std::vector<uint8_t> bytes = bytes_to_u8(encoded.hevcAnnexB);
 		charls::jpegls_decoder decoder{bytes, true};
 		const charls::frame_info info = decoder.frame_info();
-		if (info.bits_per_sample != 8 || info.component_count != 3) {
+		if ((info.bits_per_sample < 2 || info.bits_per_sample > 16) || info.component_count != 3) {
 			throw std::runtime_error("unsupported JPEG-LS preview format");
 		}
-		std::vector<uint8_t> rgb(static_cast<std::size_t>(info.width) * info.height * 3);
-		decoder.decode(rgb, static_cast<uint32_t>(info.width * 3));
-		return {rgb8_to_yuv444_preview(rgb, static_cast<int>(info.width), static_cast<int>(info.height)), {}};
+		const int sampleBytes = info.bits_per_sample <= 8 ? 1 : 2;
+		std::vector<uint8_t> rgb(static_cast<std::size_t>(info.width) * info.height * 3 * sampleBytes);
+		decoder.decode(rgb, static_cast<uint32_t>(info.width * 3 * sampleBytes));
+		return {jxl_pixels_to_preview(
+			rgb, static_cast<int>(info.width), static_cast<int>(info.height), info.bits_per_sample, 3,
+			rgb_preview_color(encoded), static_cast<double>((1u << info.bits_per_sample) - 1u)
+		), {}};
 	} catch (const std::exception& e) {
 		return {nullptr, e.what()};
 	}
@@ -574,18 +583,32 @@ DecodeResult decode_jpeg_preview(const EncodedImage& encoded) {
 			static_cast<unsigned long>(encoded.hevcAnnexB.size())
 		);
 		jpeg_read_header(&cinfo, TRUE);
+		const int bitDepth = cinfo.data_precision;
+		if (bitDepth != 8 && bitDepth != 12) throw std::runtime_error("unsupported JPEG preview precision");
 		cinfo.out_color_space = JCS_RGB;
 		jpeg_start_decompress(&cinfo);
-		std::vector<uint8_t> rgb(static_cast<std::size_t>(cinfo.output_width) * cinfo.output_height * 3);
+		std::vector<uint8_t> rgb(
+			static_cast<std::size_t>(cinfo.output_width) * cinfo.output_height * 3 * (bitDepth == 8 ? 1 : 2)
+		);
 		while (cinfo.output_scanline < cinfo.output_height) {
-			JSAMPROW row = rgb.data() + static_cast<std::size_t>(cinfo.output_scanline) * cinfo.output_width * 3;
-			jpeg_read_scanlines(&cinfo, &row, 1);
+			if (bitDepth == 8) {
+				JSAMPROW row = rgb.data() + static_cast<std::size_t>(cinfo.output_scanline) * cinfo.output_width * 3;
+				jpeg_read_scanlines(&cinfo, &row, 1);
+			} else {
+				J12SAMPROW row = reinterpret_cast<J12SAMPROW>(
+					rgb.data() + static_cast<std::size_t>(cinfo.output_scanline) * cinfo.output_width * 3 * 2
+				);
+				jpeg12_read_scanlines(&cinfo, &row, 1);
+			}
 		}
 		const int width = static_cast<int>(cinfo.output_width);
 		const int height = static_cast<int>(cinfo.output_height);
 		jpeg_finish_decompress(&cinfo);
 		jpeg_destroy_decompress(&cinfo);
-		return {rgb8_to_yuv444_preview(rgb, width, height), {}};
+		return {jxl_pixels_to_preview(
+			rgb, width, height, bitDepth, 3, rgb_preview_color(encoded),
+			static_cast<double>((1u << bitDepth) - 1u)
+		), {}};
 	} catch (const std::exception& e) {
 		jpeg_destroy_decompress(&cinfo);
 		return {nullptr, e.what()};
@@ -615,21 +638,26 @@ DecodeResult decode_png_preview(const EncodedImage& encoded) {
 		const int height = static_cast<int>(png_get_image_height(png, info));
 		const int colorType = png_get_color_type(png, info);
 		const int bitDepth = png_get_bit_depth(png, info);
-		if (bitDepth == 16) png_set_strip_16(png);
+		if (bitDepth != 8 && bitDepth != 16) throw std::runtime_error("unsupported PNG preview precision");
+		if (bitDepth == 16) png_set_swap(png);
 		if (colorType == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png);
 		if (colorType == PNG_COLOR_TYPE_GRAY && bitDepth < 8) png_set_expand_gray_1_2_4_to_8(png);
 		if (png_get_valid(png, info, PNG_INFO_tRNS)) png_set_tRNS_to_alpha(png);
 		if (colorType == PNG_COLOR_TYPE_GRAY || colorType == PNG_COLOR_TYPE_GRAY_ALPHA) png_set_gray_to_rgb(png);
 		if (colorType & PNG_COLOR_MASK_ALPHA) png_set_strip_alpha(png);
 		png_read_update_info(png, info);
-		std::vector<uint8_t> rgb(static_cast<std::size_t>(width) * height * 3);
+		const int sampleBytes = bitDepth == 8 ? 1 : 2;
+		std::vector<uint8_t> rgb(static_cast<std::size_t>(width) * height * 3 * sampleBytes);
 		std::vector<png_bytep> rows(static_cast<std::size_t>(height));
 		for (int y = 0; y < height; ++y) {
-			rows[y] = rgb.data() + static_cast<std::size_t>(y) * width * 3;
+			rows[y] = rgb.data() + static_cast<std::size_t>(y) * width * 3 * sampleBytes;
 		}
 		png_read_image(png, rows.data());
 		png_destroy_read_struct(&png, &info, nullptr);
-		return {rgb8_to_yuv444_preview(rgb, width, height), {}};
+		return {jxl_pixels_to_preview(
+			rgb, width, height, bitDepth, 3, rgb_preview_color(encoded),
+			static_cast<double>((1u << bitDepth) - 1u)
+		), {}};
 	} catch (const std::exception& e) {
 		png_destroy_read_struct(&png, &info, nullptr);
 		return {nullptr, e.what()};
@@ -659,17 +687,40 @@ DecodeResult decode_jpeg2000_preview(const EncodedImage& encoded) {
 		if (image->numcomps < 3) throw std::runtime_error("unsupported JPEG 2000 component count");
 		const int width = static_cast<int>(image->comps[0].w);
 		const int height = static_cast<int>(image->comps[0].h);
-		std::vector<uint8_t> rgb(static_cast<std::size_t>(width) * height * 3);
+		const int bitDepth = static_cast<int>(image->comps[0].prec);
+		if (bitDepth < 2 || bitDepth > 16) throw std::runtime_error("unsupported JPEG 2000 preview precision");
+		for (int component = 0; component < 3; ++component) {
+			if (image->comps[component].w != image->comps[0].w ||
+			    image->comps[component].h != image->comps[0].h ||
+			    image->comps[component].prec != image->comps[0].prec ||
+			    image->comps[component].sgnd != 0) {
+				throw std::runtime_error("unsupported JPEG 2000 component layout");
+			}
+		}
+		const int sampleBytes = bitDepth <= 8 ? 1 : 2;
+		const uint32_t maximum = (1u << bitDepth) - 1u;
+		std::vector<uint8_t> rgb(static_cast<std::size_t>(width) * height * 3 * sampleBytes);
+		auto store = [&](std::size_t sample, int value) {
+			const uint16_t clamped = static_cast<uint16_t>(std::clamp(value, 0, static_cast<int>(maximum)));
+			if (sampleBytes == 1) {
+				rgb[sample] = static_cast<uint8_t>(clamped);
+			} else {
+				rgb[sample * 2] = static_cast<uint8_t>(clamped & 0xffu);
+				rgb[sample * 2 + 1] = static_cast<uint8_t>(clamped >> 8u);
+			}
+		};
 		for (int y = 0; y < height; ++y) {
 			for (int x = 0; x < width; ++x) {
 				const std::size_t i = static_cast<std::size_t>(y) * width + x;
-				rgb[i * 3 + 0] = opj_component_u8(image->comps[0], i);
-				rgb[i * 3 + 1] = opj_component_u8(image->comps[1], i);
-				rgb[i * 3 + 2] = opj_component_u8(image->comps[2], i);
+				store(i * 3 + 0, image->comps[0].data[i]);
+				store(i * 3 + 1, image->comps[1].data[i]);
+				store(i * 3 + 2, image->comps[2].data[i]);
 			}
 		}
 		std::filesystem::remove(path);
-		return {rgb8_to_yuv444_preview(rgb, width, height), {}};
+		return {jxl_pixels_to_preview(
+			rgb, width, height, bitDepth, 3, rgb_preview_color(encoded), static_cast<double>(maximum)
+		), {}};
 	} catch (const std::exception& e) {
 		std::filesystem::remove(path);
 		return {nullptr, e.what()};
@@ -703,8 +754,9 @@ DecodeResult decode_jpegxl_preview(const EncodedImage& encoded) {
 					throw std::runtime_error("JxlDecoderGetBasicInfo failed");
 				}
 				if (info.exponent_bits_per_sample != 0 ||
-				    (info.bits_per_sample != 8 && info.bits_per_sample != 10 && info.bits_per_sample != 12 && info.bits_per_sample != 14)) {
-					throw std::runtime_error("JPEG XL preview supports integer 8-, 10-, 12-, and 14-bit codestreams; got " + std::to_string(info.bits_per_sample) + "-bit with " + std::to_string(info.exponent_bits_per_sample) + " exponent bits");
+				    (info.bits_per_sample != 8 && info.bits_per_sample != 10 && info.bits_per_sample != 12 &&
+				     info.bits_per_sample != 14 && info.bits_per_sample != 16)) {
+					throw std::runtime_error("JPEG XL preview supports integer 8-, 10-, 12-, 14-, and 16-bit codestreams; got " + std::to_string(info.bits_per_sample) + "-bit with " + std::to_string(info.exponent_bits_per_sample) + " exponent bits");
 				}
 				if (info.num_color_channels != 1 && info.num_color_channels != 3) {
 					throw std::runtime_error("unsupported JPEG XL color channel count: " + std::to_string(info.num_color_channels));
@@ -736,7 +788,11 @@ DecodeResult decode_jpegxl_preview(const EncodedImage& encoded) {
 					throw std::runtime_error("JPEG XL decoder produced no image");
 				}
 				if (!haveColor) throw std::runtime_error("JPEG XL decoder produced pixels without color metadata");
-				return {jxl_pixels_to_preview(pixels, static_cast<int>(info.xsize), static_cast<int>(info.ysize), static_cast<int>(info.bits_per_sample), info.num_color_channels, decodedColor), {}};
+				return {jxl_pixels_to_preview(
+					pixels, static_cast<int>(info.xsize), static_cast<int>(info.ysize),
+					static_cast<int>(info.bits_per_sample), info.num_color_channels, decodedColor,
+					info.bits_per_sample == 8 ? 255.0 : 65535.0
+				), {}};
 			} else if (status == JXL_DEC_NEED_MORE_INPUT) {
 				throw std::runtime_error("JPEG XL decoder requested more input");
 			} else if (status == JXL_DEC_ERROR) {
@@ -771,13 +827,22 @@ DecodeResult decode_jpegxr_preview(const EncodedImage& encoded) {
 		I32 width = 0;
 		I32 height = 0;
 		if (dec->GetSize(dec, &width, &height) != 0 || width <= 0 || height <= 0) throw std::runtime_error("jxrlib GetSize failed");
-		std::vector<uint8_t> rgb(static_cast<std::size_t>(width) * height * 3);
+		PKPixelFormatGUID pixelFormat{};
+		if (dec->GetPixelFormat(dec, &pixelFormat) != 0) throw std::runtime_error("jxrlib GetPixelFormat failed");
+		const int bitDepth = IsEqualGUID(pixelFormat, GUID_PKPixelFormat24bppRGB) ? 8 :
+			(IsEqualGUID(pixelFormat, GUID_PKPixelFormat48bppRGB) ? 16 : 0);
+		if (bitDepth == 0) throw std::runtime_error("unsupported JPEG XR preview pixel format");
+		const int sampleBytes = bitDepth == 8 ? 1 : 2;
+		std::vector<uint8_t> rgb(static_cast<std::size_t>(width) * height * 3 * sampleBytes);
 		PKRect rect{0, 0, width, height};
-		if (dec->Copy(dec, &rect, rgb.data(), static_cast<U32>(width * 3)) != 0) throw std::runtime_error("jxrlib Copy failed");
+		if (dec->Copy(dec, &rect, rgb.data(), static_cast<U32>(width * 3 * sampleBytes)) != 0) throw std::runtime_error("jxrlib Copy failed");
 		decGuard.reset();
 		streamGuard.release();
 		std::filesystem::remove(path);
-		return {rgb8_to_yuv444_preview(rgb, width, height), {}};
+		return {jxl_pixels_to_preview(
+			rgb, width, height, bitDepth, 3, rgb_preview_color(encoded),
+			static_cast<double>((1u << bitDepth) - 1u)
+		), {}};
 	} catch (const std::exception& e) {
 		std::filesystem::remove(path);
 		return {nullptr, e.what()};

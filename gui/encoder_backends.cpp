@@ -143,7 +143,7 @@ CapabilityResult query_svt_av1_backend() {
 CapabilityResult query_uvg266_backend() {
 	return query_software_capabilities<query_uvg266_parameters>(
 		"uvg266",
-		{{}, "",
+		{{{"8", "8-bit"}}, "8",
 		 {{"420", "4:2:0"}, {"400", "Monochrome"}}, "420",
 		 true, true, true, true, true}
 	);
@@ -160,19 +160,21 @@ CapabilityResult query_av2_backend() {
 
 CapabilityResult query_jpegls_backend() {
 	return query_software_capabilities<query_jpegls_parameters>(
-		"CharLS JPEG-LS", {{{"8", "8-bit"}}, "8"}
+		"CharLS JPEG-LS",
+		{{{"source", "Source"}, {"8", "8-bit"}, {"10", "10-bit"}, {"12", "12-bit"}, {"14", "14-bit"}, {"16", "16-bit"}}, "source"}
 	);
 }
 
 CapabilityResult query_jpeg_backend() {
 	return query_software_capabilities<query_jpeg_parameters>(
-		"libjpeg", {{{"8", "8-bit"}}, "8"}
+		"libjpeg", {{{"8", "8-bit"}, {"12", "12-bit"}}, "12"}
 	);
 }
 
 CapabilityResult query_jpeg2000_backend() {
 	return query_software_capabilities<query_jpeg2000_parameters>(
-		"OpenJPEG", {{{"8", "8-bit"}}, "8"}
+		"OpenJPEG",
+		{{{"source", "Source"}, {"8", "8-bit"}, {"10", "10-bit"}, {"12", "12-bit"}, {"14", "14-bit"}, {"16", "16-bit"}}, "source"}
 	);
 }
 
@@ -186,13 +188,13 @@ CapabilityResult query_jpegxl_backend() {
 
 CapabilityResult query_jpegxr_backend() {
 	return query_software_capabilities<query_jpegxr_parameters>(
-		"jxrlib", {{{"8", "8-bit"}}, "8"}
+		"jxrlib", {{{"8", "8-bit"}, {"16", "16-bit"}}, "16"}
 	);
 }
 
 CapabilityResult query_png_backend() {
 	return query_software_capabilities<query_png_parameters>(
-		"libpng", {{{"8", "8-bit"}}, "8"}
+		"libpng", {{{"8", "8-bit"}, {"16", "16-bit"}}, "16"}
 	);
 }
 
@@ -399,13 +401,6 @@ EncodeResult run_backend_encode(const EncoderBackend& backend, const RawImage& i
 	}
 	const int targetDepth = bitDepthValue == "source" ? bit_depth(image.format) : std::stoi(bitDepthValue);
 	const PixelFormat targetFormat = output_format(image.format, targetDepth, chroma);
-	const bool rgb8StillImplementation = backend.id.value >= JPEGLS.value && backend.id.value <= X264_H264_INTRA.value && backend.id != JPEGXL;
-	if (rgb8StillImplementation && targetDepth > 8) {
-		throw std::invalid_argument(backend.name + " currently has an 8-bit RGB implementation; refusing an implicit high-bit-depth reduction");
-	}
-	if (targetDepth > 10 && backend.id != X265_HEVC && backend.id != JPEGXL) {
-		throw std::invalid_argument(backend.name + " does not support " + std::to_string(targetDepth) + "-bit input in this implementation");
-	}
 	ColorTransformOptions transform;
 	transform.target = image.color;
 	if (is_rgb(image.format)) {
@@ -434,10 +429,12 @@ EncodeResult run_backend_encode(const EncoderBackend& backend, const RawImage& i
 	transform.sourcePeakNits = sourcePeak;
 	transform.targetPeakNits = targetPeak;
 	RawImage transformed = transform_raw_image(image, targetFormat, transform);
-	if (rgb8StillImplementation &&
+	const bool rgbStillImplementation =
+		backend.id.value >= JPEGLS.value && backend.id.value <= X264_H264_INTRA.value && backend.id != JPEGXL;
+	if (rgbStillImplementation &&
 	    (transformed.color.primaries != ColorPrimaries::BT709 || transformed.color.matrix != MatrixCoefficients::BT709 ||
 	     (transformed.color.transfer != TransferCharacteristics::SRGB && transformed.color.transfer != TransferCharacteristics::BT709))) {
-		throw std::invalid_argument(backend.name + " uses an 8-bit BT.709 RGB path; explicitly transform primaries/matrix to BT.709 and transfer to sRGB or BT.709");
+		throw std::invalid_argument(backend.name + " uses a BT.709 RGB path; explicitly transform primaries/matrix to BT.709 and transfer to sRGB or BT.709");
 	}
 	if (backend.id == VVENC_VVC) {
 		backendParams.erase(std::remove_if(backendParams.begin(), backendParams.end(), [](const EncoderParam& param) { return param.name == "hdr" || param.name == "sdr" || param.name == "range"; }), backendParams.end());

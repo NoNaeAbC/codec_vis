@@ -325,25 +325,34 @@ std::string dav1d_error(int err, const char* operation) {
 PixelFormat hevc_pixel_format(const de265_image* picture) {
 	const int bits = de265_get_bits_per_pixel(picture, 0);
 	const de265_chroma chroma = de265_get_chroma_format(picture);
-	if (bits <= 8 && chroma == de265_chroma_420) {
-		return PixelFormat::YUV420P8;
+	if (chroma == de265_chroma_mono) {
+		if (bits <= 8) return PixelFormat::Gray8;
+		if (bits <= 10) return PixelFormat::Gray10LE;
+		if (bits <= 12) return PixelFormat::Gray12LE;
+		if (bits <= 14) return PixelFormat::Gray14LE;
 	}
-	if (bits <= 10 && chroma == de265_chroma_420) {
-		return PixelFormat::YUV420P10LE;
+	if (chroma == de265_chroma_420) {
+		if (bits <= 8) return PixelFormat::YUV420P8;
+		if (bits <= 10) return PixelFormat::YUV420P10LE;
+		if (bits <= 12) return PixelFormat::YUV420P12LE;
+		if (bits <= 14) return PixelFormat::YUV420P14LE;
 	}
-	if (bits <= 8 && chroma == de265_chroma_422) {
-		return PixelFormat::YUV422P8;
+	if (chroma == de265_chroma_422) {
+		if (bits <= 8) return PixelFormat::YUV422P8;
+		if (bits <= 10) return PixelFormat::YUV422P10LE;
+		if (bits <= 12) return PixelFormat::YUV422P12LE;
+		if (bits <= 14) return PixelFormat::YUV422P14LE;
 	}
-	if (bits <= 10 && chroma == de265_chroma_422) {
-		return PixelFormat::YUV422P10LE;
+	if (chroma == de265_chroma_444) {
+		if (bits <= 8) return PixelFormat::YUV444P8;
+		if (bits <= 10) return PixelFormat::YUV444P10LE;
+		if (bits <= 12) return PixelFormat::YUV444P12LE;
+		if (bits <= 14) return PixelFormat::YUV444P14LE;
 	}
-	if (bits <= 8 && chroma == de265_chroma_444) {
-		return PixelFormat::YUV444P8;
-	}
-	if (bits <= 10 && chroma == de265_chroma_444) {
-		return PixelFormat::YUV444P10LE;
-	}
-	throw std::runtime_error("unsupported HEVC preview format");
+	throw std::runtime_error(
+		"unsupported HEVC preview format: " + std::to_string(bits) + "-bit chroma " +
+		std::to_string(static_cast<int>(chroma))
+	);
 }
 
 std::shared_ptr<const RawImage> copy_de265_picture(const de265_image* picture) {
@@ -352,7 +361,8 @@ std::shared_ptr<const RawImage> copy_de265_picture(const de265_image* picture) {
 	image->height = de265_get_image_height(picture, 0);
 	image->format = hevc_pixel_format(picture);
 	const int bytesPerSample = de265_get_bits_per_pixel(picture, 0) <= 8 ? 1 : 2;
-	for (int plane = 0; plane < 3; ++plane) {
+	const int planeCount = de265_get_chroma_format(picture) == de265_chroma_mono ? 1 : 3;
+	for (int plane = 0; plane < planeCount; ++plane) {
 		int srcStride = 0;
 		const uint8_t* src = de265_get_image_plane(picture, plane, &srcStride);
 		if (src == nullptr) {

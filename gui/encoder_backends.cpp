@@ -4,6 +4,7 @@
 #include "raw_image_utils.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <filesystem>
 #include <sstream>
 #include <stdexcept>
@@ -26,6 +27,38 @@ constexpr BackendId JPEGXL{11};
 constexpr BackendId JPEGXR{12};
 constexpr BackendId PNG{13};
 constexpr BackendId X264_H264_INTRA{14};
+
+RawImage pad_x264_input(RawImage image) {
+	const int paddedWidth = (is_420(image.format) || is_422(image.format)) ? (image.width + 1) & ~1 : image.width;
+	const int paddedHeight = is_420(image.format) ? (image.height + 1) & ~1 : image.height;
+	if (paddedWidth == image.width && paddedHeight == image.height) return image;
+	RawImage padded;
+	padded.width = paddedWidth;
+	padded.height = paddedHeight;
+	padded.format = image.format;
+	padded.color = image.color;
+	const int sampleBytes = bytes_per_sample(image.format);
+	for (int plane = 0; plane < plane_count(image.format); ++plane) {
+		const int sourceWidth = plane_width(image, plane);
+		const int sourceHeight = plane_height(image, plane);
+		const int targetWidth = plane_width(padded, plane);
+		const int targetHeight = plane_height(padded, plane);
+		padded.planes[plane].strideBytes = targetWidth * sampleBytes;
+		padded.planes[plane].bytes.resize(static_cast<std::size_t>(padded.planes[plane].strideBytes) * targetHeight);
+		for (int y = 0; y < targetHeight; ++y) {
+			for (int x = 0; x < targetWidth; ++x) {
+				const auto* source = image.planes[plane].bytes.data() +
+					static_cast<std::size_t>(std::min(y, sourceHeight - 1)) * image.planes[plane].strideBytes +
+					static_cast<std::size_t>(std::min(x, sourceWidth - 1)) * sampleBytes;
+				auto* target = padded.planes[plane].bytes.data() +
+					static_cast<std::size_t>(y) * padded.planes[plane].strideBytes +
+					static_cast<std::size_t>(x) * sampleBytes;
+				std::memcpy(target, source, static_cast<std::size_t>(sampleBytes));
+			}
+		}
+	}
+	return padded;
+}
 
 struct OutputControlPolicy {
 	std::vector<EnumValue> bitDepths;
@@ -200,7 +233,10 @@ CapabilityResult query_png_backend() {
 
 CapabilityResult query_x264_backend() {
 	return query_software_capabilities<query_x264_parameters>(
-		"x264", {{{"8", "8-bit"}}, "8", {{"420", "4:2:0"}}, "420"}
+		"x264",
+		{{{"8", "8-bit"}, {"10", "10-bit"}}, "8",
+		 {{"420", "4:2:0"}, {"422", "4:2:2"}, {"444", "4:4:4"}}, "420",
+		 true, true, true, true, true}
 	);
 }
 
@@ -429,8 +465,9 @@ EncodeResult run_backend_encode(const EncoderBackend& backend, const RawImage& i
 	transform.sourcePeakNits = sourcePeak;
 	transform.targetPeakNits = targetPeak;
 	RawImage transformed = transform_raw_image(image, targetFormat, transform);
+	if (backend.id == X264_H264_INTRA) transformed = pad_x264_input(std::move(transformed));
 	const bool rgbStillImplementation =
-		backend.id.value >= JPEGLS.value && backend.id.value <= X264_H264_INTRA.value && backend.id != JPEGXL;
+		backend.id.value >= JPEGLS.value && backend.id.value <= PNG.value && backend.id != JPEGXL;
 	if (rgbStillImplementation &&
 	    (transformed.color.primaries != ColorPrimaries::BT709 || transformed.color.matrix != MatrixCoefficients::BT709 ||
 	     (transformed.color.transfer != TransferCharacteristics::SRGB && transformed.color.transfer != TransferCharacteristics::BT709))) {

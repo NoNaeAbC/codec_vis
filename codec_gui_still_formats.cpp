@@ -50,18 +50,6 @@ T param_value(std::span<const EncoderParam> params, const std::string& name, T f
 	return fallback;
 }
 
-int sample_bytes(PixelFormat format) {
-	switch (format) {
-		case PixelFormat::YUV420P8:
-		case PixelFormat::YUV422P8:
-		case PixelFormat::YUV444P8:
-		case PixelFormat::Gray8:
-			return 1;
-		default:
-			return 2;
-	}
-}
-
 bool is_gray(PixelFormat format) {
 	return format == PixelFormat::Gray8 || format == PixelFormat::Gray10LE ||
 	       format == PixelFormat::Gray12LE || format == PixelFormat::Gray14LE;
@@ -134,10 +122,6 @@ uint16_t load_sample(const ImagePlane& plane, int x, int y, int bytesPerSample, 
 		return plane.bytes[offset];
 	}
 	return static_cast<uint16_t>(plane.bytes[offset] | (static_cast<uint16_t>(plane.bytes[offset + 1]) << 8u));
-}
-
-uint8_t clamp_u8(double value) {
-	return static_cast<uint8_t>(std::clamp<int>(static_cast<int>(std::lround(value)), 0, 255));
 }
 
 struct MatrixWeights {
@@ -302,49 +286,6 @@ JxlColorEncoding jxl_color_encoding(const RawImage& image) {
 	return color;
 }
 
-std::vector<uint8_t> raw_to_rgb8(const RawImage& image) {
-	if (image.width <= 0 || image.height <= 0) {
-		throw std::runtime_error("image dimensions must be positive");
-	}
-	const int bps = sample_bytes(image.format);
-	const double yOffset = image.color.range == ColorRange::Full ? 0.0 : (bps == 1 ? 16.0 : 64.0);
-	const double cOffset = bps == 1 ? 128.0 : 512.0;
-	const double yScale = image.color.range == ColorRange::Full ? (bps == 1 ? 255.0 : 1023.0) : (bps == 1 ? 219.0 : 876.0);
-	const double cScale = image.color.range == ColorRange::Full ? (bps == 1 ? 255.0 : 1023.0) : (bps == 1 ? 224.0 : 896.0);
-	const uint16_t neutralY = bps == 1 ? 16 : 64;
-	const uint16_t neutralC = bps == 1 ? 128 : 512;
-
-	std::vector<uint8_t> rgb(static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height) * 3);
-	for (int y = 0; y < image.height; ++y) {
-		for (int x = 0; x < image.width; ++x) {
-			double r = 0.0;
-			double g = 0.0;
-			double b = 0.0;
-			if (is_gray(image.format)) {
-				const double maxSample = bps == 1 ? 255.0 : 1023.0;
-				r = g = b = static_cast<double>(load_sample(image.planes[0], x, y, bps, 0)) * 255.0 / maxSample;
-			} else {
-				const int cx = (is_420(image.format) || is_422(image.format)) ? x / 2 : x;
-				const int cy = is_420(image.format) ? y / 2 : y;
-				const double yy = (static_cast<double>(load_sample(image.planes[0], x, y, bps, neutralY)) - yOffset) / yScale;
-				const double cb = (static_cast<double>(load_sample(image.planes[1], cx, cy, bps, neutralC)) - cOffset) / cScale;
-				const double cr = (static_cast<double>(load_sample(image.planes[2], cx, cy, bps, neutralC)) - cOffset) / cScale;
-				constexpr double kr = 0.2126;
-				constexpr double kb = 0.0722;
-				constexpr double kg = 1.0 - kr - kb;
-				r = (yy + (2.0 - 2.0 * kr) * cr) * 255.0;
-				b = (yy + (2.0 - 2.0 * kb) * cb) * 255.0;
-				g = ((yy - kr * (r / 255.0) - kb * (b / 255.0)) / kg) * 255.0;
-			}
-			const std::size_t offset = (static_cast<std::size_t>(y) * image.width + x) * 3;
-			rgb[offset + 0] = clamp_u8(r);
-			rgb[offset + 1] = clamp_u8(g);
-			rgb[offset + 2] = clamp_u8(b);
-		}
-	}
-	return rgb;
-}
-
 std::vector<std::byte> bytes_from_u8(const std::vector<uint8_t>& in) {
 	std::vector<std::byte> out(in.size());
 	std::memcpy(out.data(), in.data(), in.size());
@@ -359,67 +300,28 @@ std::vector<uint8_t> read_temp_file(const std::filesystem::path& path) {
 	return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
 
-RawImage rgb8_to_yuv420(const std::vector<uint8_t>& rgb, int width, int height) {
-	RawImage image;
-	image.width = (width + 1) & ~1;
-	image.height = (height + 1) & ~1;
-	image.format = PixelFormat::YUV420P8;
-	image.color.range = ColorRange::Limited;
-	image.planes[0].strideBytes = image.width;
-	image.planes[1].strideBytes = image.width / 2;
-	image.planes[2].strideBytes = image.width / 2;
-	image.planes[0].bytes.resize(static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height));
-	image.planes[1].bytes.resize(static_cast<std::size_t>(image.width / 2) * static_cast<std::size_t>(image.height / 2));
-	image.planes[2].bytes.resize(static_cast<std::size_t>(image.width / 2) * static_cast<std::size_t>(image.height / 2));
-	auto rgb_at = [&](int x, int y, int c) -> double {
-		const int sx = std::min(x, width - 1);
-		const int sy = std::min(y, height - 1);
-		return rgb[(static_cast<std::size_t>(sy) * width + sx) * 3 + c];
-	};
-	auto convert = [](double r, double g, double b, uint8_t& yy, uint8_t& cb, uint8_t& cr) {
-		const double yFull = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-		yy = clamp_u8(16.0 + 219.0 * yFull / 255.0);
-		cb = clamp_u8(128.0 + 224.0 * (b - yFull) / (2.0 * (255.0 - 255.0 * 0.0722)));
-		cr = clamp_u8(128.0 + 224.0 * (r - yFull) / (2.0 * (255.0 - 255.0 * 0.2126)));
-	};
-	for (int y = 0; y < image.height; ++y) {
-		for (int x = 0; x < image.width; ++x) {
-			uint8_t yy = 0;
-			uint8_t cb = 0;
-			uint8_t cr = 0;
-			convert(rgb_at(x, y, 0), rgb_at(x, y, 1), rgb_at(x, y, 2), yy, cb, cr);
-			image.planes[0].bytes[static_cast<std::size_t>(y) * image.width + x] = yy;
-		}
+struct X264InputFormat {
+	int csp;
+	int bitDepth;
+};
+
+X264InputFormat x264_input_format(PixelFormat format) {
+	switch (format) {
+		case PixelFormat::YUV420P8: return {X264_CSP_I420, 8};
+		case PixelFormat::YUV420P10LE: return {X264_CSP_I420 | X264_CSP_HIGH_DEPTH, 10};
+		case PixelFormat::YUV422P8: return {X264_CSP_I422, 8};
+		case PixelFormat::YUV422P10LE: return {X264_CSP_I422 | X264_CSP_HIGH_DEPTH, 10};
+		case PixelFormat::YUV444P8: return {X264_CSP_I444, 8};
+		case PixelFormat::YUV444P10LE: return {X264_CSP_I444 | X264_CSP_HIGH_DEPTH, 10};
+		default: throw std::invalid_argument("x264 requires planar 8- or 10-bit YUV 4:2:0, 4:2:2, or 4:4:4 input");
 	}
-	for (int y = 0; y < image.height / 2; ++y) {
-		for (int x = 0; x < image.width / 2; ++x) {
-			double r = 0.0;
-			double g = 0.0;
-			double b = 0.0;
-			for (int dy = 0; dy < 2; ++dy) {
-				for (int dx = 0; dx < 2; ++dx) {
-					r += rgb_at(x * 2 + dx, y * 2 + dy, 0);
-					g += rgb_at(x * 2 + dx, y * 2 + dy, 1);
-					b += rgb_at(x * 2 + dx, y * 2 + dy, 2);
-				}
-			}
-			uint8_t yy = 0;
-			uint8_t cb = 0;
-			uint8_t cr = 0;
-			convert(r * 0.25, g * 0.25, b * 0.25, yy, cb, cr);
-			const std::size_t i = static_cast<std::size_t>(y) * (image.width / 2) + x;
-			image.planes[1].bytes[i] = cb;
-			image.planes[2].bytes[i] = cr;
-		}
-	}
-	return image;
 }
 
-RawImage yuv420p8_image_for_x264(const RawImage& image) {
-	if (image.format == PixelFormat::YUV420P8 && (image.width % 2) == 0 && (image.height % 2) == 0) {
-		return image;
-	}
-	return rgb8_to_yuv420(raw_to_rgb8(image), image.width, image.height);
+std::string automatic_x264_profile(const RawImage& image, bool lossless) {
+	if (lossless || image.format == PixelFormat::YUV444P8 || image.format == PixelFormat::YUV444P10LE) return "high444";
+	if (is_422(image.format)) return "high422";
+	if (format_bit_depth(image.format) == 10) return "high10";
+	return "high";
 }
 
 EncodedImage encode_jpeg_like(const RawImage& image, std::span<const EncoderParam> params) {
@@ -1011,21 +913,23 @@ std::vector<EncoderParamInfo> query_x264_parameters() {
 	return {
 		{.name = "preset", .label = "Preset", .group = "Speed / Search", .kind = ParamKind::Enum, .defaultValue = std::string{"medium"}, .enumValues = {{"ultrafast", "Ultrafast"}, {"superfast", "Superfast"}, {"veryfast", "Veryfast"}, {"faster", "Faster"}, {"fast", "Fast"}, {"medium", "Medium"}, {"slow", "Slow"}, {"slower", "Slower"}, {"veryslow", "Veryslow"}, {"placebo", "Placebo"}}, .help = "x264 preset."},
 		{.name = "tune", .label = "Tune", .group = "Speed / Search", .kind = ParamKind::Enum, .defaultValue = std::string{"stillimage"}, .enumValues = {{"stillimage", "Still image"}, {"psnr", "PSNR"}, {"ssim", "SSIM"}, {"grain", "Grain"}, {"film", "Film"}, {"animation", "Animation"}, {"fastdecode", "Fast decode"}, {"zerolatency", "Zero latency"}}, .help = "x264 tune."},
-		{.name = "profile", .label = "Profile", .group = "Bitstream", .kind = ParamKind::Enum, .defaultValue = std::string{"high"}, .enumValues = {{"baseline", "Baseline"}, {"main", "Main"}, {"high", "High"}}, .help = "Profiles compatible with this backend's fixed 8-bit 4:2:0 input path."},
-		{.name = "qp", .label = "QP", .group = "Rate Control", .kind = ParamKind::Int, .defaultValue = int64_t{22}, .intRange = IntRange{0, 51, 1}, .help = "Constant quantizer. 0 is lossless when supported by profile/pixel format."},
-		{.name = "cabac", .label = "CABAC", .group = "Entropy", .kind = ParamKind::Bool, .defaultValue = true, .help = "Enable CABAC entropy coding."},
-		{.name = "8x8dct", .label = "8x8 DCT", .group = "Transform", .kind = ParamKind::Bool, .defaultValue = true, .help = "Enable 8x8 transform."},
-		{.name = "partitions", .label = "Partitions", .group = "Intra Analysis", .kind = ParamKind::Enum, .defaultValue = std::string{"i4x4,i8x8"}, .enumValues = {{"none", "None"}, {"i4x4", "I4x4"}, {"i8x8", "I8x8"}, {"i4x4,i8x8", "I4x4 + I8x8"}, {"all", "All"}}, .help = "Intra partition search modes."},
+		{.name = "rate-control", .label = "Mode", .group = "Rate Control", .kind = ParamKind::Enum, .defaultValue = std::string{"qp"}, .enumValues = {{"qp", "Constant QP"}, {"crf", "Constant quality (CRF)"}, {"lossless", "Lossless"}}, .help = "Still-image rate-control mode."},
+		{.name = "qp", .label = "QP", .group = "Rate Control", .kind = ParamKind::Int, .defaultValue = int64_t{22}, .intRange = IntRange{1, 51, 1}, .help = "Constant quantizer. Lossless is a separate mode so profile compatibility is explicit.", .enabledWhen = {{"rate-control", {"qp"}, "Constant QP mode only"}}},
+		{.name = "crf", .label = "CRF", .group = "Rate Control", .kind = ParamKind::Float, .defaultValue = double{23.0}, .floatRange = FloatRange{0.0, 51.0, 0.1}, .help = "Constant-rate-factor quality target.", .enabledWhen = {{"rate-control", {"crf"}, "CRF mode only"}}},
+		{.name = "profile", .label = "Compatibility profile", .group = "Bitstream", .kind = ParamKind::Enum, .defaultValue = std::string{"auto"}, .enumValues = {{"auto", "Auto"}, {"baseline", "Baseline"}, {"main", "Main"}, {"high", "High"}}, .help = "Explicit compatibility profiles apply only to lossy 8-bit 4:2:0. Other formats and lossless mode require the profile derived by x264.", .enabledWhen = {{"bit-depth", {"8"}, "8-bit output only"}, {"chroma-subsampling", {"420"}, "4:2:0 output only"}, {"rate-control", {"qp", "crf"}, "Lossy modes only"}}},
+		{.name = "cabac", .label = "CABAC", .group = "Entropy", .kind = ParamKind::Bool, .defaultValue = true, .help = "Enable CABAC entropy coding.", .enabledWhen = {{"profile", {"auto", "main", "high"}, "Baseline profile requires CAVLC"}}},
+		{.name = "8x8dct", .label = "8x8 DCT", .group = "Transform", .kind = ParamKind::Bool, .defaultValue = true, .help = "Enable 8x8 transform.", .enabledWhen = {{"profile", {"auto", "high"}, "8x8 transform requires a High-family profile"}, {"rate-control", {"qp", "crf"}, "Lossy modes only"}}},
+		{.name = "partitions", .label = "Partitions", .group = "Intra Analysis", .kind = ParamKind::Enum, .defaultValue = std::string{"i4x4,i8x8"}, .enumValues = {{"none", "None"}, {"i4x4", "I4x4"}, {"i8x8", "I8x8"}, {"i4x4,i8x8", "I4x4 + I8x8"}, {"all", "All"}}, .help = "Intra partition search modes.", .enabledWhen = {{"profile", {"auto", "high"}, "The exposed partition choices include High-profile I8x8"}}},
 		{.name = "subme", .label = "Subme", .group = "Intra Analysis", .kind = ParamKind::Int, .defaultValue = int64_t{7}, .intRange = IntRange{0, 11, 1}, .help = "Subpixel/refinement and mode decision quality."},
-		{.name = "trellis", .label = "Trellis", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{1}, .intRange = IntRange{0, 2, 1}, .help = "Trellis RD quantization."},
-		{.name = "psy", .label = "Psy", .group = "Psychovisual", .kind = ParamKind::Bool, .defaultValue = true, .help = "Enable psychovisual optimizations."},
-		{.name = "psy-rd", .label = "Psy RD", .group = "Psychovisual", .kind = ParamKind::String, .defaultValue = std::string{"1.0:0.0"}, .help = "x264 psy-rd string: psy-rd:psy-trellis."},
-		{.name = "aq-mode", .label = "AQ mode", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{1}, .intRange = IntRange{0, 3, 1}, .help = "Adaptive quantization mode."},
-		{.name = "aq-strength", .label = "AQ strength", .group = "Quantization", .kind = ParamKind::Float, .defaultValue = double{1.0}, .floatRange = FloatRange{0.0, 3.0, 0.05}, .help = "Adaptive quantization strength."},
-		{.name = "chroma-qp-offset", .label = "Chroma QP offset", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{-12, 12, 1}, .help = "Chroma QP offset."},
-		{.name = "deadzone-intra", .label = "Deadzone intra", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{11}, .intRange = IntRange{0, 32, 1}, .help = "Luma intra quantization deadzone."},
-		{.name = "nr", .label = "Noise reduction", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{0, 100000, 1}, .help = "Adaptive pseudo-deadzone noise reduction."},
-		{.name = "deblock", .label = "Deblock", .group = "Loop Filter", .kind = ParamKind::String, .defaultValue = std::string{"0:0"}, .help = "Deblocking filter alpha:beta offsets, or 0/false to disable."},
+		{.name = "trellis", .label = "Trellis", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{1}, .intRange = IntRange{0, 2, 1}, .help = "Trellis RD quantization.", .enabledWhen = {{"rate-control", {"qp", "crf"}, "Lossy modes only"}}},
+		{.name = "psy", .label = "Psy", .group = "Psychovisual", .kind = ParamKind::Bool, .defaultValue = true, .help = "Enable psychovisual optimizations.", .enabledWhen = {{"rate-control", {"qp", "crf"}, "Lossy modes only"}}},
+		{.name = "psy-rd", .label = "Psy RD", .group = "Psychovisual", .kind = ParamKind::String, .defaultValue = std::string{"1.0:0.0"}, .help = "x264 psy-rd string: psy-rd:psy-trellis.", .enabledWhen = {{"rate-control", {"qp", "crf"}, "Lossy modes only"}}},
+		{.name = "aq-mode", .label = "AQ mode", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{1}, .intRange = IntRange{0, 3, 1}, .help = "Adaptive quantization mode.", .enabledWhen = {{"rate-control", {"qp", "crf"}, "Lossy modes only"}}},
+		{.name = "aq-strength", .label = "AQ strength", .group = "Quantization", .kind = ParamKind::Float, .defaultValue = double{1.0}, .floatRange = FloatRange{0.0, 3.0, 0.05}, .help = "Adaptive quantization strength.", .enabledWhen = {{"rate-control", {"qp", "crf"}, "Lossy modes only"}}},
+		{.name = "chroma-qp-offset", .label = "Chroma QP offset", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{-12, 12, 1}, .help = "Chroma QP offset.", .enabledWhen = {{"rate-control", {"qp", "crf"}, "Lossy modes only"}}},
+		{.name = "deadzone-intra", .label = "Deadzone intra", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{11}, .intRange = IntRange{0, 32, 1}, .help = "Luma intra quantization deadzone.", .enabledWhen = {{"rate-control", {"qp", "crf"}, "Lossy modes only"}}},
+		{.name = "nr", .label = "Noise reduction", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{0, 100000, 1}, .help = "Adaptive pseudo-deadzone noise reduction.", .enabledWhen = {{"rate-control", {"qp", "crf"}, "Lossy modes only"}}},
+		{.name = "deblock", .label = "Deblock", .group = "Loop Filter", .kind = ParamKind::String, .defaultValue = std::string{"0:0"}, .help = "Deblocking filter alpha:beta offsets, or 0/false to disable.", .enabledWhen = {{"rate-control", {"qp", "crf"}, "Lossy modes only"}}},
 		{.name = "constrained-intra", .label = "Constrained intra", .group = "Prediction", .kind = ParamKind::Bool, .defaultValue = false, .help = "Constrained intra prediction."},
 		{.name = "slices", .label = "Slices", .group = "Bitstream", .kind = ParamKind::Int, .defaultValue = int64_t{1}, .intRange = IntRange{1, 128, 1}, .help = "Number of slices."},
 		{.name = "aud", .label = "AUD", .group = "Bitstream", .kind = ParamKind::Bool, .defaultValue = false, .help = "Emit access unit delimiters."},
@@ -1038,9 +942,9 @@ EncodedImage encode_x264_intra_still_image(const RawImage& image, std::span<cons
 	const std::string preset = param_value<std::string>(params, "preset", "medium");
 	const std::string tune = param_value<std::string>(params, "tune", "stillimage");
 	if (x264_param_default_preset(&p, preset.c_str(), tune.empty() ? nullptr : tune.c_str()) < 0) throw std::runtime_error("x264 preset setup failed");
-	RawImage src = yuv420p8_image_for_x264(image);
-	p.i_width = src.width;
-	p.i_height = src.height;
+	const X264InputFormat input = x264_input_format(image.format);
+	p.i_width = image.width;
+	p.i_height = image.height;
 	p.i_fps_num = 1;
 	p.i_fps_den = 1;
 	p.i_keyint_max = 1;
@@ -1049,11 +953,34 @@ EncodedImage encode_x264_intra_still_image(const RawImage& image, std::span<cons
 	p.i_bframe = 0;
 	p.b_annexb = 1;
 	p.b_repeat_headers = 1;
-	p.i_csp = X264_CSP_I420;
-	p.rc.i_rc_method = X264_RC_CQP;
+	p.i_csp = input.csp;
+	p.i_bitdepth = input.bitDepth;
 	p.i_threads = 1;
+	p.vui.b_fullrange = image.color.range == ColorRange::Full;
+	p.vui.i_colorprim = static_cast<int>(image.color.primaries);
+	p.vui.i_transfer = static_cast<int>(image.color.transfer);
+	p.vui.i_colmatrix = static_cast<int>(image.color.matrix);
+	p.vui.i_chroma_loc = static_cast<int>(image.color.chroma420Location.value_or(Chroma420SampleLocation::LeftCenter));
+	const std::string rateControl = param_value<std::string>(params, "rate-control", "qp");
+	const bool lossless = rateControl == "lossless";
+	if (rateControl == "qp") {
+		p.rc.i_rc_method = X264_RC_CQP;
+		p.rc.i_qp_constant = static_cast<int>(param_value<int64_t>(params, "qp", 22));
+	}
+	else if (rateControl == "crf") {
+		p.rc.i_rc_method = X264_RC_CRF;
+		p.rc.f_rf_constant = static_cast<float>(param_value<double>(params, "crf", 23.0));
+	}
+	else if (lossless) {
+		p.rc.i_rc_method = X264_RC_CQP;
+		p.rc.i_qp_constant = 0;
+	}
+	else {
+		throw std::invalid_argument("x264: unsupported rate-control mode " + rateControl);
+	}
 	for (const EncoderParam& param : params) {
-		if (param.name == "preset" || param.name == "tune" || param.name == "profile") {
+		if (param.name == "preset" || param.name == "tune" || param.name == "profile" ||
+		    param.name == "rate-control" || param.name == "qp" || param.name == "crf") {
 			continue;
 		}
 		const std::string value = value_to_cli_string(param.value);
@@ -1064,19 +991,23 @@ EncodedImage encode_x264_intra_still_image(const RawImage& image, std::span<cons
 			throw std::invalid_argument("x264: invalid parameter '" + param.name + "' = " + value);
 		}
 	}
-	const std::string profile = param_value<std::string>(params, "profile", "high");
-	if (!profile.empty() && x264_param_apply_profile(&p, profile.c_str()) < 0) {
+	std::string profile = param_value<std::string>(params, "profile", "auto");
+	if (profile != "auto" && (lossless || input.bitDepth != 8 || !is_420(image.format))) {
+		throw std::invalid_argument("x264: explicit baseline/main/high profiles require lossy 8-bit 4:2:0 output");
+	}
+	if (profile == "auto") profile = automatic_x264_profile(image, lossless);
+	if (x264_param_apply_profile(&p, profile.c_str()) < 0) {
 		throw std::invalid_argument("x264: invalid profile " + profile);
 	}
 	std::unique_ptr<x264_t, decltype(&x264_encoder_close)> enc(x264_encoder_open(&p), x264_encoder_close);
 	if (!enc) throw std::runtime_error("x264_encoder_open failed");
 	x264_picture_t picIn{};
 	x264_picture_init(&picIn);
-	picIn.img.i_csp = X264_CSP_I420;
+	picIn.img.i_csp = input.csp;
 	picIn.img.i_plane = 3;
 	for (int i = 0; i < 3; ++i) {
-		picIn.img.plane[i] = const_cast<uint8_t*>(src.planes[i].bytes.data());
-		picIn.img.i_stride[i] = src.planes[i].strideBytes;
+		picIn.img.plane[i] = const_cast<uint8_t*>(image.planes[i].bytes.data());
+		picIn.img.i_stride[i] = image.planes[i].strideBytes;
 	}
 	picIn.i_type = X264_TYPE_IDR;
 	x264_nal_t* nals = nullptr;
@@ -1097,6 +1028,7 @@ EncodedImage encode_x264_intra_still_image(const RawImage& image, std::span<cons
 		if (flushBytes < 0) throw std::runtime_error("x264_encoder_encode flush failed");
 		appendNals();
 	}
+	encoded.codedColor = image.color;
 	return encoded;
 }
 

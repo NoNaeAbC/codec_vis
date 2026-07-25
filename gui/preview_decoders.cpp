@@ -20,11 +20,11 @@
 #include <jxl/decode.h>
 #include <openjpeg.h>
 #include <png.h>
-#include <wels/codec_api.h>
-#include <wels/codec_app_def.h>
-#include <wels/codec_def.h>
 
 extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavutil/error.h>
+#include <libavutil/pixfmt.h>
 #include <dav1d/dav1d.h>
 #include <jpeglib.h>
 #include <jxrlib/JXRGlue.h>
@@ -59,36 +59,6 @@ uint32_t read_u32le(const std::byte* p) {
 		out |= static_cast<uint32_t>(std::to_integer<uint8_t>(p[i])) << (i * 8);
 	}
 	return out;
-}
-
-uint8_t clamp_u8(double value) {
-	return static_cast<uint8_t>(std::clamp<int>(static_cast<int>(std::lround(value)), 0, 255));
-}
-
-std::shared_ptr<const RawImage> rgb8_to_yuv444_preview(const std::vector<uint8_t>& rgb, int width, int height) {
-	auto image = std::make_shared<RawImage>();
-	image->width = width;
-	image->height = height;
-	image->format = PixelFormat::YUV444P8;
-	image->color.range = ColorRange::Limited;
-	for (int p = 0; p < 3; ++p) {
-		image->planes[p].strideBytes = width;
-		image->planes[p].bytes.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height));
-	}
-	for (int y = 0; y < height; ++y) {
-		for (int x = 0; x < width; ++x) {
-			const std::size_t i = (static_cast<std::size_t>(y) * width + x) * 3;
-			const double r = rgb[i + 0];
-			const double g = rgb[i + 1];
-			const double b = rgb[i + 2];
-			const double yy = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-			const std::size_t o = static_cast<std::size_t>(y) * width + x;
-			image->planes[0].bytes[o] = clamp_u8(16.0 + 219.0 * yy / 255.0);
-			image->planes[1].bytes[o] = clamp_u8(128.0 + 224.0 * (b - yy) / (2.0 * (255.0 - 255.0 * 0.0722)));
-			image->planes[2].bytes[o] = clamp_u8(128.0 + 224.0 * (r - yy) / (2.0 * (255.0 - 255.0 * 0.2126)));
-		}
-	}
-	return image;
 }
 
 struct MatrixWeights {
@@ -228,42 +198,6 @@ ColorDescription color_description_from_jxl(const JxlColorEncoding& profile) {
 	}
 	color.matrix = color.primaries == ColorPrimaries::BT2020 ? MatrixCoefficients::BT2020NonConstant : MatrixCoefficients::BT709;
 	return color;
-}
-
-std::shared_ptr<const RawImage> copy_i420_preview(const unsigned char* const planes[3], const int strides[2], int width, int height) {
-	auto image = std::make_shared<RawImage>();
-	image->width = width;
-	image->height = height;
-	image->format = PixelFormat::YUV420P8;
-	image->color.range = ColorRange::Limited;
-	image->planes[0].strideBytes = width;
-	image->planes[1].strideBytes = (width + 1) / 2;
-	image->planes[2].strideBytes = (width + 1) / 2;
-	image->planes[0].bytes.resize(static_cast<std::size_t>(width) * height);
-	image->planes[1].bytes.resize(static_cast<std::size_t>((width + 1) / 2) * ((height + 1) / 2));
-	image->planes[2].bytes.resize(static_cast<std::size_t>((width + 1) / 2) * ((height + 1) / 2));
-	for (int y = 0; y < height; ++y) {
-		std::memcpy(
-			image->planes[0].bytes.data() + static_cast<std::size_t>(y) * image->planes[0].strideBytes,
-			planes[0] + static_cast<std::size_t>(y) * strides[0],
-			static_cast<std::size_t>(width)
-		);
-	}
-	const int chromaWidth = (width + 1) / 2;
-	const int chromaHeight = (height + 1) / 2;
-	for (int y = 0; y < chromaHeight; ++y) {
-		std::memcpy(
-			image->planes[1].bytes.data() + static_cast<std::size_t>(y) * image->planes[1].strideBytes,
-			planes[1] + static_cast<std::size_t>(y) * strides[1],
-			static_cast<std::size_t>(chromaWidth)
-		);
-		std::memcpy(
-			image->planes[2].bytes.data() + static_cast<std::size_t>(y) * image->planes[2].strideBytes,
-			planes[2] + static_cast<std::size_t>(y) * strides[1],
-			static_cast<std::size_t>(chromaWidth)
-		);
-	}
-	return image;
 }
 
 std::vector<uint8_t> bytes_to_u8(const std::vector<std::byte>& bytes) {
@@ -853,47 +787,82 @@ DecodeResult decode_h264_preview(const EncodedImage& encoded) {
 	if (encoded.hevcAnnexB.empty()) {
 		return {nullptr, "H.264 encoded byte buffer is empty"};
 	}
-	ISVCDecoder* rawDecoder = nullptr;
-	if (WelsCreateDecoder(&rawDecoder) != 0 || rawDecoder == nullptr) {
-		return {nullptr, "OpenH264 decoder allocation failed"};
-	}
-	std::unique_ptr<ISVCDecoder, void (*)(ISVCDecoder*)> decoder(rawDecoder, WelsDestroyDecoder);
+	auto ffmpeg_error = [](int error) {
+		char text[AV_ERROR_MAX_STRING_SIZE]{};
+		av_strerror(error, text, sizeof(text));
+		return std::string{text};
+	};
+	auto format_for = [](AVPixelFormat format) {
+		switch (format) {
+			case AV_PIX_FMT_YUV420P:
+			case AV_PIX_FMT_YUVJ420P: return PixelFormat::YUV420P8;
+			case AV_PIX_FMT_YUV422P:
+			case AV_PIX_FMT_YUVJ422P: return PixelFormat::YUV422P8;
+			case AV_PIX_FMT_YUV444P:
+			case AV_PIX_FMT_YUVJ444P: return PixelFormat::YUV444P8;
+			case AV_PIX_FMT_YUV420P10LE: return PixelFormat::YUV420P10LE;
+			case AV_PIX_FMT_YUV422P10LE: return PixelFormat::YUV422P10LE;
+			case AV_PIX_FMT_YUV444P10LE: return PixelFormat::YUV444P10LE;
+			default: throw std::runtime_error("libavcodec produced unsupported H.264 pixel format " + std::to_string(format));
+		}
+	};
+	const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+	if (!codec) return {nullptr, "libavcodec H.264 decoder is unavailable"};
+	using CodecContextPtr = std::unique_ptr<AVCodecContext, void (*)(AVCodecContext*)>;
+	using PacketPtr = std::unique_ptr<AVPacket, void (*)(AVPacket*)>;
+	using FramePtr = std::unique_ptr<AVFrame, void (*)(AVFrame*)>;
+	CodecContextPtr decoder(avcodec_alloc_context3(codec), [](AVCodecContext* p) { avcodec_free_context(&p); });
+	PacketPtr packet(av_packet_alloc(), [](AVPacket* p) { av_packet_free(&p); });
+	FramePtr frame(av_frame_alloc(), [](AVFrame* p) { av_frame_free(&p); });
+	if (!decoder || !packet || !frame) return {nullptr, "libavcodec H.264 decoder allocation failed"};
 	try {
-		SDecodingParam params{};
-		params.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_AVC;
-		params.eEcActiveIdc = ERROR_CON_DISABLE;
-		params.bParseOnly = false;
-		if (decoder->Initialize(&params) != 0) {
-			throw std::runtime_error("OpenH264 decoder initialize failed");
+		int error = avcodec_open2(decoder.get(), codec, nullptr);
+		if (error < 0) {
+			throw std::runtime_error("libavcodec H.264 decoder open failed: " + ffmpeg_error(error));
 		}
-		unsigned char* planes[3]{};
-		SBufferInfo info{};
-		const DECODING_STATE state = decoder->DecodeFrameNoDelay(
-			reinterpret_cast<const unsigned char*>(encoded.hevcAnnexB.data()),
-			static_cast<int>(encoded.hevcAnnexB.size()),
-			planes,
-			&info
-		);
-		if ((state & (dsBitstreamError | dsInvalidArgument | dsInitialOptExpected | dsOutOfMemory | dsDstBufNeedExpan)) != 0) {
-			throw std::runtime_error("OpenH264 decode failed");
+		if (encoded.hevcAnnexB.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+			throw std::runtime_error("H.264 byte buffer is too large for libavcodec");
 		}
-		if (info.iBufferStatus != 1) {
-			const DECODING_STATE flushState = decoder->FlushFrame(planes, &info);
-			if ((flushState & (dsBitstreamError | dsInvalidArgument | dsInitialOptExpected | dsOutOfMemory | dsDstBufNeedExpan)) != 0) {
-				throw std::runtime_error("OpenH264 flush failed");
+		error = av_new_packet(packet.get(), static_cast<int>(encoded.hevcAnnexB.size()));
+		if (error < 0) throw std::runtime_error("libavcodec packet allocation failed: " + ffmpeg_error(error));
+		std::memcpy(packet->data, encoded.hevcAnnexB.data(), encoded.hevcAnnexB.size());
+		error = avcodec_send_packet(decoder.get(), packet.get());
+		if (error < 0) throw std::runtime_error("libavcodec rejected H.264 stream: " + ffmpeg_error(error));
+		error = avcodec_receive_frame(decoder.get(), frame.get());
+		if (error == AVERROR(EAGAIN)) {
+			error = avcodec_send_packet(decoder.get(), nullptr);
+			if (error < 0) throw std::runtime_error("libavcodec H.264 flush failed: " + ffmpeg_error(error));
+			error = avcodec_receive_frame(decoder.get(), frame.get());
+		}
+		if (error < 0) throw std::runtime_error("libavcodec produced no H.264 preview frame: " + ffmpeg_error(error));
+
+		auto image = std::make_shared<RawImage>();
+		image->width = frame->width;
+		image->height = frame->height;
+		image->format = format_for(static_cast<AVPixelFormat>(frame->format));
+		image->color = encoded.codedColor.value_or(ColorDescription{});
+		const bool chroma420 = image->format == PixelFormat::YUV420P8 || image->format == PixelFormat::YUV420P10LE;
+		const bool chroma422 = image->format == PixelFormat::YUV422P8 || image->format == PixelFormat::YUV422P10LE;
+		const int bytesPerSample = image->format == PixelFormat::YUV420P8 ||
+		                           image->format == PixelFormat::YUV422P8 ||
+		                           image->format == PixelFormat::YUV444P8 ? 1 : 2;
+		for (int plane = 0; plane < 3; ++plane) {
+			const int width = plane == 0 || (!chroma420 && !chroma422) ? image->width : (image->width + 1) / 2;
+			const int height = plane == 0 || !chroma420 ? image->height : (image->height + 1) / 2;
+			const int rowBytes = width * bytesPerSample;
+			image->planes[plane].strideBytes = rowBytes;
+			image->planes[plane].bytes.resize(static_cast<std::size_t>(rowBytes) * height);
+			if (!frame->data[plane]) throw std::runtime_error("libavcodec returned an incomplete H.264 frame");
+			for (int y = 0; y < height; ++y) {
+				std::memcpy(
+					image->planes[plane].bytes.data() + static_cast<std::size_t>(y) * rowBytes,
+					frame->data[plane] + static_cast<std::ptrdiff_t>(y) * frame->linesize[plane],
+					static_cast<std::size_t>(rowBytes)
+				);
 			}
 		}
-		if (info.iBufferStatus != 1 || planes[0] == nullptr || planes[1] == nullptr || planes[2] == nullptr) {
-			throw std::runtime_error("OpenH264 produced no preview frame");
-		}
-		const SSysMEMBuffer& sys = info.UsrData.sSystemBuffer;
-		if (sys.iFormat != videoFormatI420) {
-			throw std::runtime_error("OpenH264 produced unsupported pixel format");
-		}
-		const int strides[2]{sys.iStride[0], sys.iStride[1]};
-		return {copy_i420_preview(planes, strides, sys.iWidth, sys.iHeight), {}};
+		return {std::move(image), {}};
 	} catch (const std::exception& e) {
-		decoder->Uninitialize();
 		return {nullptr, e.what()};
 	}
 }

@@ -893,6 +893,16 @@ EncodedImage encode_png_still_image(const RawImage& image, std::span<const Encod
 	else if (filters == "paeth") png_set_filter(png, PNG_FILTER_TYPE_BASE, PNG_FILTER_PAETH);
 	else png_set_filter(png, PNG_FILTER_TYPE_BASE, PNG_ALL_FILTERS);
 	png_set_IHDR(png, info, image.width, image.height, rgb.bitDepth, PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+#ifdef PNG_cICP_SUPPORTED
+	png_set_cICP(
+		png,
+		info,
+		static_cast<png_byte>(image.color.primaries),
+		static_cast<png_byte>(image.color.transfer),
+		0,
+		1
+	);
+#endif
 	if (rgb.bitDepth == 16) png_set_swap(png);
 	png_write_info(png, info);
 	for (int y = 0; y < image.height; ++y) {

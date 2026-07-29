@@ -440,13 +440,17 @@ EncodeResult run_backend_encode(const EncoderBackend& backend, const RawImage& i
 	ColorTransformOptions transform;
 	transform.target = image.color;
 	if (is_rgb(image.format)) {
-		transform.target.matrix = MatrixCoefficients::BT709;
 		transform.target.range = ColorRange::Limited;
 	}
 	if (primaries == "bt709") transform.target.primaries = ColorPrimaries::BT709;
 	else if (primaries == "display-p3") transform.target.primaries = ColorPrimaries::DisplayP3;
 	else if (primaries == "bt2020") transform.target.primaries = ColorPrimaries::BT2020;
 	else if (primaries != "source") throw std::invalid_argument("unsupported target primaries: " + primaries);
+	if (is_rgb(image.format) && matrix == "source") {
+		transform.target.matrix = transform.target.primaries == ColorPrimaries::BT2020
+			? MatrixCoefficients::BT2020NonConstant
+			: MatrixCoefficients::BT709;
+	}
 	if (transfer == "srgb") transform.target.transfer = TransferCharacteristics::SRGB;
 	else if (transfer == "bt709") transform.target.transfer = TransferCharacteristics::BT709;
 	else if (transfer == "linear") transform.target.transfer = TransferCharacteristics::Linear;

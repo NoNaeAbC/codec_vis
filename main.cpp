@@ -706,7 +706,9 @@ int main(int argc, char **argv) try {
 		codec_gui::gui::ColorTransformOptions transform;
 		transform.target = source.color;
 		if (source.color.matrix == codec_gui::MatrixCoefficients::Identity) {
-			transform.target.matrix = codec_gui::MatrixCoefficients::BT709;
+			transform.target.matrix = source.color.primaries == codec_gui::ColorPrimaries::BT2020
+				? codec_gui::MatrixCoefficients::BT2020NonConstant
+				: codec_gui::MatrixCoefficients::BT709;
 			transform.target.range = codec_gui::ColorRange::Limited;
 		}
 		const codec_gui::PixelFormat targetFormat =

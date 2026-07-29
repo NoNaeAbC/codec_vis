@@ -101,6 +101,7 @@ std::vector<Action> execute_command(const Command& command, const AppState& stat
 				if (preview.image) {
 					auto decoded = std::make_shared<RawImage>(*preview.image);
 					decoded->color = encode.comparisonReference->color;
+					decoded->nominalPeakNits = encode.comparisonReference->nominalPeakNits;
 					preview.image = std::move(decoded);
 					const auto metricStart = std::chrono::steady_clock::now();
 					MetricResult metric = compute_quality_metrics(*encode.comparisonReference, *preview.image);

@@ -14,8 +14,10 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <variant>
 
 #include <libraw/libraw.h>
+#include <lcms2.h>
 
 extern "C" {
 #include <jpeglib.h>
@@ -41,12 +43,16 @@ struct RgbImage {
 	int width = 0;
 	int height = 0;
 	std::vector<unsigned char> rgb;
+	ColorDescription color{ColorPrimaries::BT709, TransferCharacteristics::SRGB, MatrixCoefficients::Identity, ColorRange::Full, std::nullopt};
+	std::optional<double> nominalPeakNits;
 };
 
 struct Rgb16Image {
 	int width = 0;
 	int height = 0;
 	std::vector<unsigned short> rgb;
+	ColorDescription color{ColorPrimaries::BT709, TransferCharacteristics::SRGB, MatrixCoefficients::Identity, ColorRange::Full, std::nullopt};
+	std::optional<double> nominalPeakNits;
 };
 
 struct PngImage {
@@ -59,6 +65,201 @@ struct PngAllocations {
 	void* pixels = nullptr;
 	png_bytep* rows = nullptr;
 };
+
+enum class PngColorKind {
+	Cicp,
+	Icc,
+	Srgb,
+	Chromaticities,
+	AssumedSrgb,
+};
+
+struct PngColorMetadata {
+	PngColorKind kind = PngColorKind::AssumedSrgb;
+	std::vector<unsigned char> icc;
+	ColorDescription cicp;
+	std::optional<double> nominalPeakNits;
+	double whiteX = 0.3127;
+	double whiteY = 0.3290;
+	double redX = 0.64;
+	double redY = 0.33;
+	double greenX = 0.30;
+	double greenY = 0.60;
+	double blueX = 0.15;
+	double blueY = 0.06;
+	double fileGamma = 1.0 / 2.2;
+};
+
+ColorDescription png_cicp_description(
+	unsigned int primaries,
+	unsigned int transfer,
+	unsigned int matrix,
+	unsigned int fullRange
+) {
+	if (matrix != 0) throw std::runtime_error("PNG cICP RGB image must use identity matrix coefficients");
+	if (primaries != static_cast<unsigned int>(ColorPrimaries::BT709) &&
+	    primaries != static_cast<unsigned int>(ColorPrimaries::BT2020) &&
+	    primaries != static_cast<unsigned int>(ColorPrimaries::DisplayP3)) {
+		throw std::runtime_error("PNG cICP uses unsupported H.273 color primaries " + std::to_string(primaries));
+	}
+	switch (static_cast<TransferCharacteristics>(transfer)) {
+		case TransferCharacteristics::BT709:
+		case TransferCharacteristics::Gamma22:
+		case TransferCharacteristics::Gamma28:
+		case TransferCharacteristics::Linear:
+		case TransferCharacteristics::SRGB:
+		case TransferCharacteristics::BT2020_10:
+		case TransferCharacteristics::BT2020_12:
+		case TransferCharacteristics::PQ:
+		case TransferCharacteristics::HLG:
+			break;
+		default:
+			throw std::runtime_error("PNG cICP uses unsupported H.273 transfer characteristics " + std::to_string(transfer));
+	}
+	ColorDescription color{
+		static_cast<ColorPrimaries>(primaries),
+		static_cast<TransferCharacteristics>(transfer),
+		MatrixCoefficients::Identity,
+		fullRange != 0 ? ColorRange::Full : ColorRange::Limited,
+		std::nullopt,
+	};
+	return color;
+}
+
+cmsHPROFILE create_linear_bt2020_profile() {
+	const cmsCIExyY white{0.3127, 0.3290, 1.0};
+	const cmsCIExyYTRIPLE primaries{
+		{0.708, 0.292, 1.0},
+		{0.170, 0.797, 1.0},
+		{0.131, 0.046, 1.0},
+	};
+	cmsToneCurve* curves[3]{
+		cmsBuildGamma(nullptr, 1.0),
+		cmsBuildGamma(nullptr, 1.0),
+		cmsBuildGamma(nullptr, 1.0),
+	};
+	if (!curves[0] || !curves[1] || !curves[2]) {
+		for (cmsToneCurve* curve : curves) if (curve) cmsFreeToneCurve(curve);
+		throw std::runtime_error("LittleCMS failed to create linear transfer curves");
+	}
+	cmsHPROFILE profile = cmsCreateRGBProfile(&white, &primaries, curves);
+	for (cmsToneCurve* curve : curves) cmsFreeToneCurve(curve);
+	if (!profile) throw std::runtime_error("LittleCMS failed to create the internal linear BT.2020 profile");
+	return profile;
+}
+
+cmsHPROFILE create_png_chromaticity_profile(const PngColorMetadata& metadata) {
+	if (metadata.fileGamma <= 0.0) throw std::runtime_error("PNG gAMA value must be positive");
+	const cmsCIExyY white{metadata.whiteX, metadata.whiteY, 1.0};
+	const cmsCIExyYTRIPLE primaries{
+		{metadata.redX, metadata.redY, 1.0},
+		{metadata.greenX, metadata.greenY, 1.0},
+		{metadata.blueX, metadata.blueY, 1.0},
+	};
+	const double decodingGamma = 1.0 / metadata.fileGamma;
+	cmsToneCurve* curves[3]{
+		cmsBuildGamma(nullptr, decodingGamma),
+		cmsBuildGamma(nullptr, decodingGamma),
+		cmsBuildGamma(nullptr, decodingGamma),
+	};
+	if (!curves[0] || !curves[1] || !curves[2]) {
+		for (cmsToneCurve* curve : curves) if (curve) cmsFreeToneCurve(curve);
+		throw std::runtime_error("LittleCMS failed to create PNG gamma curves");
+	}
+	cmsHPROFILE profile = cmsCreateRGBProfile(&white, &primaries, curves);
+	for (cmsToneCurve* curve : curves) cmsFreeToneCurve(curve);
+	if (!profile) throw std::runtime_error("LittleCMS rejected PNG cHRM/gAMA metadata");
+	return profile;
+}
+
+Rgb16Image convert_to_linear_bt2020(
+	int width,
+	int height,
+	const void* input,
+	cmsUInt32Number inputFormat,
+	cmsHPROFILE inputProfile
+) {
+	if (!inputProfile || cmsGetColorSpace(inputProfile) != cmsSigRgbData) {
+		throw std::runtime_error("embedded input ICC profile is not an RGB profile");
+	}
+	const std::size_t pixelCount = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+	if (pixelCount > std::numeric_limits<cmsUInt32Number>::max()) {
+		throw std::runtime_error("image is too large for a LittleCMS transform");
+	}
+	cmsHPROFILE outputProfile = create_linear_bt2020_profile();
+	const cmsUInt32Number intent = std::min<cmsUInt32Number>(cmsGetHeaderRenderingIntent(inputProfile), INTENT_ABSOLUTE_COLORIMETRIC);
+	cmsHTRANSFORM transform = cmsCreateTransform(
+		inputProfile,
+		inputFormat,
+		outputProfile,
+		TYPE_RGB_16,
+		intent,
+		cmsFLAGS_BLACKPOINTCOMPENSATION
+	);
+	if (!transform) {
+		cmsCloseProfile(outputProfile);
+		throw std::runtime_error("LittleCMS could not transform the embedded input profile");
+	}
+	Rgb16Image result;
+	result.width = width;
+	result.height = height;
+	result.color = {ColorPrimaries::BT2020, TransferCharacteristics::Linear, MatrixCoefficients::Identity, ColorRange::Full, std::nullopt};
+	result.rgb.resize(pixelCount * 3);
+	cmsDoTransform(transform, input, result.rgb.data(), static_cast<cmsUInt32Number>(pixelCount));
+	cmsDeleteTransform(transform);
+	cmsCloseProfile(outputProfile);
+	return result;
+}
+
+PngColorMetadata read_png_color_metadata(png_structp png, png_infop info) {
+	PngColorMetadata metadata;
+#ifdef PNG_cICP_SUPPORTED
+	png_byte primaries = 0;
+	png_byte transfer = 0;
+	png_byte matrix = 0;
+	png_byte fullRange = 0;
+	if (png_get_cICP(png, info, &primaries, &transfer, &matrix, &fullRange) != 0) {
+		metadata.kind = PngColorKind::Cicp;
+		metadata.cicp = png_cicp_description(primaries, transfer, matrix, fullRange);
+		if (metadata.cicp.transfer == TransferCharacteristics::HLG) {
+			metadata.nominalPeakNits = 1000.0;
+		}
+		return metadata;
+	}
+#endif
+	png_charp profileName = nullptr;
+	int compressionType = 0;
+	png_bytep profileData = nullptr;
+	png_uint_32 profileSize = 0;
+	if (png_get_iCCP(png, info, &profileName, &compressionType, &profileData, &profileSize) != 0 &&
+	    profileData != nullptr && profileSize > 0) {
+		metadata.kind = PngColorKind::Icc;
+		metadata.icc.assign(profileData, profileData + profileSize);
+		return metadata;
+	}
+	int renderingIntent = 0;
+	if (png_get_sRGB(png, info, &renderingIntent) != 0) {
+		metadata.kind = PngColorKind::Srgb;
+		return metadata;
+	}
+	double gamma = 0.0;
+	const bool hasGamma = png_get_gAMA(png, info, &gamma) != 0;
+	const bool hasChromaticities = png_get_cHRM(
+		png,
+		info,
+		&metadata.whiteX,
+		&metadata.whiteY,
+		&metadata.redX,
+		&metadata.redY,
+		&metadata.greenX,
+		&metadata.greenY,
+		&metadata.blueX,
+		&metadata.blueY
+	) != 0;
+	if (hasGamma) metadata.fileGamma = gamma;
+	if (hasGamma || hasChromaticities) metadata.kind = PngColorKind::Chromaticities;
+	return metadata;
+}
 
 PngImage load_png_rgb(const std::filesystem::path& path) {
 	FILE* file = std::fopen(path.c_str(), "rb");
@@ -129,6 +330,17 @@ PngImage load_png_rgb(const std::filesystem::path& path) {
 	}
 	png_read_image(png, allocations->rows);
 	png_read_end(png, info);
+	PngColorMetadata colorMetadata;
+	try {
+		colorMetadata = read_png_color_metadata(png, info);
+	} catch (...) {
+		std::free(allocations->rows);
+		std::free(allocations->pixels);
+		std::free(allocations);
+		png_destroy_read_struct(&png, &info, nullptr);
+		std::fclose(file);
+		throw;
+	}
 	png_destroy_read_struct(&png, &info, nullptr);
 	std::fclose(file);
 	std::free(allocations->rows);
@@ -148,6 +360,32 @@ PngImage load_png_rgb(const std::filesystem::path& path) {
 	}
 	std::free(allocations->pixels);
 	std::free(allocations);
+	if (colorMetadata.kind == PngColorKind::Cicp) {
+		if (image.sixteenBit) {
+			image.rgb16.color = colorMetadata.cicp;
+			image.rgb16.nominalPeakNits = colorMetadata.nominalPeakNits;
+		} else {
+			image.rgb8.color = colorMetadata.cicp;
+			image.rgb8.nominalPeakNits = colorMetadata.nominalPeakNits;
+		}
+	} else if (colorMetadata.kind == PngColorKind::Icc || colorMetadata.kind == PngColorKind::Chromaticities) {
+		cmsHPROFILE sourceProfile = colorMetadata.kind == PngColorKind::Icc
+			? cmsOpenProfileFromMem(colorMetadata.icc.data(), static_cast<cmsUInt32Number>(colorMetadata.icc.size()))
+			: create_png_chromaticity_profile(colorMetadata);
+		if (!sourceProfile) throw std::runtime_error("LittleCMS rejected the embedded PNG ICC profile");
+		try {
+			Rgb16Image converted = image.sixteenBit
+				? convert_to_linear_bt2020(image.rgb16.width, image.rgb16.height, image.rgb16.rgb.data(), TYPE_RGB_16, sourceProfile)
+				: convert_to_linear_bt2020(image.rgb8.width, image.rgb8.height, image.rgb8.rgb.data(), TYPE_RGB_8, sourceProfile);
+			cmsCloseProfile(sourceProfile);
+			image.sixteenBit = true;
+			image.rgb16 = std::move(converted);
+			image.rgb8 = {};
+		} catch (...) {
+			cmsCloseProfile(sourceProfile);
+			throw;
+		}
+	}
 	return image;
 }
 
@@ -159,7 +397,44 @@ bool has_extension(const std::filesystem::path& path, const std::string& extensi
 	return ext == extension;
 }
 
-RgbImage load_jpeg_rgb(const std::filesystem::path& path) {
+std::vector<unsigned char> jpeg_icc_profile(const jpeg_decompress_struct& cinfo) {
+	constexpr unsigned char signature[] = {'I', 'C', 'C', '_', 'P', 'R', 'O', 'F', 'I', 'L', 'E', '\0'};
+	unsigned int chunkCount = 0;
+	std::vector<const jpeg_marker_struct*> chunks;
+	for (jpeg_saved_marker_ptr marker = cinfo.marker_list; marker != nullptr; marker = marker->next) {
+		if (marker->marker != JPEG_APP0 + 2 || marker->data_length < sizeof(signature) + 2 ||
+		    std::memcmp(marker->data, signature, sizeof(signature)) != 0) {
+			continue;
+		}
+		const unsigned int sequence = marker->data[sizeof(signature)];
+		const unsigned int total = marker->data[sizeof(signature) + 1];
+		if (sequence == 0 || total == 0 || sequence > total) throw std::runtime_error("JPEG contains malformed ICC profile chunks");
+		if (chunkCount == 0) {
+			chunkCount = total;
+			chunks.resize(total, nullptr);
+		} else if (chunkCount != total) {
+			throw std::runtime_error("JPEG ICC profile chunks disagree on their total count");
+		}
+		if (chunks[sequence - 1] != nullptr) throw std::runtime_error("JPEG contains duplicate ICC profile chunks");
+		chunks[sequence - 1] = marker;
+	}
+	if (chunkCount == 0) return {};
+	std::size_t totalSize = 0;
+	for (const jpeg_marker_struct* marker : chunks) {
+		if (marker == nullptr) throw std::runtime_error("JPEG ICC profile is missing a chunk");
+		totalSize += marker->data_length - sizeof(signature) - 2;
+	}
+	std::vector<unsigned char> profile;
+	profile.reserve(totalSize);
+	for (const jpeg_marker_struct* marker : chunks) {
+		const unsigned char* first = marker->data + sizeof(signature) + 2;
+		const unsigned char* last = marker->data + marker->data_length;
+		profile.insert(profile.end(), first, last);
+	}
+	return profile;
+}
+
+std::variant<RgbImage, Rgb16Image> load_jpeg_rgb(const std::filesystem::path& path) {
 	const std::vector<unsigned char> bytes = read_file_bytes(path);
 	if (bytes.empty()) {
 		throw std::runtime_error("empty JPEG file: " + path.string());
@@ -177,8 +452,16 @@ RgbImage load_jpeg_rgb(const std::filesystem::path& path) {
 
 	jpeg_create_decompress(&cinfo);
 	jpeg_mem_src(&cinfo, bytes.data(), static_cast<unsigned long>(bytes.size()));
+	jpeg_save_markers(&cinfo, JPEG_APP0 + 2, 0xFFFF);
 	if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
 		throw std::runtime_error("not a JPEG image: " + path.string());
+	}
+	std::vector<unsigned char> icc;
+	try {
+		icc = jpeg_icc_profile(cinfo);
+	} catch (...) {
+		jpeg_destroy_decompress(&cinfo);
+		throw;
 	}
 
 	cinfo.out_color_space = JCS_RGB;
@@ -205,6 +488,18 @@ RgbImage load_jpeg_rgb(const std::filesystem::path& path) {
 
 	jpeg_finish_decompress(&cinfo);
 	jpeg_destroy_decompress(&cinfo);
+	if (!icc.empty()) {
+		cmsHPROFILE sourceProfile = cmsOpenProfileFromMem(icc.data(), static_cast<cmsUInt32Number>(icc.size()));
+		if (!sourceProfile) throw std::runtime_error("LittleCMS rejected the embedded JPEG ICC profile");
+		try {
+			Rgb16Image converted = convert_to_linear_bt2020(image.width, image.height, image.rgb.data(), TYPE_RGB_8, sourceProfile);
+			cmsCloseProfile(sourceProfile);
+			return converted;
+		} catch (...) {
+			cmsCloseProfile(sourceProfile);
+			throw;
+		}
+	}
 	return image;
 }
 
@@ -265,7 +560,8 @@ RawImage rgb8_to_planar_source(const RgbImage& rgb) {
 	image.width = rgb.width;
 	image.height = rgb.height;
 	image.format = PixelFormat::RGBP8;
-	image.color = {ColorPrimaries::BT709, TransferCharacteristics::SRGB, MatrixCoefficients::Identity, ColorRange::Full, std::nullopt};
+	image.color = rgb.color;
+	image.nominalPeakNits = rgb.nominalPeakNits;
 	for (ImagePlane& plane : image.planes) {
 		plane.strideBytes = image.width;
 		plane.bytes.resize(static_cast<std::size_t>(image.width) * image.height);
@@ -286,7 +582,8 @@ RawImage rgb16_to_planar_source(const Rgb16Image& rgb, int sourceBitDepth) {
 	image.width = rgb.width;
 	image.height = rgb.height;
 	image.format = sourceBitDepth == 14 ? PixelFormat::RGBP14LE : PixelFormat::RGBP16LE;
-	image.color = {ColorPrimaries::BT709, TransferCharacteristics::SRGB, MatrixCoefficients::Identity, ColorRange::Full, std::nullopt};
+	image.color = rgb.color;
+	image.nominalPeakNits = rgb.nominalPeakNits;
 	for (ImagePlane& plane : image.planes) {
 		plane.strideBytes = image.width * 2;
 		plane.bytes.resize(static_cast<std::size_t>(image.width) * image.height * 2);
@@ -335,7 +632,9 @@ RawImage load_input_image(const std::filesystem::path& path) {
 			: rgb8_to_planar_source(png.rgb8);
 	}
 	if (has_extension(path, ".jpg") || has_extension(path, ".jpeg")) {
-		return rgb8_to_planar_source(load_jpeg_rgb(path));
+		std::variant<RgbImage, Rgb16Image> jpeg = load_jpeg_rgb(path);
+		if (const auto* rgb8 = std::get_if<RgbImage>(&jpeg)) return rgb8_to_planar_source(*rgb8);
+		return rgb16_to_planar_source(std::get<Rgb16Image>(jpeg), 16);
 	}
 	throw std::runtime_error("unsupported input format: " + path.string());
 }

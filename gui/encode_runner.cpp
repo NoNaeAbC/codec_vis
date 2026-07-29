@@ -171,6 +171,7 @@ void EncodeRunner::run_decode_worker() {
 			if (preview.image) {
 				auto decoded = std::make_shared<RawImage>(*preview.image);
 				decoded->color = job.encode.comparisonReference->color;
+				decoded->nominalPeakNits = job.encode.comparisonReference->nominalPeakNits;
 				preview.image = std::move(decoded);
 				const auto metricStart = std::chrono::steady_clock::now();
 				MetricResult metric = compute_quality_metrics(*job.encode.comparisonReference, *preview.image);

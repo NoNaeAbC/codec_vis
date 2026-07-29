@@ -180,6 +180,9 @@ namespace codec_gui {
 		int         height = 0;
 		PixelFormat format = PixelFormat::YUV420P8;
 		ColorDescription color;
+		// HLG requires the nominal display peak to invert its system OOTF. This
+		// is image interpretation context, not an H.273 color-description field.
+		std::optional<double> nominalPeakNits;
 		ImagePlane  planes[3];
 	};
 

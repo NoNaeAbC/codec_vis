@@ -54,6 +54,19 @@ void matrix_coefficients(const MatrixCoefficients matrix, double& kr, double& kb
 	kb = 0.0722;
 }
 
+void primaries_luma_coefficients(const ColorPrimaries primaries, double& kr, double& kb) {
+	if (primaries == ColorPrimaries::BT2020) {
+		kr = 0.2627;
+		kb = 0.0593;
+	} else if (primaries == ColorPrimaries::DisplayP3) {
+		kr = 0.2289746;
+		kb = 0.0792869;
+	} else {
+		kr = 0.2126;
+		kb = 0.0722;
+	}
+}
+
 double transfer_to_linear(double value, TransferCharacteristics transfer) {
 	value = std::clamp(value, 0.0, 1.0);
 	if (transfer == TransferCharacteristics::Linear) {
@@ -74,6 +87,8 @@ double transfer_to_linear(double value, TransferCharacteristics transfer) {
 	if (transfer == TransferCharacteristics::SRGB) {
 		return value <= 0.04045 ? value / 12.92 : std::pow((value + 0.055) / 1.055, 2.4);
 	}
+	if (transfer == TransferCharacteristics::Gamma22) return std::pow(value, 2.2);
+	if (transfer == TransferCharacteristics::Gamma28) return std::pow(value, 2.8);
 	return value < 0.081 ? value / 4.5 : std::pow((value + 0.099) / 1.099, 1.0 / 0.45);
 }
 
@@ -98,6 +113,8 @@ double linear_to_transfer(double value, TransferCharacteristics transfer) {
 		return value <= 1.0 / 12.0 ? std::sqrt(3.0 * value) : 0.17883277 * std::log(12.0 * value - 0.28466892) + 0.55991073;
 	}
 	if (transfer == TransferCharacteristics::SRGB) return linear_to_srgb(value);
+	if (transfer == TransferCharacteristics::Gamma22) return std::pow(value, 1.0 / 2.2);
+	if (transfer == TransferCharacteristics::Gamma28) return std::pow(value, 1.0 / 2.8);
 	return value < 0.018 ? 4.5 * value : 1.099 * std::pow(value, 0.45) - 0.099;
 }
 
@@ -147,12 +164,95 @@ bool wider_than_bt709(ColorPrimaries primaries) {
 	return primaries == ColorPrimaries::BT2020 || primaries == ColorPrimaries::DisplayP3;
 }
 
-double tonemap_linear(double value, TransferCharacteristics transfer) {
-	value = std::max(0.0, value);
-	if (transfer == TransferCharacteristics::PQ || transfer == TransferCharacteristics::HLG) {
-		return value / (1.0 + value);
+constexpr double SDR_REFERENCE_WHITE_NITS = 203.0;
+constexpr double PQ_MAX_NITS = 10000.0;
+
+double hlg_system_gamma(double peakNits) {
+	return std::clamp(1.2 + 0.42 * std::log10(std::max(peakNits, 1.0) / 1000.0), 1.0, 1.5);
+}
+
+Rgb signal_rgb_to_nits(
+	Rgb signal,
+	TransferCharacteristics transfer,
+	double kr,
+	double kb,
+	double hlgPeakNits
+) {
+	if (transfer != TransferCharacteristics::HLG) {
+		const double scale = transfer == TransferCharacteristics::PQ ? PQ_MAX_NITS : SDR_REFERENCE_WHITE_NITS;
+		return {
+			transfer_to_linear(signal.r, transfer) * scale,
+			transfer_to_linear(signal.g, transfer) * scale,
+			transfer_to_linear(signal.b, transfer) * scale,
+		};
 	}
-	return value;
+	const Rgb scene{
+		transfer_to_linear(signal.r, transfer),
+		transfer_to_linear(signal.g, transfer),
+		transfer_to_linear(signal.b, transfer),
+	};
+	const double kg = 1.0 - kr - kb;
+	const double sceneLuma = std::max(0.0, kr * scene.r + kg * scene.g + kb * scene.b);
+	if (sceneLuma == 0.0) return {};
+	const double scale = hlgPeakNits * std::pow(sceneLuma, hlg_system_gamma(hlgPeakNits) - 1.0);
+	return {scene.r * scale, scene.g * scale, scene.b * scale};
+}
+
+Rgb nits_rgb_to_signal(
+	Rgb nits,
+	TransferCharacteristics transfer,
+	double kr,
+	double kb,
+	double hlgPeakNits
+) {
+	if (transfer != TransferCharacteristics::HLG) {
+		const double scale = transfer == TransferCharacteristics::PQ ? PQ_MAX_NITS : SDR_REFERENCE_WHITE_NITS;
+		return {
+			linear_to_transfer(nits.r / scale, transfer),
+			linear_to_transfer(nits.g / scale, transfer),
+			linear_to_transfer(nits.b / scale, transfer),
+		};
+	}
+	const double kg = 1.0 - kr - kb;
+	const double displayLuma = std::max(0.0, kr * nits.r + kg * nits.g + kb * nits.b);
+	if (displayLuma == 0.0) return {};
+	const double sceneLuma = std::pow(displayLuma / hlgPeakNits, 1.0 / hlg_system_gamma(hlgPeakNits));
+	const double scale = hlgPeakNits * std::pow(sceneLuma, hlg_system_gamma(hlgPeakNits) - 1.0);
+	return {
+		linear_to_transfer(nits.r / scale, transfer),
+		linear_to_transfer(nits.g / scale, transfer),
+		linear_to_transfer(nits.b / scale, transfer),
+	};
+}
+
+double rgb_sample_to_signal(const RawImage& image, uint32_t sample) {
+	const int depth = bit_depth(image.format);
+	if (image.color.range == ColorRange::Full) {
+		return static_cast<double>(sample) / max_sample_value(image.format);
+	}
+	const double scale = static_cast<double>(1u << (depth - 8));
+	return std::clamp((static_cast<double>(sample) - 16.0 * scale) / (219.0 * scale), 0.0, 1.0);
+}
+
+Rgb display_srgb(const RawImage& image, Rgb signal) {
+	if (image.color.transfer == TransferCharacteristics::Unspecified ||
+	    image.color.primaries == ColorPrimaries::Unspecified) {
+		return signal;
+	}
+	double kr = 0.2126;
+	double kb = 0.0722;
+	primaries_luma_coefficients(image.color.primaries, kr, kb);
+	const double hlgPeak = image.nominalPeakNits.value_or(1000.0);
+	Rgb nits = signal_rgb_to_nits(signal, image.color.transfer, kr, kb, hlgPeak);
+	nits = multiply(
+		xyz_to_rgb_matrix(ColorPrimaries::BT709),
+		multiply(rgb_to_xyz_matrix(image.color.primaries), nits)
+	);
+	return {
+		linear_to_srgb(nits.r / SDR_REFERENCE_WHITE_NITS),
+		linear_to_srgb(nits.g / SDR_REFERENCE_WHITE_NITS),
+		linear_to_srgb(nits.b / SDR_REFERENCE_WHITE_NITS),
+	};
 }
 
 void yuv_sample_to_rgb(
@@ -175,17 +275,10 @@ void yuv_sample_to_rgb(
 	r = yFull + (2.0 - 2.0 * kr) * crFull;
 	b = yFull + (2.0 - 2.0 * kb) * cbFull;
 	g = (yFull - kr * r - kb * b) / kg;
-	if (image.color.transfer == TransferCharacteristics::Unspecified) {
-		// Preserve the coded R'G'B' values. Guessing a transfer function here would
-		// silently change an image whose interpretation is explicitly unknown.
-		r *= 255.0;
-		g *= 255.0;
-		b *= 255.0;
-	} else {
-		r = linear_to_srgb(tonemap_linear(transfer_to_linear(r, image.color.transfer), image.color.transfer)) * 255.0;
-		g = linear_to_srgb(tonemap_linear(transfer_to_linear(g, image.color.transfer), image.color.transfer)) * 255.0;
-		b = linear_to_srgb(tonemap_linear(transfer_to_linear(b, image.color.transfer), image.color.transfer)) * 255.0;
-	}
+	const Rgb display = display_srgb(image, {r, g, b});
+	r = display.r * 255.0;
+	g = display.g * 255.0;
+	b = display.b * 255.0;
 }
 
 uint32_t source_sample(const RawImage& image, int plane, int x, int y) {
@@ -217,13 +310,20 @@ std::vector<uint8_t> raw_image_to_rgba8(const RawImage& image) {
 		case PixelFormat::RGBP14LE:
 		case PixelFormat::RGBP16LE: {
 			const int sampleBytes = bytes_per_sample(image.format);
-			const double scale = 255.0 / max_sample_value(image.format);
 			for (int y = 0; y < image.height; ++y) {
 				for (int x = 0; x < image.width; ++x) {
-					const uint8_t r = clamp_byte(sample_or_default(image.planes[0], x, y, sampleBytes, 0) * scale);
-					const uint8_t g = clamp_byte(sample_or_default(image.planes[1], x, y, sampleBytes, 0) * scale);
-					const uint8_t b = clamp_byte(sample_or_default(image.planes[2], x, y, sampleBytes, 0) * scale);
-					store(x, y, r, g, b);
+					const Rgb display = display_srgb(image, {
+						rgb_sample_to_signal(image, sample_or_default(image.planes[0], x, y, sampleBytes, 0)),
+						rgb_sample_to_signal(image, sample_or_default(image.planes[1], x, y, sampleBytes, 0)),
+						rgb_sample_to_signal(image, sample_or_default(image.planes[2], x, y, sampleBytes, 0)),
+					});
+					store(
+						x,
+						y,
+						clamp_byte(display.r * 255.0),
+						clamp_byte(display.g * 255.0),
+						clamp_byte(display.b * 255.0)
+					);
 				}
 			}
 			break;
@@ -304,6 +404,7 @@ RawImage convert_raw_image_format(const RawImage& image, PixelFormat targetForma
 	out.height = image.height;
 	out.format = targetFormat;
 	out.color = image.color;
+	out.nominalPeakNits = image.nominalPeakNits;
 	const int sourceDepth = bit_depth(image.format);
 	const int targetDepth = bit_depth(targetFormat);
 	const uint32_t sourceMaximum = (1u << sourceDepth) - 1u;
@@ -361,7 +462,8 @@ RawImage transform_raw_image(const RawImage& image, PixelFormat targetFormat, co
 	    image.color.primaries == options.target.primaries &&
 	    image.color.transfer == options.target.transfer &&
 	    image.color.matrix == options.target.matrix &&
-	    image.color.range == options.target.range) {
+	    image.color.range == options.target.range &&
+	    options.toneMap == ToneMapMode::None) {
 		RawImage out = convert_raw_image_format(image, targetFormat);
 		out.color.chroma420Location = options.target.chroma420Location;
 		return out;
@@ -394,6 +496,17 @@ RawImage transform_raw_image(const RawImage& image, PixelFormat targetFormat, co
 	out.height = image.height;
 	out.format = targetFormat;
 	out.color = options.target;
+	const bool sameLightEncoding =
+		image.color.primaries == options.target.primaries &&
+		image.color.transfer == options.target.transfer &&
+		options.toneMap == ToneMapMode::None;
+	if (out.color.transfer == TransferCharacteristics::HLG) {
+		out.nominalPeakNits = sameLightEncoding
+			? image.nominalPeakNits.value_or(options.sourcePeakNits)
+			: options.targetPeakNits;
+	} else {
+		out.nominalPeakNits.reset();
+	}
 	const int targetDepth = bit_depth(targetFormat);
 	const int targetBps = bytes_per_sample(targetFormat);
 	const uint32_t targetMaximum = (1u << targetDepth) - 1u;
@@ -419,10 +532,16 @@ RawImage transform_raw_image(const RawImage& image, PixelFormat targetFormat, co
 	matrix_coefficients(options.target.matrix, targetKr, targetKb);
 	const double sourceKg = 1.0 - sourceKr - sourceKb;
 	const double targetKg = 1.0 - targetKr - targetKb;
+	double sourceLumaKr = 0.0;
+	double sourceLumaKb = 0.0;
+	double targetLumaKr = 0.0;
+	double targetLumaKb = 0.0;
+	primaries_luma_coefficients(image.color.primaries, sourceLumaKr, sourceLumaKb);
+	primaries_luma_coefficients(options.target.primaries, targetLumaKr, targetLumaKb);
 	const int sourceBps = bytes_per_sample(image.format);
 	const uint32_t neutral = 1u << (bit_depth(image.format) - 1);
-	const double sourceWhiteNits = is_hdr(image.color.transfer) ? options.sourcePeakNits : 203.0;
-	const double targetWhiteNits = is_hdr(options.target.transfer) ? options.targetPeakNits : 203.0;
+	const double sourceHlgPeak = image.nominalPeakNits.value_or(options.sourcePeakNits);
+	const double targetHlgPeak = options.targetPeakNits;
 
 	for (int y = 0; y < out.height; ++y) {
 		for (int x = 0; x < out.width; ++x) {
@@ -430,10 +549,9 @@ RawImage transform_raw_image(const RawImage& image, PixelFormat targetFormat, co
 			double gp = 0.0;
 			double bp = 0.0;
 			if (is_rgb(image.format)) {
-				const double maximum = max_sample_value(image.format);
-				rp = sample_or_default(image.planes[0], x, y, sourceBps, 0) / maximum;
-				gp = sample_or_default(image.planes[1], x, y, sourceBps, 0) / maximum;
-				bp = sample_or_default(image.planes[2], x, y, sourceBps, 0) / maximum;
+				rp = rgb_sample_to_signal(image, sample_or_default(image.planes[0], x, y, sourceBps, 0));
+				gp = rgb_sample_to_signal(image, sample_or_default(image.planes[1], x, y, sourceBps, 0));
+				bp = rgb_sample_to_signal(image, sample_or_default(image.planes[2], x, y, sourceBps, 0));
 			} else if (is_gray(image.format)) {
 				const uint32_t yy = source_sample(image, 0, x, y);
 				rp = gp = bp = std::clamp((static_cast<double>(yy) - sourceScale.yOffset) / sourceScale.yScale, 0.0, 1.0);
@@ -448,24 +566,31 @@ RawImage transform_raw_image(const RawImage& image, PixelFormat targetFormat, co
 				bp = yp + (2.0 - 2.0 * sourceKb) * cb;
 				gp = (yp - sourceKr * rp - sourceKb * bp) / sourceKg;
 			}
-			Rgb linear{
-				transfer_to_linear(rp, image.color.transfer) * sourceWhiteNits,
-				transfer_to_linear(gp, image.color.transfer) * sourceWhiteNits,
-				transfer_to_linear(bp, image.color.transfer) * sourceWhiteNits,
-			};
-			linear = multiply(xyz_to_rgb_matrix(options.target.primaries), multiply(rgb_to_xyz_matrix(image.color.primaries), linear));
-			if (options.toneMap != ToneMapMode::None) {
-				auto map = [&](double value) {
-					const double normalized = std::max(0.0, value / options.targetPeakNits);
-					return options.targetPeakNits * (options.toneMap == ToneMapMode::Clip ? std::min(1.0, normalized) : normalized / (1.0 + normalized));
-				};
-				linear = {map(linear.r), map(linear.g), map(linear.b)};
+			Rgb signal{rp, gp, bp};
+			if (!sameLightEncoding) {
+				Rgb linear = signal_rgb_to_nits(
+					signal,
+					image.color.transfer,
+					sourceLumaKr,
+					sourceLumaKb,
+					sourceHlgPeak
+				);
+				linear = multiply(xyz_to_rgb_matrix(options.target.primaries), multiply(rgb_to_xyz_matrix(image.color.primaries), linear));
+				if (options.toneMap != ToneMapMode::None) {
+					auto map = [&](double value) {
+						const double normalized = std::max(0.0, value / options.targetPeakNits);
+						return options.targetPeakNits * (options.toneMap == ToneMapMode::Clip ? std::min(1.0, normalized) : normalized / (1.0 + normalized));
+					};
+					linear = {map(linear.r), map(linear.g), map(linear.b)};
+				}
+				signal = nits_rgb_to_signal(
+					linear,
+					options.target.transfer,
+					targetLumaKr,
+					targetLumaKb,
+					targetHlgPeak
+				);
 			}
-			const Rgb signal{
-				linear_to_transfer(linear.r / targetWhiteNits, options.target.transfer),
-				linear_to_transfer(linear.g / targetWhiteNits, options.target.transfer),
-				linear_to_transfer(linear.b / targetWhiteNits, options.target.transfer),
-			};
 			const double yp = targetKr * signal.r + targetKg * signal.g + targetKb * signal.b;
 			const std::size_t index = static_cast<std::size_t>(y) * out.width + x;
 			targetY[index] = targetScale.yOffset + yp * targetScale.yScale;

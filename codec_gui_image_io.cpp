@@ -18,6 +18,8 @@
 
 #include <libraw/libraw.h>
 #include <lcms2.h>
+#include <jxl/cms.h>
+#include <jxl/decode.h>
 
 extern "C" {
 #include <jpeglib.h>
@@ -179,8 +181,10 @@ Rgb16Image convert_to_linear_bt2020(
 	cmsUInt32Number inputFormat,
 	cmsHPROFILE inputProfile
 ) {
-	if (!inputProfile || cmsGetColorSpace(inputProfile) != cmsSigRgbData) {
-		throw std::runtime_error("embedded input ICC profile is not an RGB profile");
+	if (!inputProfile ||
+	    (cmsGetColorSpace(inputProfile) != cmsSigRgbData &&
+	     cmsGetColorSpace(inputProfile) != cmsSigGrayData)) {
+		throw std::runtime_error("embedded input ICC profile is not an RGB or grayscale profile");
 	}
 	const std::size_t pixelCount = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
 	if (pixelCount > std::numeric_limits<cmsUInt32Number>::max()) {
@@ -503,6 +507,233 @@ std::variant<RgbImage, Rgb16Image> load_jpeg_rgb(const std::filesystem::path& pa
 	return image;
 }
 
+std::optional<ColorDescription> jxl_structured_color(const JxlColorEncoding& encoding) {
+	if (encoding.color_space != JXL_COLOR_SPACE_RGB && encoding.color_space != JXL_COLOR_SPACE_GRAY) {
+		return std::nullopt;
+	}
+	if (encoding.white_point != JXL_WHITE_POINT_D65) return std::nullopt;
+
+	ColorDescription color;
+	color.matrix = MatrixCoefficients::Identity;
+	color.range = ColorRange::Full;
+	if (encoding.color_space == JXL_COLOR_SPACE_GRAY || encoding.primaries == JXL_PRIMARIES_SRGB) {
+		color.primaries = ColorPrimaries::BT709;
+	} else if (encoding.primaries == JXL_PRIMARIES_2100) {
+		color.primaries = ColorPrimaries::BT2020;
+	} else if (encoding.primaries == JXL_PRIMARIES_P3) {
+		color.primaries = ColorPrimaries::DisplayP3;
+	} else {
+		return std::nullopt;
+	}
+
+	switch (encoding.transfer_function) {
+		case JXL_TRANSFER_FUNCTION_709: color.transfer = TransferCharacteristics::BT709; break;
+		case JXL_TRANSFER_FUNCTION_LINEAR: color.transfer = TransferCharacteristics::Linear; break;
+		case JXL_TRANSFER_FUNCTION_SRGB: color.transfer = TransferCharacteristics::SRGB; break;
+		case JXL_TRANSFER_FUNCTION_PQ: color.transfer = TransferCharacteristics::PQ; break;
+		case JXL_TRANSFER_FUNCTION_HLG: color.transfer = TransferCharacteristics::HLG; break;
+		default: return std::nullopt;
+	}
+	return color;
+}
+
+std::variant<RgbImage, Rgb16Image> load_jxl_rgb(const std::filesystem::path& path) {
+	const std::vector<unsigned char> bytes = read_file_bytes(path);
+	if (bytes.empty()) throw std::runtime_error("empty JPEG XL file: " + path.string());
+
+	std::unique_ptr<JxlDecoder, decltype(&JxlDecoderDestroy)> decoder{
+		JxlDecoderCreate(nullptr),
+		JxlDecoderDestroy,
+	};
+	if (!decoder) throw std::runtime_error("JxlDecoderCreate failed");
+	if (const JxlCmsInterface* cms = JxlGetDefaultCms()) {
+		if (JxlDecoderSetCms(decoder.get(), *cms) != JXL_DEC_SUCCESS) {
+			throw std::runtime_error("JPEG XL decoder rejected its default color-management system");
+		}
+	}
+	if (JxlDecoderSubscribeEvents(
+		    decoder.get(),
+		    JXL_DEC_BASIC_INFO | JXL_DEC_COLOR_ENCODING | JXL_DEC_FULL_IMAGE
+	    ) != JXL_DEC_SUCCESS) {
+		throw std::runtime_error("JxlDecoderSubscribeEvents failed");
+	}
+	if (JxlDecoderSetInput(decoder.get(), bytes.data(), bytes.size()) != JXL_DEC_SUCCESS) {
+		throw std::runtime_error("JxlDecoderSetInput failed");
+	}
+	JxlDecoderCloseInput(decoder.get());
+
+	JxlBasicInfo basic{};
+	JxlPixelFormat format{3, JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 0};
+	ColorDescription color;
+	std::vector<unsigned char> icc;
+	std::vector<unsigned char> pixels;
+	bool haveBasicInfo = false;
+	bool haveColor = false;
+	bool useIcc = false;
+
+	for (;;) {
+		const JxlDecoderStatus status = JxlDecoderProcessInput(decoder.get());
+		if (status == JXL_DEC_BASIC_INFO) {
+			if (JxlDecoderGetBasicInfo(decoder.get(), &basic) != JXL_DEC_SUCCESS) {
+				throw std::runtime_error("JxlDecoderGetBasicInfo failed");
+			}
+			if (basic.xsize == 0 || basic.ysize == 0 ||
+			    basic.xsize > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+			    basic.ysize > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+				throw std::runtime_error("JPEG XL dimensions are invalid or too large");
+			}
+			if (basic.num_color_channels != 1 && basic.num_color_channels != 3) {
+				throw std::runtime_error("JPEG XL input must use RGB or grayscale color channels");
+			}
+			if (basic.exponent_bits_per_sample != 0 || basic.bits_per_sample == 0 || basic.bits_per_sample > 16) {
+				throw std::runtime_error(
+					"JPEG XL import currently supports 1- to 16-bit integer samples; got " +
+					std::to_string(basic.bits_per_sample) + "-bit with " +
+					std::to_string(basic.exponent_bits_per_sample) + " exponent bits"
+				);
+			}
+			format.num_channels = basic.num_color_channels;
+			format.data_type = basic.bits_per_sample <= 8 ? JXL_TYPE_UINT8 : JXL_TYPE_UINT16;
+			haveBasicInfo = true;
+		} else if (status == JXL_DEC_COLOR_ENCODING) {
+			if (!haveBasicInfo) throw std::runtime_error("JPEG XL reported color metadata before basic image information");
+			JxlColorEncoding encoding{};
+			if (JxlDecoderGetColorAsEncodedProfile(
+				    decoder.get(),
+				    JXL_COLOR_PROFILE_TARGET_ORIGINAL,
+				    &encoding
+			    ) == JXL_DEC_SUCCESS) {
+				const std::optional<ColorDescription> mapped = jxl_structured_color(encoding);
+				if (mapped) {
+					color = *mapped;
+					if (basic.uses_original_profile == JXL_FALSE &&
+					    JxlDecoderSetPreferredColorProfile(decoder.get(), &encoding) != JXL_DEC_SUCCESS) {
+						throw std::runtime_error("JPEG XL decoder could not preserve the structured source color profile");
+					}
+				} else {
+					if (encoding.transfer_function == JXL_TRANSFER_FUNCTION_PQ ||
+					    encoding.transfer_function == JXL_TRANSFER_FUNCTION_HLG) {
+						throw std::runtime_error(
+							"JPEG XL HDR import requires D65 BT.2020, Display P3, or BT.709 primaries"
+						);
+					}
+					useIcc = true;
+				}
+			} else {
+				useIcc = true;
+			}
+			if (useIcc) {
+				size_t profileSize = 0;
+				if (JxlDecoderGetICCProfileSize(
+					    decoder.get(),
+					    JXL_COLOR_PROFILE_TARGET_ORIGINAL,
+					    &profileSize
+				    ) != JXL_DEC_SUCCESS || profileSize == 0) {
+					throw std::runtime_error("JPEG XL source color profile is unsupported and has no usable ICC representation");
+				}
+				if (profileSize > std::numeric_limits<cmsUInt32Number>::max()) {
+					throw std::runtime_error("JPEG XL ICC profile is too large for LittleCMS");
+				}
+				icc.resize(profileSize);
+				if (JxlDecoderGetColorAsICCProfile(
+					    decoder.get(),
+					    JXL_COLOR_PROFILE_TARGET_ORIGINAL,
+					    icc.data(),
+					    icc.size()
+				    ) != JXL_DEC_SUCCESS) {
+					throw std::runtime_error("JPEG XL decoder could not read the embedded ICC profile");
+				}
+				if (JxlDecoderSetOutputColorProfile(
+					    decoder.get(),
+					    nullptr,
+					    icc.data(),
+					    icc.size()
+				    ) != JXL_DEC_SUCCESS) {
+					throw std::runtime_error("JPEG XL decoder could not preserve the embedded ICC output profile");
+				}
+			}
+			haveColor = true;
+		} else if (status == JXL_DEC_NEED_IMAGE_OUT_BUFFER) {
+			if (!haveBasicInfo || !haveColor) {
+				throw std::runtime_error("JPEG XL requested an output buffer before reporting image color metadata");
+			}
+			size_t outputSize = 0;
+			if (JxlDecoderImageOutBufferSize(decoder.get(), &format, &outputSize) != JXL_DEC_SUCCESS) {
+				throw std::runtime_error("JxlDecoderImageOutBufferSize failed");
+			}
+			pixels.resize(outputSize);
+			if (JxlDecoderSetImageOutBuffer(decoder.get(), &format, pixels.data(), pixels.size()) != JXL_DEC_SUCCESS) {
+				throw std::runtime_error("JxlDecoderSetImageOutBuffer failed");
+			}
+		} else if (status == JXL_DEC_FULL_IMAGE) {
+			if (pixels.empty() || !haveBasicInfo || !haveColor) {
+				throw std::runtime_error("JPEG XL decoder produced no complete image");
+			}
+			const int width = static_cast<int>(basic.xsize);
+			const int height = static_cast<int>(basic.ysize);
+			const std::size_t pixelCount = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+			const unsigned int channels = basic.num_color_channels;
+			if (useIcc) {
+				cmsHPROFILE profile = cmsOpenProfileFromMem(icc.data(), static_cast<cmsUInt32Number>(icc.size()));
+				if (!profile) throw std::runtime_error("LittleCMS rejected the JPEG XL ICC profile");
+				try {
+					const cmsUInt32Number inputFormat = channels == 1
+						? (basic.bits_per_sample <= 8 ? TYPE_GRAY_8 : TYPE_GRAY_16)
+						: (basic.bits_per_sample <= 8 ? TYPE_RGB_8 : TYPE_RGB_16);
+					Rgb16Image converted =
+						convert_to_linear_bt2020(width, height, pixels.data(), inputFormat, profile);
+					cmsCloseProfile(profile);
+					return converted;
+				} catch (...) {
+					cmsCloseProfile(profile);
+					throw;
+				}
+			}
+			if (basic.bits_per_sample <= 8) {
+				RgbImage image;
+				image.width = width;
+				image.height = height;
+				image.color = color;
+				image.nominalPeakNits = color.transfer == TransferCharacteristics::HLG
+					? std::optional<double>{basic.intensity_target > 0.0f ? basic.intensity_target : 1000.0}
+					: std::nullopt;
+				image.rgb.resize(pixelCount * 3);
+				for (std::size_t i = 0; i < pixelCount; ++i) {
+					for (unsigned int channel = 0; channel < 3; ++channel) {
+						image.rgb[i * 3 + channel] = pixels[i * channels + (channels == 1 ? 0 : channel)];
+					}
+				}
+				return image;
+			}
+			Rgb16Image image;
+			image.width = width;
+			image.height = height;
+			image.color = color;
+			image.nominalPeakNits = color.transfer == TransferCharacteristics::HLG
+				? std::optional<double>{basic.intensity_target > 0.0f ? basic.intensity_target : 1000.0}
+				: std::nullopt;
+			image.rgb.resize(pixelCount * 3);
+			for (std::size_t i = 0; i < pixelCount; ++i) {
+				for (unsigned int channel = 0; channel < 3; ++channel) {
+					const std::size_t inputIndex = i * channels + (channels == 1 ? 0 : channel);
+					std::memcpy(
+						&image.rgb[i * 3 + channel],
+						pixels.data() + inputIndex * sizeof(unsigned short),
+						sizeof(unsigned short)
+					);
+				}
+			}
+			return image;
+		} else if (status == JXL_DEC_NEED_MORE_INPUT) {
+			throw std::runtime_error("truncated JPEG XL input");
+		} else if (status == JXL_DEC_ERROR) {
+			throw std::runtime_error("JPEG XL decode failed");
+		} else if (status == JXL_DEC_SUCCESS) {
+			throw std::runtime_error("JPEG XL decoder finished without producing an image");
+		}
+	}
+}
+
 void check_libraw(const int rc, const std::string& operation) {
 	if (rc != LIBRAW_SUCCESS) {
 		throw std::runtime_error("LibRaw " + operation + " failed: " + LibRaw::strerror(rc));
@@ -635,6 +866,11 @@ RawImage load_input_image(const std::filesystem::path& path) {
 		std::variant<RgbImage, Rgb16Image> jpeg = load_jpeg_rgb(path);
 		if (const auto* rgb8 = std::get_if<RgbImage>(&jpeg)) return rgb8_to_planar_source(*rgb8);
 		return rgb16_to_planar_source(std::get<Rgb16Image>(jpeg), 16);
+	}
+	if (has_extension(path, ".jxl")) {
+		std::variant<RgbImage, Rgb16Image> jxl = load_jxl_rgb(path);
+		if (const auto* rgb8 = std::get_if<RgbImage>(&jxl)) return rgb8_to_planar_source(*rgb8);
+		return rgb16_to_planar_source(std::get<Rgb16Image>(jxl), 16);
 	}
 	throw std::runtime_error("unsupported input format: " + path.string());
 }

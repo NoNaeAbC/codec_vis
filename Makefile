@@ -16,7 +16,7 @@ export PKG_CONFIG_PATH
 LOCAL_LIBDIR ?= /usr/local/lib
 LOCAL_RUNPATH := -Wl,-rpath,$(LOCAL_LIBDIR)
 
-CODEC_PKGS := x265 libjpeg libraw libvvenc libvvdec uvg266 SvtAv1Enc libva libva-drm avm libde265 dav1d dav2d charls libpng16 libjxl libjxl_threads libopenjp2 x264 libavcodec libavutil libvmaf
+CODEC_PKGS := x265 libjpeg libraw libvvenc libvvdec uvg266 SvtAv1Enc libva libva-drm avm libde265 dav1d dav2d charls libpng16 libjxl libjxl_cms libjxl_threads libopenjp2 x264 libavcodec libavutil libvmaf
 GUI_PKGS := wayland-client vulkan harfbuzz freetype2 fontconfig sdbus-c++ xkbcommon
 XDG_SHELL_XML := $(shell $(PKG_CONFIG) --variable=pkgdatadir wayland-protocols)/stable/xdg-shell/xdg-shell.xml
 FRACTIONAL_SCALE_XML := $(shell $(PKG_CONFIG) --variable=pkgdatadir wayland-protocols)/staging/fractional-scale/fractional-scale-v1.xml

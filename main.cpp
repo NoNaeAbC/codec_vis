@@ -571,7 +571,7 @@ CliOptions parse_cli_options(int argc, char** argv) {
 		const std::string_view argument = argv[index];
 		if (argument == "--help" || argument == "-h") {
 			std::cout
-				<< "Usage: codec_vis_cli [OPTIONS] [INPUT.png|INPUT.jpg|INPUT.jpeg|INPUT.nef]\n"
+				<< "Usage: codec_vis_cli [OPTIONS] [INPUT.png|INPUT.jpg|INPUT.jpeg|INPUT.jxl|INPUT.nef]\n"
 				   "Encode an input image, or a generated pattern when no input is given.\n\n"
 				   "  --vaapi-av1-only            Run only the VA-API AV1 backend\n"
 				   "  --av1-param NAME=VALUE      Pass a backend parameter; repeatable\n"

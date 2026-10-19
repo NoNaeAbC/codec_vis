@@ -1,24 +1,32 @@
 // codec_gui_av2.cpp
 #include "codec_gui_x265.hpp"
+#include "gui/codec_timer.hpp"
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <memory>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 extern "C" {
 #include <avm/avm_codec.h>
 #include <avm/avm_encoder.h>
+#include <avm/avm_decoder.h>
+#include <avm/avmdx.h>
 #include <avm/avm_image.h>
 #include <avm/avmcx.h>
 }
+
+// A weak reference does not pull optional inference code from a static AVM
+// archive. If it is linked, it requires a real TFLite runtime, not our shims.
+extern "C" int av2_part_prune_tflite_exec(void**, const float*, float*, int) __attribute__((weak));
+extern "C" bool codec_vis_avm_tflite_shims_active() __attribute__((weak));
 
 namespace codec_gui {
 namespace {
@@ -29,6 +37,7 @@ struct FormatInfo {
 	int planeCount;
 	int widthDiv[3];
 	int heightDiv[3];
+	// AVM profile IDs differ from the older AV1 profile numbering.
 	unsigned int profile;
 	bool monochrome;
 };
@@ -40,21 +49,21 @@ struct FormatInfo {
 [[nodiscard]] FormatInfo format_info(const PixelFormat format) {
 	switch (format) {
 		case PixelFormat::YUV420P8:
-			return {AVM_IMG_FMT_I420, AVM_BITS_8, 3, {1, 2, 2}, {1, 2, 2}, 0, false};
+			return {.imageFormat=AVM_IMG_FMT_I420, .bitDepth=AVM_BITS_8, .planeCount=3, .widthDiv={1, 2, 2}, .heightDiv={1, 2, 2}, .profile=0, .monochrome=false};
 			case PixelFormat::YUV420P10LE:
-				return {AVM_IMG_FMT_I42016, AVM_BITS_10, 3, {1, 2, 2}, {1, 2, 2}, 0, false};
+				return {.imageFormat=AVM_IMG_FMT_I42016, .bitDepth=AVM_BITS_10, .planeCount=3, .widthDiv={1, 2, 2}, .heightDiv={1, 2, 2}, .profile=0, .monochrome=false};
 			case PixelFormat::YUV422P8:
-				return {AVM_IMG_FMT_I422, AVM_BITS_8, 3, {1, 2, 2}, {1, 1, 1}, 1, false};
+				return {.imageFormat=AVM_IMG_FMT_I422, .bitDepth=AVM_BITS_8, .planeCount=3, .widthDiv={1, 2, 2}, .heightDiv={1, 1, 1}, .profile=3, .monochrome=false};
 			case PixelFormat::YUV422P10LE:
-				return {AVM_IMG_FMT_I42216, AVM_BITS_10, 3, {1, 2, 2}, {1, 1, 1}, 2, false};
+				return {.imageFormat=AVM_IMG_FMT_I42216, .bitDepth=AVM_BITS_10, .planeCount=3, .widthDiv={1, 2, 2}, .heightDiv={1, 1, 1}, .profile=3, .monochrome=false};
 			case PixelFormat::YUV444P8:
-			return {AVM_IMG_FMT_I444, AVM_BITS_8, 3, {1, 1, 1}, {1, 1, 1}, 1, false};
+			return {.imageFormat=AVM_IMG_FMT_I444, .bitDepth=AVM_BITS_8, .planeCount=3, .widthDiv={1, 1, 1}, .heightDiv={1, 1, 1}, .profile=4, .monochrome=false};
 		case PixelFormat::YUV444P10LE:
-			return {AVM_IMG_FMT_I44416, AVM_BITS_10, 3, {1, 1, 1}, {1, 1, 1}, 2, false};
+			return {.imageFormat=AVM_IMG_FMT_I44416, .bitDepth=AVM_BITS_10, .planeCount=3, .widthDiv={1, 1, 1}, .heightDiv={1, 1, 1}, .profile=4, .monochrome=false};
 		case PixelFormat::Gray8:
-			return {AVM_IMG_FMT_I420, AVM_BITS_8, 1, {1, 1, 1}, {1, 1, 1}, 0, true};
+			return {.imageFormat=AVM_IMG_FMT_I420, .bitDepth=AVM_BITS_8, .planeCount=1, .widthDiv={1, 1, 1}, .heightDiv={1, 1, 1}, .profile=0, .monochrome=true};
 		case PixelFormat::Gray10LE:
-			return {AVM_IMG_FMT_I42016, AVM_BITS_10, 1, {1, 1, 1}, {1, 1, 1}, 0, true};
+			return {.imageFormat=AVM_IMG_FMT_I42016, .bitDepth=AVM_BITS_10, .planeCount=1, .widthDiv={1, 1, 1}, .heightDiv={1, 1, 1}, .profile=0, .monochrome=true};
 		case PixelFormat::YUV420P12LE: case PixelFormat::YUV420P14LE:
 		case PixelFormat::YUV422P12LE: case PixelFormat::YUV422P14LE:
 		case PixelFormat::YUV444P12LE: case PixelFormat::YUV444P14LE:
@@ -231,10 +240,17 @@ void append_ivf_frame(std::vector<std::byte>& out, const std::vector<std::byte>&
 
 } // namespace
 
+std::string av2_unavailable_reason() {
+	if (av2_part_prune_tflite_exec != nullptr && codec_vis_avm_tflite_shims_active != nullptr && codec_vis_avm_tflite_shims_active()) {
+		return "AV2 unavailable: linked AVM requires TFLite partition inference, but this application links compatibility shims. Link a real TFLite runtime or rebuild AVM with CONFIG_ML_PART_SPLIT=0.";
+	}
+	return {};
+}
+
 std::vector<EncoderParamInfo> query_av2_parameters() {
 	return {
-		int_param("cpu-used", "CPU used", "Speed / Quality", 9, {0, 9, 1}, "AVM encoder speed level."),
-		int_param("qp", "QP", "Rate Control", 128, {0, 255, 1}, "AV2 quantizer used in constant-quality mode."),
+		int_param("cpu-used", "CPU used", "Speed / Quality", 9, {.min=0, .max=9, .step=1}, "AVM encoder speed level."),
+		int_param("qp", "QP", "Rate Control", 128, {.min=0, .max=255, .step=1}, "AV2 quantizer used in constant-quality mode."),
 		bool_param("lossless", "Lossless", "Rate Control", false, "Enable lossless coding."),
 		bool_param("enable-cdef", "CDEF", "Filters", true, "Enable constrained directional enhancement filtering."),
 		bool_param("enable-restoration", "Loop restoration", "Filters", true, "Enable loop restoration filtering."),
@@ -242,12 +258,13 @@ std::vector<EncoderParamInfo> query_av2_parameters() {
 		bool_param("enable-intrabc", "IntraBC", "Tools", false, "Enable intra block copy screen-content search."),
 		bool_param("enable-rect-partitions", "Rect partitions", "Tools", false, "Enable rectangular partition search."),
 		bool_param("enable-1to4-partitions", "1:4 partitions", "Tools", false, "Enable 1:4 and 4:1 partition search."),
-		int_param("tile-columns", "Tile columns", "Execution", 0, {0, 6, 1}, "Log2 tile column count."),
-		int_param("tile-rows", "Tile rows", "Execution", 0, {0, 6, 1}, "Log2 tile row count."),
+		int_param("tile-columns", "Tile columns", "Execution", 0, {.min=0, .max=6, .step=1}, "Log2 tile column count."),
+		int_param("tile-rows", "Tile rows", "Execution", 0, {.min=0, .max=6, .step=1}, "Log2 tile row count."),
 	};
 }
 
 EncodedImage encode_av2_still_image(const RawImage& image, std::span<const EncoderParam> params) {
+	if (const std::string error = av2_unavailable_reason(); !error.empty()) throw std::runtime_error(error);
 	const FormatInfo info = format_info(image.format);
 	validate_image(image, info);
 
@@ -257,7 +274,7 @@ EncodedImage encode_av2_still_image(const RawImage& image, std::span<const Encod
 	}
 
 	avm_codec_enc_cfg_t cfg{};
-	avm_codec_err_t err = avm_codec_enc_config_default(iface, &cfg, AVM_USAGE_GOOD_QUALITY);
+	avm_codec_err_t const err = avm_codec_enc_config_default(iface, &cfg, AVM_USAGE_GOOD_QUALITY);
 	if (err != AVM_CODEC_OK) {
 		throw std::runtime_error("AV2 default encoder configuration failed");
 	}
@@ -269,7 +286,7 @@ EncodedImage encode_av2_still_image(const RawImage& image, std::span<const Encod
 	cfg.g_profile                = info.profile;
 	cfg.g_bit_depth              = info.bitDepth;
 	cfg.g_input_bit_depth        = static_cast<unsigned int>(info.bitDepth);
-	cfg.g_timebase               = {1, 1};
+	cfg.g_timebase               = {.num=1, .den=1};
 	cfg.g_limit                  = 1;
 	cfg.g_lag_in_frames          = 0;
 	cfg.rc_end_usage             = AVM_Q;
@@ -393,6 +410,53 @@ EncodedImage encode_av2_still_image(const RawImage& image, std::span<const Encod
 	}
 
 	return result;
+}
+
+// Decode the actual coded frame with the matching reference decoder. dav2d
+// currently rejects AVM's 4:2:2/4:4:4 profiles and crashes on some valid
+// monochrome streams. No encoder reconstruction is used.
+std::shared_ptr<const RawImage> decode_av2_reference_frame(std::span<const std::byte> payload,double* codecSeconds) {
+    avm_codec_ctx_t ctx{};
+    avm_codec_dec_cfg_t cfg{};
+    cfg.threads = 1;
+    checked_codec_call(ctx, avm_codec_dec_init(&ctx, avm_codec_av2_dx(), &cfg, 0), "decoder init");
+    struct Guard { avm_codec_ctx_t* ctx; ~Guard() { avm_codec_destroy(ctx); } } guard{&ctx};
+    const auto codecStart=std::chrono::steady_clock::now();
+    checked_codec_call(ctx, avm_codec_decode(&ctx, reinterpret_cast<const uint8_t*>(payload.data()), payload.size(), nullptr), "decode");
+    avm_codec_iter_t iter = nullptr;
+    const avm_image_t* decoded = avm_codec_get_frame(&ctx, &iter);
+    if (!decoded) throw std::runtime_error("AVM decoder produced no frame");
+    if(codecSeconds) *codecSeconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-codecStart).count();
+    if (decoded->bit_depth != 8 && decoded->bit_depth != 10) throw std::runtime_error("unsupported AVM decoded precision");
+    auto image = std::make_shared<RawImage>();
+    image->width = static_cast<int>(decoded->d_w);
+    image->height = static_cast<int>(decoded->d_h);
+    const bool high = decoded->bit_depth > 8;
+    if (decoded->monochrome) image->format = high ? PixelFormat::Gray10LE : PixelFormat::Gray8;
+    else if (decoded->x_chroma_shift == 0 && decoded->y_chroma_shift == 0) image->format = high ? PixelFormat::YUV444P10LE : PixelFormat::YUV444P8;
+    else if (decoded->x_chroma_shift == 1 && decoded->y_chroma_shift == 0) image->format = high ? PixelFormat::YUV422P10LE : PixelFormat::YUV422P8;
+    else if (decoded->x_chroma_shift == 1 && decoded->y_chroma_shift == 1) image->format = high ? PixelFormat::YUV420P10LE : PixelFormat::YUV420P8;
+    else throw std::runtime_error("unsupported AVM decoded subsampling");
+    image->color.primaries = static_cast<ColorPrimaries>(decoded->cp);
+    image->color.transfer = static_cast<TransferCharacteristics>(decoded->tc);
+    image->color.matrix = static_cast<MatrixCoefficients>(decoded->mc);
+    image->color.range = decoded->range == AVM_CR_FULL_RANGE ? ColorRange::Full : ColorRange::Limited;
+    // AVM's reference decoder stores even 8-bit output in 16-bit containers.
+    const bool wideStorage = (decoded->fmt & AVM_IMG_FMT_HIGHBITDEPTH) != 0;
+    for (int p = 0; p < (decoded->monochrome ? 1 : 3); ++p) {
+        const int sx = p ? decoded->x_chroma_shift : 0, sy = p ? decoded->y_chroma_shift : 0;
+        const int width = (image->width + (1 << sx) - 1) >> sx;
+        const int height = (image->height + (1 << sy) - 1) >> sy;
+        image->planes[p].strideBytes = width * (high ? 2 : 1);
+        image->planes[p].bytes.resize(static_cast<std::size_t>(image->planes[p].strideBytes) * height);
+        for (int y = 0; y < height; ++y) {
+            const uint8_t* src = decoded->planes[p] + static_cast<std::size_t>(y) * decoded->stride[p];
+            uint8_t* dst = image->planes[p].bytes.data() + static_cast<std::size_t>(y) * image->planes[p].strideBytes;
+            if (high || !wideStorage) std::memcpy(dst, src, image->planes[p].strideBytes);
+            else for (int x = 0; x < width; ++x) dst[x] = static_cast<uint8_t>(reinterpret_cast<const uint16_t*>(src)[x]);
+        }
+    }
+    return image;
 }
 
 } // namespace codec_gui

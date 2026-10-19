@@ -1,195 +1,166 @@
 #include "text_atlas.hpp"
-
-#include <algorithm>
+#include "paint_scene.hpp"
 #include <cmath>
-#include <cstddef>
-#include <unordered_map>
-
+#include <map>
+#include <tuple>
+#include <stdexcept>
 namespace codec_gui::gui {
+std::vector<TextLine> wrap_text(TextShaper& shaper, std::string_view text, float width) {
+    std::vector<TextLine> lines;
+    if (!std::isfinite(width) || width <= 0) return lines;
+    std::size_t paragraphStart = 0;
+    do {
+        auto paragraphEnd = text.find('\n', paragraphStart);
+        if (paragraphEnd == std::string_view::npos) paragraphEnd = text.size();
+        const auto paragraph = text.substr(paragraphStart, paragraphEnd - paragraphStart);
+        if (paragraph.empty()) lines.push_back({"", 0});
+        const auto shaped = shaper.shape(paragraph);
+        std::map<std::size_t, float> advances;
+        for (const auto& glyph : shaped.glyphs) advances[glyph.cluster] += std::abs(glyph.advanceX);
+        advances[paragraph.size()] = 0;
+        std::size_t start = 0;
+        while (start < paragraph.size()) {
+            float used = 0;
+            std::size_t end = start, space = start;
+            for (auto it = advances.lower_bound(start); it != advances.end() && it->first < paragraph.size(); ++it) {
+                if (used + it->second > width && end > start) break;
+                used += it->second;
+                end = std::next(it)->first;
+                if (paragraph[it->first] == ' ' || paragraph[it->first] == '\t') space = end;
+                if (used > width) break; // A single oversize cluster is clipped, never split.
+            }
+            if (end <= start) end = paragraph.size();
+            if (end < paragraph.size() && space > start) end = space;
+            auto segment = paragraph.substr(start, end - start);
+            while (!segment.empty() && (segment.back() == ' ' || segment.back() == '\t')) segment.remove_suffix(1);
+            lines.push_back({std::string(segment), shaper.shape(segment).width});
+            start = end;
+            while (start < paragraph.size() && (paragraph[start] == ' ' || paragraph[start] == '\t')) ++start;
+        }
+        if (paragraphEnd == text.size()) break;
+        paragraphStart = paragraphEnd + 1;
+    } while (paragraphStart <= text.size());
+    return lines;
+}
 namespace {
-
-struct PackedGlyph {
-	int x = 0;
-	int y = 0;
-	int w = 0;
-	int h = 0;
-	int bearingX = 0;
-	int bearingY = 0;
+struct AtlasFull {};
+struct PackedGlyph { int x=0,y=0,w=0,h=0,bearingX=0,bearingY=0; };
+using GlyphKey = std::tuple<uint64_t, uint32_t, uint32_t>;
+}
+struct TextAtlasCache::Impl {
+    TextAtlas atlas;
+    std::map<GlyphKey, PackedGlyph> glyphs;
+    std::map<std::pair<FontRole,int>,std::unique_ptr<TextShaper>> fonts;
+    int x=1,y=1,rowHeight=0;
+    uint64_t source=0, rasterized=0;
+    float scale=1;
+    TextShaper& font(const DrawCommand& command,TextShaper& fallback) {
+        if (command.fontSize <= 0 && command.fontRole == FontRole::Interface) return fallback;
+        const int size = int(std::lround((command.fontSize > 0 ? command.fontSize : 16)*scale*64));
+        auto key=std::pair{command.fontRole,size};
+        auto& face=fonts[key];
+        if (!face) face=std::make_unique<TextShaper>(command.fontRole==FontRole::Monospace ? default_monospace_font_path() : default_font_path(),float(size)/64);
+        return *face;
+    }
+    const PackedGlyph& ensure(TextShaper& font,const ShapedGlyph& shape) {
+        GlyphKey key{font.identity(),shape.fontIndex,shape.glyphIndex};
+        if (auto it=glyphs.find(key);it!=glyphs.end()) return it->second;
+        auto bitmap=font.rasterize_glyph(shape);++rasterized;
+        if (bitmap.width+4>atlas.width || bitmap.height+4>4096) throw AtlasFull{};
+        if(x+bitmap.width+2>atlas.width){x=1;y+=rowHeight+2;rowHeight=0;}
+        if(y+bitmap.height+2>4096)throw AtlasFull{};
+        const int needed=y+bitmap.height+2;
+        while(atlas.height<needed)atlas.height=std::min(4096,atlas.height*2);
+        atlas.alpha.resize(std::size_t(atlas.width)*atlas.height,0);
+        PackedGlyph packed{x+1,y+1,bitmap.width,bitmap.height,bitmap.bearingX,bitmap.bearingY};
+        for(int row=0;row<bitmap.height;++row)
+            std::copy_n(bitmap.alpha.data()+std::size_t(row)*bitmap.width,bitmap.width,
+                        atlas.alpha.data()+std::size_t(packed.y+row)*atlas.width+packed.x);
+        x+=bitmap.width+2;rowHeight=std::max(rowHeight,bitmap.height);
+        return glyphs.emplace(key,packed).first->second;
+    }
 };
-
-struct GlyphCacheValue {
-	GlyphBitmap bitmap;
-	PackedGlyph packed;
-};
-
-uint64_t glyph_key(const ShapedGlyph& glyph) {
-	return (static_cast<uint64_t>(glyph.fontIndex) << 32u) | glyph.glyphIndex;
+TextAtlasCache::TextAtlasCache():impl_(std::make_unique<Impl>()){}
+TextAtlasCache::~TextAtlasCache()=default;
+void TextAtlasCache::clear(){*impl_=Impl{};}
+TextAtlas& TextAtlasCache::atlas(){return impl_->atlas;}
+uint64_t TextAtlasCache::rasterized_glyph_count()const{return impl_->rasterized;}
+const TextAtlas& TextAtlasCache::build(const std::vector<DrawCommand>& commands,TextShaper& fallback,int width,float scale) {
+    width=std::clamp(width,64,4096);
+    if(!std::isfinite(scale) || scale<=0)throw std::invalid_argument("Invalid UI device scale");
+    if(impl_->source!=fallback.identity() || impl_->scale!=scale || impl_->atlas.width!=width)clear();
+    for(int attempt=0;attempt<2;++attempt) try {
+        auto& cache=*impl_;
+        cache.source=fallback.identity();cache.scale=scale;
+        auto& atlas=cache.atlas;
+        atlas.width=width;
+        if(!atlas.height){atlas.height=64;atlas.alpha.resize(std::size_t(width)*64);}
+        atlas.quads.clear();
+        struct Line { DrawCommand command; Rect clip; std::size_t index; TextShaper* font; ShapedText shaped,ellipsis; };
+        std::vector<Line> lines;
+        for(const auto& item:compile_paint_scene(commands)) {
+            const auto& command=commands[item.commandIndex];
+            if(command.kind!=DrawCommandKind::Text || command.text.empty() || !ui::valid_rect(command.rect) ||
+               !ui::valid_rect(ui::intersect(command.rect,item.clip)))continue;
+            auto& font=cache.font(command,fallback);
+            std::vector<TextLine> segments;
+            if(command.textOverflow==TextOverflow::Wrap)segments=wrap_text(font,command.text,command.rect.w*scale);
+            else segments.push_back({command.text,0});
+            float y=command.rect.y;
+            const float lineHeight=command.lineHeight>0?command.lineHeight:font.shape("Mg").height/scale*1.35f;
+            for(const auto& segment:segments) {
+                if(y>=command.rect.y+command.rect.h)break;
+                auto lineCommand=command;
+                lineCommand.text=segment.text;
+                lineCommand.rect.y=y;
+                lineCommand.rect.h=std::min(lineHeight,command.rect.y+command.rect.h-y);
+                auto shaped=font.shape(segment.text);
+                auto ellipsis=font.shape("...");
+                for(const auto& glyph:shaped.glyphs)cache.ensure(font,glyph);
+                if(command.textOverflow==TextOverflow::Ellipsis)for(const auto& glyph:ellipsis.glyphs)cache.ensure(font,glyph);
+                lines.push_back({std::move(lineCommand),item.clip,item.commandIndex,&font,std::move(shaped),std::move(ellipsis)});
+                y+=lineHeight;
+            }
+        }
+        // Packing is complete before UV normalization: growth never invalidates this frame.
+        for(const auto& line:lines) {
+            const auto& command=line.command;
+            const float physicalWidth=command.rect.w*scale;
+            const bool elide=command.textOverflow==TextOverflow::Ellipsis && line.shaped.width>physicalWidth;
+            const float limit=elide?std::max(0.f,physicalWidth-line.ellipsis.width):physicalWidth;
+            const float displayedWidth=elide?physicalWidth:std::min(physicalWidth,line.shaped.width);
+            float offset=command.textAlign==TextAlign::Right?physicalWidth-displayedWidth:
+                         command.textAlign==TextAlign::Center?(physicalWidth-displayedWidth)/2:0;
+            auto append=[&](const ShapedGlyph& glyph,float pen,bool elision) {
+                const auto& p=cache.glyphs.at({line.font->identity(),glyph.fontIndex,glyph.glyphIndex});
+                if(p.w<=0 || p.h<=0)return;
+                Rect r{std::round(command.rect.x*scale+offset+pen+glyph.offsetX+p.bearingX)/scale,
+                       std::round(command.rect.y*scale+line.shaped.height-glyph.offsetY-p.bearingY)/scale,float(p.w)/scale,float(p.h)/scale};
+                const auto visible=ui::intersect(r,ui::intersect(command.rect,line.clip));
+                if(!ui::valid_rect(visible))return;
+                Rect uv{(p.x+(visible.x-r.x)*scale)/atlas.width,(p.y+(visible.y-r.y)*scale)/atlas.height,
+                        visible.w*scale/atlas.width,visible.h*scale/atlas.height};
+                atlas.quads.push_back({visible,uv,command.color,elision,command.layer,line.clip,line.index});
+            };
+            float pen=0;
+            for(std::size_t i=0;i<line.shaped.glyphs.size();) {
+                std::size_t end=i+1;
+                float advance=line.shaped.glyphs[i].advanceX;
+                while(end<line.shaped.glyphs.size() && line.shaped.glyphs[end].cluster==line.shaped.glyphs[i].cluster)
+                    advance+=line.shaped.glyphs[end++].advanceX;
+                if(elide && pen+advance>limit)break;
+                for(;i<end;++i){append(line.shaped.glyphs[i],pen,false);pen+=line.shaped.glyphs[i].advanceX;}
+            }
+            if(elide)for(const auto& glyph:line.ellipsis.glyphs){append(glyph,pen,true);pen+=glyph.advanceX;}
+        }
+        return atlas;
+    } catch(const AtlasFull&) {
+        clear();
+        if(attempt)throw std::runtime_error("Visible UI glyphs exceed the 4096-pixel atlas capacity");
+    }
+    throw std::logic_error("Unreachable atlas build");
 }
-
-void cache_rasterized_glyphs(std::unordered_map<uint64_t, GlyphCacheValue>& glyphs, const RasterizedText& rasterized) {
-	for (const RasterizedGlyph& glyph : rasterized.glyphs) {
-		if (glyph.bitmap.width <= 0 || glyph.bitmap.height <= 0) {
-			continue;
-		}
-		glyphs.try_emplace(glyph_key(glyph.shape), GlyphCacheValue{glyph.bitmap, {}});
-	}
+TextAtlas build_text_atlas(const std::vector<DrawCommand>& commands,TextShaper& shaper,int width,float scale) {
+    TextAtlasCache cache;return cache.build(commands,shaper,width,scale);
 }
-
-void append_glyph_quad(
-	TextAtlas& atlas,
-	std::vector<GlyphQuad>& quads,
-	const std::unordered_map<uint64_t, GlyphCacheValue>& glyphs,
-	const DrawCommand& command,
-	const RasterizedText& rasterized,
-	const RasterizedGlyph& glyph,
-	float xOffset,
-	bool elision,
-	Rect clip,
-	float deviceScale
-) {
-	const auto it = glyphs.find(glyph_key(glyph.shape));
-	if (it == glyphs.end()) {
-		return;
-	}
-	const PackedGlyph& packed = it->second.packed;
-	const float scale = std::max(1.0f, deviceScale);
-	// FreeType's hinted bitmap is aligned to physical pixels. Snap its screen
-	// origin to the same grid so linear atlas filtering does not blend every
-	// stem across two output pixels at fractional UI scales.
-	const float physicalX = command.rect.x * scale + xOffset + glyph.penX + glyph.shape.offsetX + static_cast<float>(packed.bearingX);
-	const float physicalY = command.rect.y * scale + glyph.shape.offsetY + rasterized.height - static_cast<float>(packed.bearingY);
-	Rect rect{
-		std::round(physicalX) / scale,
-		std::round(physicalY) / scale,
-		static_cast<float>(packed.w) / scale,
-		static_cast<float>(packed.h) / scale,
-	};
-	Rect uv{
-		static_cast<float>(packed.x) / static_cast<float>(atlas.width),
-		static_cast<float>(packed.y) / static_cast<float>(atlas.height),
-		static_cast<float>(packed.w) / static_cast<float>(atlas.width),
-		static_cast<float>(packed.h) / static_cast<float>(atlas.height),
-	};
-	if (rect.x < command.rect.x) {
-		const float trim = command.rect.x - rect.x;
-		rect.x = command.rect.x;
-		rect.w = std::max(0.0f, rect.w - trim);
-		uv.x += trim * scale / static_cast<float>(atlas.width);
-		uv.w = rect.w * scale / static_cast<float>(atlas.width);
-	}
-	if (rect.x + rect.w > command.rect.x + command.rect.w) {
-		rect.w = std::max(0.0f, command.rect.x + command.rect.w - rect.x);
-		uv.w = rect.w * scale / static_cast<float>(atlas.width);
-	}
-	if (rect.y < command.rect.y) {
-		const float trim = command.rect.y - rect.y;
-		rect.y = command.rect.y;
-		rect.h = std::max(0.0f, rect.h - trim);
-		uv.y += trim * scale / static_cast<float>(atlas.height);
-		uv.h = rect.h * scale / static_cast<float>(atlas.height);
-	}
-	if (rect.y + rect.h > command.rect.y + command.rect.h) {
-		rect.h = std::max(0.0f, command.rect.y + command.rect.h - rect.y);
-		uv.h = rect.h * scale / static_cast<float>(atlas.height);
-	}
-	if (rect.w > 0.0f && rect.h > 0.0f) {
-		quads.push_back({rect, uv, command.color, elision, command.layer, clip});
-	}
-}
-
-} // namespace
-
-TextAtlas build_text_atlas(const std::vector<DrawCommand>& commands, TextShaper& shaper, int atlasWidth, float deviceScale) {
-	atlasWidth = std::max(64, atlasWidth);
-	deviceScale = std::max(1.0f, deviceScale);
-	std::unordered_map<uint64_t, GlyphCacheValue> glyphs;
-	struct ClippedTextCommand { const DrawCommand* command; Rect clip; };
-	std::vector<ClippedTextCommand> textCommands;
-	std::vector<Rect> clips{Rect{-1000000.0f, -1000000.0f, 2000000.0f, 2000000.0f}};
-	const RasterizedText ellipsis = shaper.rasterize("...");
-	for (const DrawCommand& command : commands) {
-		if (command.kind == DrawCommandKind::ScissorBegin) {
-			const Rect parent = clips.back();
-			const float x0 = std::max(parent.x, command.rect.x);
-			const float y0 = std::max(parent.y, command.rect.y);
-			const float x1 = std::min(parent.x + parent.w, command.rect.x + command.rect.w);
-			const float y1 = std::min(parent.y + parent.h, command.rect.y + command.rect.h);
-			clips.push_back(Rect{x0, y0, std::max(0.0f, x1 - x0), std::max(0.0f, y1 - y0)});
-			continue;
-		}
-		if (command.kind == DrawCommandKind::ScissorEnd) {
-			if (clips.size() > 1) clips.pop_back();
-			continue;
-		}
-		if (command.kind != DrawCommandKind::Text || command.text.empty() || command.rect.w <= 0.0f || command.rect.h <= 0.0f) {
-			continue;
-		}
-		const Rect clip = clips.back();
-		if (command.rect.x >= clip.x + clip.w || command.rect.x + command.rect.w <= clip.x ||
-		    command.rect.y >= clip.y + clip.h || command.rect.y + command.rect.h <= clip.y) continue;
-		textCommands.push_back({&command, clip});
-		RasterizedText rasterized = shaper.rasterize(command.text);
-		cache_rasterized_glyphs(glyphs, rasterized);
-	}
-	cache_rasterized_glyphs(glyphs, ellipsis);
-
-	const int padding = 1;
-	int cursorX = padding;
-	int cursorY = padding;
-	int rowH = 0;
-	for (auto& [_, value] : glyphs) {
-		const int w = value.bitmap.width + padding * 2;
-		const int h = value.bitmap.height + padding * 2;
-		if (cursorX + w > atlasWidth) {
-			cursorX = padding;
-			cursorY += rowH + padding;
-			rowH = 0;
-		}
-		value.packed.x = cursorX + padding;
-		value.packed.y = cursorY + padding;
-		value.packed.w = value.bitmap.width;
-		value.packed.h = value.bitmap.height;
-		value.packed.bearingX = value.bitmap.bearingX;
-		value.packed.bearingY = value.bitmap.bearingY;
-		cursorX += w;
-		rowH = std::max(rowH, h);
-	}
-
-	TextAtlas atlas;
-	atlas.width = atlasWidth;
-	atlas.height = std::max(1, cursorY + rowH + padding);
-	atlas.alpha.assign(static_cast<std::size_t>(atlas.width) * static_cast<std::size_t>(atlas.height), 0);
-	for (const auto& [_, value] : glyphs) {
-		for (int y = 0; y < value.bitmap.height; ++y) {
-			const auto srcOff = static_cast<std::size_t>(y) * static_cast<std::size_t>(value.bitmap.width);
-			const auto dstOff = static_cast<std::size_t>(value.packed.y + y) * static_cast<std::size_t>(atlas.width) + static_cast<std::size_t>(value.packed.x);
-			std::copy_n(value.bitmap.alpha.data() + srcOff, static_cast<std::size_t>(value.bitmap.width), atlas.alpha.data() + dstOff);
-		}
-	}
-
-	for (const ClippedTextCommand& clipped : textCommands) {
-		const DrawCommand* command = clipped.command;
-		RasterizedText rasterized = shaper.rasterize(command->text);
-		const float physicalWidth = command->rect.w * deviceScale;
-		const bool shouldElide = rasterized.width > physicalWidth && !ellipsis.glyphs.empty();
-		const float textLimit = shouldElide ? std::max(0.0f, physicalWidth - ellipsis.width) : physicalWidth;
-		float visibleAdvance = 0.0f;
-		for (const RasterizedGlyph& glyph : rasterized.glyphs) {
-			const float glyphEnd = glyph.penX + std::max(0.0f, glyph.shape.advanceX);
-			if (shouldElide && glyphEnd > textLimit) {
-				break;
-			}
-			append_glyph_quad(atlas, atlas.quads, glyphs, *command, rasterized, glyph, 0.0f, false, clipped.clip, deviceScale);
-			visibleAdvance = std::max(visibleAdvance, glyphEnd);
-		}
-		if (shouldElide) {
-			const float ellipsisOffset = std::min(visibleAdvance, std::max(0.0f, physicalWidth - ellipsis.width));
-			for (const RasterizedGlyph& glyph : ellipsis.glyphs) {
-				append_glyph_quad(atlas, atlas.quads, glyphs, *command, ellipsis, glyph, ellipsisOffset, true, clipped.clip, deviceScale);
-			}
-		}
-	}
-	return atlas;
-}
-
 } // namespace codec_gui::gui

@@ -14,9 +14,12 @@ namespace codec_gui::gui {
 			return ".bin";
 		}
 		std::string codec = image.encoded->codecName.empty() ? image.encoded->backendName : image.encoded->codecName;
-		std::transform(codec.begin(), codec.end(), codec.begin(), [](unsigned char c) {
+		std::ranges::transform(codec, codec.begin(), [](unsigned char c) {
 			return static_cast<char>(std::tolower(c));
 		});
+		if (codec == "jpeg xs" || codec == "jpegxs" || codec == "svt-jpeg-xs") return ".jxs";
+		if (codec == "webp") return ".webp";
+		if (codec == "vp8" || codec == "vp9") return ".ivf";
 		if (codec.find("av1") != std::string::npos || codec.find("av2") != std::string::npos) {
 			return ".ivf";
 		}
@@ -31,7 +34,7 @@ namespace codec_gui::gui {
 
 	[[nodiscard]] inline std::string sanitize_filename(std::string name) {
 		for (char& c : name) {
-			const unsigned char u = static_cast<unsigned char>(c);
+			const auto u = static_cast<unsigned char>(c);
 			if (!(std::isalnum(u) || c == '-' || c == '_' || c == '.')) {
 				c = '_';
 			}
@@ -50,7 +53,7 @@ namespace codec_gui::gui {
 		std::string sourceStem;
 		if (!image.parents.empty()) {
 			const ImageId sourceId = image.parents.front();
-			const auto source = std::find_if(state.images.begin(), state.images.end(), [sourceId](const ImageObject& candidate) {
+			const auto source = std::ranges::find_if(state.images, [sourceId](const ImageObject& candidate) {
 				return candidate.id == sourceId;
 			});
 			if (source != state.images.end()) {
@@ -73,8 +76,12 @@ namespace codec_gui::gui {
 				}
 			}
 		}
-		stem += "_" + std::to_string(image.id.value);
-		return directory / (stem + encoded_extension(image));
+		const std::string suffix = "_" + std::to_string(image.id.value) + encoded_extension(image);
+		// Parameter-rich hardware backends can exceed NAME_MAX with defaults.
+		// Sanitized stems are ASCII, so truncating bytes preserves characters.
+		constexpr std::size_t maxFilenameBytes = 240;
+		if (stem.size() + suffix.size() > maxFilenameBytes) stem.resize(maxFilenameBytes - suffix.size());
+		return directory / (stem + suffix);
 	}
 
 } // namespace codec_gui::gui

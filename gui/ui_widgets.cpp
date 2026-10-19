@@ -1,11 +1,18 @@
+#include "decoder_ui.hpp"
+#include "command_controls.hpp"
 #include "ui_widgets.hpp"
 
+#include "../codec_gui_x265.hpp"
+#include "app_state.hpp"
 #include "image_list_model.hpp"
 #include "encoder_param_state.hpp"
+#include "layout.hpp"
 #include "viewer_model.hpp"
 
 #include <algorithm>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace codec_gui::gui {
 namespace {
@@ -20,7 +27,7 @@ bool intersects(Rect a, Rect b) {
 
 const BackendInfo* selected_backend(const AppState& state) {
 	if (valid(state.selection.selectedBackend)) {
-		const auto it = std::find_if(state.backends.begin(), state.backends.end(), [&](const BackendInfo& backend) {
+		const auto it = std::ranges::find_if(state.backends, [&](const BackendInfo& backend) {
 			return backend.id == state.selection.selectedBackend;
 		});
 		if (it != state.backends.end()) {
@@ -31,7 +38,7 @@ const BackendInfo* selected_backend(const AppState& state) {
 }
 
 Rect backend_row_rect(Rect inspector, float y) {
-	return Rect{inspector.x + 12.0f, y, inspector.w - 24.0f, 22.0f};
+	return Rect{.x=inspector.x + 12.0f, .y=y, .w=inspector.w - 24.0f, .h=22.0f};
 }
 
 float backend_selector_end_y(const AppState& state, Rect inspector) {
@@ -71,39 +78,26 @@ void push_widget(std::vector<WidgetInfo>& out, const AppState& state, std::strin
 std::vector<WidgetInfo> collect_widgets(const AppState& state, const LayoutResult& layout) {
 	std::vector<WidgetInfo> out;
 
-	struct Button {
-		float x;
-		float w;
-		const char* name;
-	};
-	const Button buttons[] = {
-		{140, 78, "import"},
-		{224, 78, "encode"},
-		{308, 78, "cancel"},
-		{392, 62, "save"},
-		{462, 78, "single"},
-		{546, 64, "side"},
-		{616, 70, "split"},
-		{692, 70, "blink"},
-		{768, 60, "diff"},
-		{834, 60, "grid"},
-		{900, 52, "fit"},
-		{958, 64, "100"},
-		{1028, 52, "delete"},
-	};
-	for (const Button& button : buttons) {
-		push_widget(out, state, std::string{"command:"} + button.name, WidgetKind::Button, Rect{layout.commandBar.x + button.x, layout.commandBar.y, button.w, layout.commandBar.h});
+	for (const CommandButton& button : CommandButtons) {
+		push_widget(
+			out,
+			state,
+			std::string{"command:"} + button.name,
+			WidgetKind::Button,
+			command_button_rect(layout.commandBar,button),
+			command_is_enabled(state, button.name)
+		);
 	}
 
-	push_widget(out, state, "image-list:sort", WidgetKind::TableList, Rect{layout.imageList.x, layout.imageList.y, layout.imageList.w, 40}, layout.imageList.w > 0.0f);
-	float y = layout.imageList.y + 42.0f - state.imageList.scrollOffset;
-	const Rect imageListContent{layout.imageList.x, layout.imageList.y + 40.0f, layout.imageList.w, std::max(0.0f, layout.imageList.h - 40.0f)};
+	push_widget(out, state, "image-list:sort", WidgetKind::TableList, Rect{.x=layout.imageList.x, .y=layout.imageList.y, .w=layout.imageList.w, .h=ImageListHeaderHeight}, layout.imageList.w > 0.0f);
+	float y = layout.imageList.y + ImageListHeaderHeight + 4.0f - state.imageList.scrollOffset;
+	const Rect imageListContent{.x=layout.imageList.x, .y=layout.imageList.y + ImageListHeaderHeight, .w=layout.imageList.w, .h=std::max(0.0f, layout.imageList.h - ImageListHeaderHeight)};
 	for (const ImageObject* image : ordered_images(state)) {
-		const Rect row{layout.imageList.x + 6, y - 2, layout.imageList.w - 12, 50};
+		const Rect row = image_list_row_rect(layout.imageList, y);
 		if (intersects(row, imageListContent)) {
 			push_widget(out, state, "image-row:" + std::to_string(image->id.value), WidgetKind::TableList, row, layout.imageList.w > 0.0f);
 		}
-		y += 56;
+		y += ImageListRowStep;
 	}
 
 	const std::vector<PaneRect> paneRects = compute_pane_rects(state.viewMode, state.panes, layout.viewer);
@@ -112,11 +106,16 @@ std::vector<WidgetInfo> collect_widgets(const AppState& state, const LayoutResul
 	}
 	if (state.viewMode.kind == ViewModeKind::Split) {
 		const float split = layout.viewer.x + layout.viewer.w * static_cast<float>(std::clamp(state.viewMode.splitPosition, 0.0, 1.0));
-		push_widget(out, state, "splitter:viewer", WidgetKind::Splitter, Rect{split - 6.0f, layout.viewer.y, 12.0f, layout.viewer.h}, true);
+		push_widget(out, state, "splitter:viewer", WidgetKind::Splitter, Rect{.x=split - 6.0f, .y=layout.viewer.y, .w=12.0f, .h=layout.viewer.h}, true);
 	}
 
+    for(const auto& control:decoder_controls(state,layout.inspector)) {
+        const Rect clip{layout.inspector.x,layout.inspector.y+40,layout.inspector.w,layout.inspector.h-40};
+        if(control.id.starts_with("inspector:") || (control.rect.y>=clip.y && intersects(control.rect,clip)))push_widget(out,state,control.id,WidgetKind::Button,control.rect,control.enabled);
+    }
+    if(!state.decoderInspector && layout.inspector.w>=160) {
 	const BackendInfo* backend = selected_backend(state);
-	const Rect inspectorContent{layout.inspector.x, layout.inspector.y + 40.0f, layout.inspector.w, std::max(0.0f, layout.inspector.h - 40.0f)};
+	const Rect inspectorContent{.x=layout.inspector.x, .y=layout.inspector.y + 40.0f, .w=layout.inspector.w, .h=std::max(0.0f, layout.inspector.h - 40.0f)};
 	y = layout.inspector.y + 42.0f + 22.0f - state.layout.inspectorScrollOffset;
 	for (const BackendInfo& candidate : state.backends) {
 		const Rect row = backend_row_rect(layout.inspector, y);
@@ -137,13 +136,15 @@ std::vector<WidgetInfo> collect_widgets(const AppState& state, const LayoutResul
 				currentGroup = param.group;
 				y += 24;
 			}
-			Rect control{layout.inspector.x + layout.inspector.w * 0.50f, y - 2, layout.inspector.w * 0.44f, 20};
+			Rect const control{.x=layout.inspector.x + layout.inspector.w * 0.50f, .y=y - 2, .w=layout.inspector.w * 0.44f, .h=20};
 			if (intersects(control, inspectorContent)) {
 				push_widget(out, state, "param:" + std::to_string(backend->id.value) + ":" + param.name, widget_kind_for_param(param), control, backend->capabilities.available && param.name != "implementation" && parameter_is_enabled(state, *backend, param));
 			}
 			y += 24;
 		}
 	}
+
+    }
 
 	for (const AppError& error : state.errors) {
 		push_widget(out, state, "error:" + std::to_string(error.id), WidgetKind::InlineError, layout.statusBar, true);

@@ -1,8 +1,14 @@
 #include "dav2d_bridge.h"
 
+#include <asm-generic/errno-base.h>
+#include <dav2d/common.h>
+#include <dav2d/data.h>
 #include <dav2d/dav2d.h>
 
-#include <errno.h>
+#include <dav2d/headers.h>
+#include <dav2d/picture.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +33,10 @@ static int copy_picture(const Dav2dPicture* source, CodecVisDav2dPicture* output
 	output->height = source->p.h;
 	output->layout = source->p.layout;
 	output->bit_depth = source->p.bpc;
+	output->color_primaries = source->ci ? source->ci->color.pri : 2;
+	output->transfer = source->ci ? source->ci->color.trc : 2;
+	output->matrix = source->ci ? source->ci->color.mtrx : 2;
+	output->full_range = source->ci ? source->ci->color.range : 0;
 	const int sample_bytes = source->p.bpc > 8 ? 2 : 1;
 	const int plane_count = source->p.layout == DAV2D_PIXEL_LAYOUT_I400 ? 1 : 3;
 	for (int plane = 0; plane < plane_count; ++plane) {

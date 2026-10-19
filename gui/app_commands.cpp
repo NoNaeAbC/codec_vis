@@ -1,5 +1,8 @@
 #include "app_commands.hpp"
 
+#include "../codec_gui_x265.hpp"
+#include "app_state.hpp"
+#include "encoder_backends.hpp"
 #include "image_ops.hpp"
 #include "metrics.hpp"
 #include "platform_portal.hpp"
@@ -7,12 +10,16 @@
 #include "../codec_gui_image_io.hpp"
 
 #include <chrono>
+#include <cstdint>
 #include <exception>
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
+#include <system_error>
 #include <utility>
+#include <vector>
 
 namespace codec_gui::gui {
 namespace {
@@ -99,24 +106,13 @@ std::vector<Action> execute_command(const Command& command, const AppState& stat
 				DecodeResult preview = backend->decodePreview(encode.encoded);
 				encode.metadata.decodeSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - decodeStart).count();
 				if (preview.image) {
-					auto decoded = std::make_shared<RawImage>(*preview.image);
-					decoded->color = encode.comparisonReference->color;
-					decoded->nominalPeakNits = encode.comparisonReference->nominalPeakNits;
-					preview.image = std::move(decoded);
-					const auto metricStart = std::chrono::steady_clock::now();
-					MetricResult metric = compute_quality_metrics(*encode.comparisonReference, *preview.image);
-					encode.metadata.metricSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - metricStart).count();
-					encode.metadata.psnrY = metric.psnrY;
-					encode.metadata.psnrRgb = metric.psnrAll;
-					encode.metadata.metrics = std::move(metric.metrics);
-					if (!metric.psnrY && !metric.unavailableReason.empty()) {
-						encode.metadata.metricError = metric.unavailableReason;
-					}
+					encode.metadata.codedPixelFormat = preview.image->format;
+					encode.metadata.codedColor = preview.image->color;
 				} else {
 					encode.metadata.previewError = preview.error.empty() ? "preview decoder did not return an image" : preview.error;
 				encode.metadata.metricError = "metrics unavailable because decoded preview is unavailable";
 					encode.metadata.metrics = {
-						QualityMetricRecord{"psnr-y", "PSNR-Y", std::nullopt, "dB", true, encode.metadata.metricError},
+						QualityMetricRecord{.id="psnr-y", .label="PSNR-Y", .value=std::nullopt, .unit="dB", .higherIsBetter=true, .unavailableReason=encode.metadata.metricError},
 					};
 				}
 
@@ -149,7 +145,7 @@ std::vector<Action> execute_command(const Command& command, const AppState& stat
 					actions.push_back(failed_action(ActionKind::DerivedImageFailed, "difference inputs are not decoded"));
 					break;
 				}
-				DerivedImageResult diff = compute_absolute_difference(*first->decoded, *second->decoded, command.value);
+				DerivedImageResult diff = command.text=="linear-difference"?compute_linear_difference(*first->decoded,*second->decoded,command.value):compute_absolute_difference(*first->decoded, *second->decoded, command.value);
 				if (!diff.image) {
 					actions.push_back(failed_action(ActionKind::DerivedImageFailed, diff.error.empty() ? "difference image could not be computed" : diff.error));
 					break;
@@ -158,6 +154,7 @@ std::vector<Action> execute_command(const Command& command, const AppState& stat
 				action.kind = ActionKind::DerivedImageComputed;
 				action.derivedImage.first = first->id;
 				action.derivedImage.second = second->id;
+                action.derivedImage.firstRevision=first->previewRevision;action.derivedImage.secondRevision=second->previewRevision;
 				action.derivedImage.gain = command.value;
 				action.derivedImage.displayName = "Difference: " + first->displayName + " vs " + second->displayName;
 				action.derivedImage.image = std::move(diff.image);
@@ -170,15 +167,42 @@ std::vector<Action> execute_command(const Command& command, const AppState& stat
 			case CommandKind::ShowSaveFilePortal:
 				actions.push_back(show_save_file_portal(command.image, command.path));
 				break;
+			case CommandKind::ComputeMetric: {
+				const auto* image=command_image(state,command.image);
+				const auto* reference=command_image(state,command.otherImage);
+				if(!image || !image->decoded || !reference || !reference->decoded)
+					throw std::invalid_argument("decoded result or source is unavailable");
+				Action started;started.kind=ActionKind::MetricsStarted;started.image=command.image;actions.push_back(started);
+				const auto start=std::chrono::steady_clock::now();
+				const auto result=compute_quality_metrics(*reference->decoded,*image->decoded);
+				if(!result.unavailableReason.empty()) throw std::runtime_error(result.unavailableReason);
+				for(const auto& metric:result.metrics) {
+					Action computed;computed.kind=ActionKind::MetricComputed;computed.image=command.image;computed.metric=metric;actions.push_back(std::move(computed));
+				}
+				Action done;done.kind=ActionKind::MetricsCompleted;done.image=command.image;
+				done.value=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();actions.push_back(done);
+				break;
+			}
 			case CommandKind::UploadImageTexture:
 			case CommandKind::RequestRedraw:
 			case CommandKind::RequestEncodeCancel:
+			case CommandKind::RunLivePreview:
+			case CommandKind::CancelLivePreview:
+			// Image decoder work is routed to DecoderRunner by the GUI.
+			case CommandKind::QueryImageDecoders:
+			case CommandKind::RunImageDecode:
+			case CommandKind::CancelImageDecode:
+			// Authorization is routed to EnergyAccess by the GUI.
+			case CommandKind::AuthorizeEnergyAccess:
+			case CommandKind::CloseEnergyAccess:
 			case CommandKind::DecodeEncodedBytes:
-			case CommandKind::ComputeMetric:
 				break;
 		}
 	} catch (const std::exception& e) {
 		switch (command.kind) {
+			case CommandKind::ComputeMetric: {
+				Action failed;failed.kind=ActionKind::MetricsFailed;failed.image=command.image;failed.text=e.what();actions.push_back(std::move(failed));break;
+			}
 			case CommandKind::LoadSourceImage:
 				actions.push_back(failed_action(ActionKind::SourceLoadFailed, e.what()));
 				break;

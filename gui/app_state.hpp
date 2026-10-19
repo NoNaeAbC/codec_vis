@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../codec_gui_x265.hpp"
+#include "decoder_types.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -79,12 +80,15 @@ namespace codec_gui::gui {
 		std::string unit;
 		bool higherIsBetter = true;
 		std::string unavailableReason;
+		std::string accuracyNote;
 	};
+	enum class MetricState { NotRequested, Queued, Running, Ready, Failed };
 
 	enum class ImageObjectType {
 		Source,
 		EncodedResult,
 		Derived,
+		LivePreview,
 	};
 
 	struct EncodedMetadata {
@@ -97,20 +101,28 @@ namespace codec_gui::gui {
 		ColorDescription codedColor;
 		uint64_t byteSize = 0;
 		double encodeSeconds = 0.0;
+		double prepareSeconds = 0.0;
+		bool preparationCacheHit = false;
 		double decodeSeconds = 0.0;
 		double metricSeconds = 0.0;
 		std::filesystem::path outputPath;
 		std::vector<ParamSummary> keyParams;
 		std::vector<QualityMetricRecord> metrics;
+		MetricState metricState = MetricState::NotRequested;
 		std::optional<double> psnrY;
 		std::optional<double> psnrRgb;
 		std::string previewError;
 		std::string metricError;
+		std::string metricReference = "source (end-to-end)";
+		std::vector<std::string> requestedMetrics;
+		// Shared immutable application-prepared samples supplied to the encoder adapter.
+		std::shared_ptr<const RawImage> encoderInput;
 	};
 
 	struct DerivedMetadata {
 		std::string kind;
 		double gain = 1.0;
+        uint64_t firstRevision=0,secondRevision=0;
 	};
 
 	struct ImageObject {
@@ -126,6 +138,10 @@ namespace codec_gui::gui {
 		std::optional<EncodedMetadata> encoded;
 		std::optional<DerivedMetadata> derived;
 		std::vector<ImageId> parents;
+		std::shared_ptr<const EncodedImage> sourceCompressed;
+		std::string sourceCodec;
+		ImageDecoderState decoder;
+		uint64_t previewRevision=0;
 	};
 
 	enum class ChannelView {
@@ -209,6 +225,7 @@ namespace codec_gui::gui {
 		BackendId backend;
 		std::vector<EncoderParam> params;
 		bool replacePreviousResult = false;
+		std::optional<EncodeRunId> replacedBy;
 		EncodeRunState state = EncodeRunState::Queued;
 		double startedSeconds = 0.0;
 		double finishedSeconds = 0.0;
@@ -260,6 +277,7 @@ namespace codec_gui::gui {
 
 	struct ImageListState {
 		ImageSortKey sortKey = ImageSortKey::CreationTime;
+		std::string metricId; // empty selects the first admitted registry entry
 		bool ascending = true;
 		float scrollOffset = 0.0f;
 	};
@@ -291,6 +309,16 @@ namespace codec_gui::gui {
 		bool importPending = false;
 	};
 
+	struct LivePreviewState {
+        bool enabled=true,busy=false;
+        ImageId source,image;
+        std::weak_ptr<const RawImage> requestedSource;
+        BackendId backend;
+        uint64_t requested=0,displayed=0,minimumGeneration=0;
+        std::vector<EncoderParam> requestedParams,shownParams;
+        double seconds=0;
+        std::string error;
+    };
 	struct AppState {
 		std::vector<ImageObject> images;
 		std::vector<Pane> panes;
@@ -305,9 +333,13 @@ namespace codec_gui::gui {
 		StorageState storage;
 		DebugState debug;
 		InteractionState interaction;
+		LivePreviewState livePreview;
 		// Application workflow state: encoded results are retained unless the user
 		// explicitly enables scratch replacement.
 		bool scratchResults = false;
+		bool decoderInspector=false;
+		bool energyAccessPending=false, energyAccessEnabled=false;
+		std::string energyAccessDomain, energyAccessError;
 		uint64_t nextId = 1;
 	};
 
@@ -340,14 +372,23 @@ namespace codec_gui::gui {
 		CreateDifferenceImage,
 		DerivedImageComputed,
 		DerivedImageFailed,
+		InspectEncoderInput,
 		SelectEncodeRun,
 		StartEncodeRun,
+		SetLivePreviewEnabled,RequestLivePreview,LivePreviewCompleted,LivePreviewFailed,
 		EncodeRunQueued,
 		EncodeRunStarted,
 		EncodeRunCompleted,
 		EncodeRunFailed,
 		CancelEncodeRun,
 		EncodeRunCanceled,
+		ShowEncoderInspector, ShowDecoderInspector, QueryDecoders, DecodersReady, SelectDecoder, SetDecodeRepetitions, StartDecode, CancelDecode, DecodeProgress, DecodeFinished,
+		RequestEnergyAccess, ReleaseEnergyAccess, EnergyAccessReady,
+		RequestMetrics,
+		MetricsStarted,
+		MetricComputed,
+		MetricsCompleted,
+		MetricsFailed,
 		SaveEncodedResult,
 		SaveCompleted,
 		SaveCanceled,
@@ -356,7 +397,7 @@ namespace codec_gui::gui {
 		PointerPressed,
 		PointerReleased,
 		PointerScrolled,
-		KeyPressed,
+		KeyPressed, KeyReleased, WindowFocusLost, ClipboardText,
 		WindowResized,
 		ErrorDismissed,
 	};
@@ -382,6 +423,7 @@ namespace codec_gui::gui {
 	struct DerivedImagePayload {
 		ImageId first;
 		ImageId second;
+        uint64_t firstRevision=0,secondRevision=0;
 		double gain = 1.0;
 		std::string displayName;
 		std::shared_ptr<const RawImage> image;
@@ -405,11 +447,19 @@ namespace codec_gui::gui {
 		EncodeCompletedPayload encodeCompleted;
 		BackendCapabilitiesPayload backendCapabilities;
 		DerivedImagePayload derivedImage;
+		QualityMetricRecord metric;
+		std::vector<std::string> metricIds;
+		DecoderNotification decoder;
 		double value = 0.0;
 		int width = 0;
 		int height = 0;
 		float outputScale = 1.0f;
 		Point point;
+		uint32_t button=272;
+        uint32_t pointerSerial=0; // Native Wayland button-event serial; never synthesize it.
+		uint64_t revision=0;
+		bool shift=false,control=false,alt=false;
+		float scrollX=0;
 	};
 
 	enum class CommandKind {
@@ -418,7 +468,10 @@ namespace codec_gui::gui {
 		LoadSourceImage,
 		QueryBackendCapabilities,
 		RunEncode,
+		RunLivePreview,CancelLivePreview,
 		RequestEncodeCancel,
+		QueryImageDecoders, RunImageDecode, CancelImageDecode,
+		AuthorizeEnergyAccess, CloseEnergyAccess,
 		DecodeEncodedBytes,
 		ComputeMetric,
 		ComputeDerivedImage,
@@ -435,7 +488,10 @@ namespace codec_gui::gui {
 		EncodeRunId run;
 		BackendId backend;
 		std::vector<std::byte> bytes;
+		std::string text;
+		uint64_t revision=0;
 		std::vector<EncoderParam> params;
+		std::vector<std::string> metricIds;
 		double value = 0.0;
 	};
 

@@ -1,8 +1,12 @@
+#include "test_check.hpp"
+#include "../codec_gui_x265.hpp"
 #include "app_state.hpp"
 #include "draw_list.hpp"
 #include "layout.hpp"
 #include "text_atlas.hpp"
+#include "text_shaper.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <algorithm>
@@ -10,6 +14,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace codec_gui;
@@ -54,23 +59,23 @@ void assert_images_are_scissored(const std::vector<DrawCommand>& commands) {
 		if (command.kind == DrawCommandKind::ScissorBegin) {
 			++scissorDepth;
 		} else if (command.kind == DrawCommandKind::ScissorEnd) {
-			assert(scissorDepth > 0);
+			CODEC_VIS_CHECK(scissorDepth > 0);
 			--scissorDepth;
 		} else if (command.kind == DrawCommandKind::Image) {
-			assert(scissorDepth > 0);
+			CODEC_VIS_CHECK(scissorDepth > 0);
 		}
 	}
-	assert(scissorDepth == 0);
+	CODEC_VIS_CHECK(scissorDepth == 0);
 }
 
 void assert_text_clips_to_rect(const DrawCommand& command, TextShaper& shaper) {
-	assert(command.kind == DrawCommandKind::Text);
-	TextAtlas atlas = build_text_atlas({command}, shaper, 128);
+	CODEC_VIS_CHECK(command.kind == DrawCommandKind::Text);
+	TextAtlas const atlas = build_text_atlas({command}, shaper, 128);
 	for (const GlyphQuad& quad : atlas.quads) {
-		assert(quad.rect.x >= command.rect.x - 0.01f);
-		assert(quad.rect.y >= command.rect.y - 0.01f);
-		assert(quad.rect.x + quad.rect.w <= command.rect.x + command.rect.w + 0.01f);
-		assert(quad.rect.y + quad.rect.h <= command.rect.y + command.rect.h + 0.01f);
+		CODEC_VIS_CHECK(quad.rect.x >= command.rect.x - 0.01f);
+		CODEC_VIS_CHECK(quad.rect.y >= command.rect.y - 0.01f);
+		CODEC_VIS_CHECK(quad.rect.x + quad.rect.w <= command.rect.x + command.rect.w + 0.01f);
+		CODEC_VIS_CHECK(quad.rect.y + quad.rect.h <= command.rect.y + command.rect.h + 0.01f);
 	}
 }
 
@@ -103,10 +108,10 @@ int main() {
 	state.images.push_back(encoded);
 	state.selection.selectedImage = encoded.id;
 
-	LayoutResult layout = compute_layout(state.layout, 1280, 720, 1.0f);
+	LayoutResult const layout = compute_layout(state.layout, 1280, 720, 1.0f);
 	ResourceSnapshot resources;
-	resources.textures.push_back({state.images.front().id, TextureId{12}});
-	std::vector<DrawCommand> commands = build_draw_list(state, layout, resources, 0.0);
+	resources.textures.push_back({.image=state.images.front().id, .texture=TextureId{12}});
+	std::vector<DrawCommand> const commands = build_draw_list(state, layout, resources, 0.0);
 	assert_images_are_scissored(commands);
 
 	bool sawImageCommand = false;
@@ -127,7 +132,7 @@ int main() {
 		if (command.kind == DrawCommandKind::Text && command.text.find("1536 B / 1.5 KiB") != std::string::npos) {
 			sawExactByteSize = true;
 		}
-		if (command.kind == DrawCommandKind::Text && command.text == "1") {
+		if (command.kind == DrawCommandKind::Text && command.text == "P1") {
 			sawPaneAssignButton = true;
 		}
 		if (command.kind == DrawCommandKind::Text && command.text == "Diff") {
@@ -143,16 +148,16 @@ int main() {
 			sawImageRatio = true;
 		}
 	}
-	assert(sawImageCommand);
-	assert(sawByteSize);
-	assert(sawExactByteSize);
-	assert(sawPaneAssignButton);
-	assert(sawDifferenceButton);
-	assert(sawMetricUnavailable);
-	assert(sawPreviewUnavailableReason);
-	assert(sawImageRatio);
-	assert(resolve_texture(resources, state.images.front().id).value == 12);
-	assert(!valid(resolve_texture(resources, encoded.id)));
+	CODEC_VIS_CHECK(sawImageCommand);
+	CODEC_VIS_CHECK(sawByteSize);
+	CODEC_VIS_CHECK(sawExactByteSize);
+	CODEC_VIS_CHECK(sawPaneAssignButton);
+	CODEC_VIS_CHECK(sawDifferenceButton);
+	CODEC_VIS_CHECK(sawMetricUnavailable);
+	CODEC_VIS_CHECK(sawPreviewUnavailableReason);
+	CODEC_VIS_CHECK(sawImageRatio);
+	CODEC_VIS_CHECK(resolve_texture(resources, state.images.front().id).value == 12);
+	CODEC_VIS_CHECK(!valid(resolve_texture(resources, encoded.id)));
 
 	{
 		AppState byteOnly = state;
@@ -160,10 +165,10 @@ int main() {
 		byteOnly.images.back().encoded->previewError = "preview decoder is not available";
 		byteOnly.panes.front().image = byteOnly.images.back().id;
 		std::vector<DrawCommand> byteOnlyCommands = build_draw_list(byteOnly, layout, resources, 0.0);
-		const bool sawUnavailablePane = std::any_of(byteOnlyCommands.begin(), byteOnlyCommands.end(), [](const DrawCommand& command) {
+		const bool sawUnavailablePane = std::ranges::any_of(byteOnlyCommands, [](const DrawCommand& command) {
 			return command.kind == DrawCommandKind::Text && command.text.find("Preview unavailable") != std::string::npos;
 		});
-		assert(sawUnavailablePane);
+		CODEC_VIS_CHECK(sawUnavailablePane);
 	}
 
 	{
@@ -173,20 +178,20 @@ int main() {
 		loaded422.sourceLoaded.path = "422.yuv";
 		loaded422.sourceLoaded.image = make_422_image();
 		yuv422 = update(std::move(yuv422), loaded422).state;
-		LayoutResult yuv422Layout = compute_layout(yuv422.layout, 640, 480, 1.0f);
+		LayoutResult const yuv422Layout = compute_layout(yuv422.layout, 640, 480, 1.0f);
 		yuv422.panes.front().transform.scale = 1.0;
 		yuv422.panes.front().transform.centerX = 0.0;
 		yuv422.panes.front().transform.centerY = 0.0;
 		yuv422.interaction.hoveredPane = yuv422.panes.front().id;
 		yuv422.interaction.lastPointer = Point{
-			yuv422Layout.viewer.x + yuv422Layout.viewer.w * 0.5f + 1.0f,
-			yuv422Layout.viewer.y + yuv422Layout.viewer.h * 0.5f + 1.0f
+			.x=yuv422Layout.viewer.x + yuv422Layout.viewer.w * 0.5f + 1.0f,
+			.y=yuv422Layout.viewer.y + yuv422Layout.viewer.h * 0.5f + 1.0f
 		};
 		std::vector<DrawCommand> yuv422Commands = build_draw_list(yuv422, yuv422Layout, resources, 0.0);
-		const bool sawYuv422Sample = std::any_of(yuv422Commands.begin(), yuv422Commands.end(), [](const DrawCommand& command) {
+		const bool sawYuv422Sample = std::ranges::any_of(yuv422Commands, [](const DrawCommand& command) {
 			return command.kind == DrawCommandKind::Text && command.text.find("YUV422 42,111,222") != std::string::npos;
 		});
-		assert(sawYuv422Sample);
+		CODEC_VIS_CHECK(sawYuv422Sample);
 
 		ImageObject yuv422Result;
 		yuv422Result.id = next_image_id(yuv422);
@@ -200,9 +205,15 @@ int main() {
 		reload.kind = ActionKind::SourceLoaded;
 		reload.sourceLoaded.path = "replacement.yuv";
 		reload.sourceLoaded.image = make_image();
+		const ImageId originalSource = yuv422.images.front().id;
 		yuv422 = update(std::move(yuv422), reload).state;
-		assert(yuv422.images.size() == 1);
-		assert(yuv422.images.front().type == ImageObjectType::Source);
+		CODEC_VIS_CHECK(yuv422.images.size() == 3);
+		CODEC_VIS_CHECK(yuv422.images.front().id == originalSource);
+		CODEC_VIS_CHECK(yuv422.images.front().type == ImageObjectType::Source);
+		CODEC_VIS_CHECK(yuv422.images[1].id == yuv422Result.id);
+		CODEC_VIS_CHECK(yuv422.images.back().displayName == "replacement.yuv");
+		CODEC_VIS_CHECK(yuv422.selection.selectedImage == yuv422.images.back().id);
+		CODEC_VIS_CHECK(yuv422.panes.front().image == yuv422.images.back().id);
 	}
 
 	{
@@ -218,7 +229,7 @@ int main() {
 		implementation.group = "Backend";
 		implementation.kind = ParamKind::Enum;
 		implementation.defaultValue = std::string{"fake"};
-		implementation.enumValues = {{"fake", "Fake driver"}};
+		implementation.enumValues = {{.value="fake", .label="Fake driver"}};
 		backend.params.push_back(implementation);
 		EncoderParamInfo unavailable;
 		unavailable.name = "rate-control";
@@ -230,24 +241,24 @@ int main() {
 		state.backends.push_back(backend);
 		state.selection.selectedBackend = backend.id;
 		state.debug.enabled = true;
-		state.debug.recent.push_back({1, "action SourceLoaded -> UploadImageTexture"});
+		state.debug.recent.push_back({.id=1, .message="action SourceLoaded -> UploadImageTexture"});
 		std::vector<DrawCommand> debugCommands = build_draw_list(state, layout, resources, 0.0);
-		const bool sawDebug = std::any_of(debugCommands.begin(), debugCommands.end(), [](const DrawCommand& command) {
+		const bool sawDebug = std::ranges::any_of(debugCommands, [](const DrawCommand& command) {
 			return command.kind == DrawCommandKind::Text && command.text.find("Debug log") != std::string::npos;
 		});
-		const bool sawCapabilityDetail = std::any_of(debugCommands.begin(), debugCommands.end(), [](const DrawCommand& command) {
+		const bool sawCapabilityDetail = std::ranges::any_of(debugCommands, [](const DrawCommand& command) {
 			return command.kind == DrawCommandKind::Text && command.text.find("rate-control = cqp icq") != std::string::npos;
 		});
-		const bool sawIdentityLimitation = std::any_of(debugCommands.begin(), debugCommands.end(), [](const DrawCommand& command) {
+		const bool sawIdentityLimitation = std::ranges::any_of(debugCommands, [](const DrawCommand& command) {
 			return command.kind == DrawCommandKind::Text && command.text.find("identity only") != std::string::npos;
 		});
-		const bool sawUnavailableControl = std::any_of(debugCommands.begin(), debugCommands.end(), [](const DrawCommand& command) {
+		const bool sawUnavailableControl = std::ranges::any_of(debugCommands, [](const DrawCommand& command) {
 			return command.kind == DrawCommandKind::Text && command.text == "unavailable";
 		});
-		assert(sawDebug);
-		assert(sawCapabilityDetail);
-		assert(sawIdentityLimitation);
-		assert(sawUnavailableControl);
+		CODEC_VIS_CHECK(sawDebug);
+		CODEC_VIS_CHECK(sawCapabilityDetail);
+		CODEC_VIS_CHECK(sawIdentityLimitation);
+		CODEC_VIS_CHECK(sawUnavailableControl);
 		state.debug.enabled = false;
 	}
 
@@ -261,14 +272,36 @@ int main() {
 		state.encodeRuns.push_back(run);
 		state.selection.selectedRun = run.id;
 		std::vector<DrawCommand> runCommands = build_draw_list(state, layout, resources, 0.0);
-		const bool sawRunDetails = std::any_of(runCommands.begin(), runCommands.end(), [](const DrawCommand& command) {
+		const bool sawRunDetails = std::ranges::any_of(runCommands, [](const DrawCommand& command) {
 			return command.kind == DrawCommandKind::Text && command.text.find("Selected run") != std::string::npos;
 		});
-		const bool sawRunError = std::any_of(runCommands.begin(), runCommands.end(), [](const DrawCommand& command) {
+		const bool sawRunError = std::ranges::any_of(runCommands, [](const DrawCommand& command) {
 			return command.kind == DrawCommandKind::Text && command.text.find("backend failed") != std::string::npos;
 		});
-		assert(sawRunDetails);
-		assert(sawRunError);
+		CODEC_VIS_CHECK(sawRunDetails);
+		CODEC_VIS_CHECK(sawRunError);
+	}
+	{
+		AppState timed = state;
+		timed.images.back().encoded->encodeSeconds = 0.125;
+		EncodeRun run;
+		run.id = next_run_id(timed);
+		run.source = timed.images.front().id;
+		run.backend = BackendId{1};
+		run.state = EncodeRunState::Completed;
+		run.startedSeconds = 1.0;
+		run.finishedSeconds = 6.0;
+		run.producedImage = timed.images.back().id;
+		timed.encodeRuns = {run};
+		timed.selection.selectedRun = run.id;
+		const auto nativeLayout = compute_layout(timed.layout, 2880, 1800, 1.0f);
+		const auto timedCommands = build_draw_list(timed, nativeLayout, resources, 0.0);
+		CODEC_VIS_CHECK(std::ranges::any_of(timedCommands, [](const DrawCommand& c) {
+			return c.kind == DrawCommandKind::Text && c.text.find("completed  encode 0.125 s") != std::string::npos;
+		}));
+		CODEC_VIS_CHECK(std::ranges::any_of(timedCommands, [](const DrawCommand& c) {
+			return c.kind == DrawCommandKind::Text && c.text == "Total run time: 5.000 s";
+		}));
 	}
 
 	{
@@ -314,7 +347,7 @@ int main() {
 		resultMetadata.bytes.resize(1536);
 		resultMetadata.byteSize = resultMetadata.bytes.size();
 		resultMetadata.psnrY = 42.13;
-		resultMetadata.metrics.push_back(QualityMetricRecord{"ms-ssim", "MS-SSIM", 0.98765, "", true, {}});
+		resultMetadata.metrics.push_back(QualityMetricRecord{.id="ms-ssim", .label="MS-SSIM", .value=0.98765, .unit="", .higherIsBetter=true, .unavailableReason={}});
 		result.encoded = resultMetadata;
 		narrow.images.push_back(result);
 		narrow.selection.selectedImage = result.id;
@@ -329,9 +362,9 @@ int main() {
 		narrow.encodeRuns.push_back(failed);
 		narrow.selection.selectedRun = failed.id;
 
-		LayoutResult narrowLayout = compute_layout(narrow.layout, 760, 540, 1.0f);
-		ResourceSnapshot narrowResources;
-		std::vector<DrawCommand> narrowCommands = build_draw_list(narrow, narrowLayout, narrowResources, 0.0);
+		LayoutResult const narrowLayout = compute_layout(narrow.layout, 760, 540, 1.0f);
+		ResourceSnapshot const narrowResources;
+		std::vector<DrawCommand> const narrowCommands = build_draw_list(narrow, narrowLayout, narrowResources, 0.0);
 		bool sawLongBackend = false;
 		bool sawLongError = false;
 		bool sawCriticalBytes = false;
@@ -340,8 +373,8 @@ int main() {
 			if (command.kind != DrawCommandKind::Text) {
 				continue;
 			}
-			assert(command.rect.w > 0.0f);
-			assert(command.rect.h > 0.0f);
+			CODEC_VIS_CHECK(command.rect.w > 0.0f);
+			CODEC_VIS_CHECK(command.rect.h > 0.0f);
 			if (command.text.find(longBackend) != std::string::npos) {
 				sawLongBackend = true;
 				assert_text_clips_to_rect(command, shaper);
@@ -359,10 +392,10 @@ int main() {
 				assert_text_clips_to_rect(command, shaper);
 			}
 		}
-		assert(sawLongBackend);
-		assert(sawLongError);
-		assert(sawCriticalBytes);
-		assert(sawCriticalPsnr);
+		CODEC_VIS_CHECK(sawLongBackend);
+		CODEC_VIS_CHECK(sawLongError);
+		CODEC_VIS_CHECK(sawCriticalBytes);
+		CODEC_VIS_CHECK(sawCriticalPsnr);
 	}
 
 	{
@@ -376,15 +409,15 @@ int main() {
 		active.state = EncodeRunState::Running;
 		collapsed.encodeRuns.push_back(active);
 		collapsed.selection.selectedRun = active.id;
-		LayoutResult collapsedLayout = compute_layout(collapsed.layout, 760, 540, 1.0f);
+		LayoutResult const collapsedLayout = compute_layout(collapsed.layout, 760, 540, 1.0f);
 		std::vector<DrawCommand> collapsedCommands = build_draw_list(collapsed, collapsedLayout, resources, 0.0);
-		const bool sawStatusBarRun = std::any_of(collapsedCommands.begin(), collapsedCommands.end(), [](const DrawCommand& command) {
+		const bool sawStatusBarRun = std::ranges::any_of(collapsedCommands, [](const DrawCommand& command) {
 			return command.kind == DrawCommandKind::Text &&
 			       command.text.find("Run ") != std::string::npos &&
 			       command.text.find("running") != std::string::npos;
 		});
-		assert(sawStatusBarRun);
-		assert(collapsedLayout.statusBar.h > 0.0f);
+		CODEC_VIS_CHECK(sawStatusBarRun);
+		CODEC_VIS_CHECK(collapsedLayout.statusBar.h > 0.0f);
 	}
 
 	{
@@ -399,30 +432,30 @@ int main() {
 		state = update(std::move(state), assign).state;
 		state.viewMode.kind = ViewModeKind::Blink;
 		state.viewMode.paneOrder = {state.panes.front().id, state.panes.back().id};
-		resources.textures.push_back({encoded.id, TextureId{13}});
-		std::vector<DrawCommand> firstBlink = build_draw_list(state, layout, resources, 0.0);
-		std::vector<DrawCommand> secondBlink = build_draw_list(state, layout, resources, 0.6);
+		resources.textures.push_back({.image=encoded.id, .texture=TextureId{13}});
+		std::vector<DrawCommand> const firstBlink = build_draw_list(state, layout, resources, 0.0);
+		std::vector<DrawCommand> const secondBlink = build_draw_list(state, layout, resources, 0.6);
 		auto blinkImage = [](const std::vector<DrawCommand>& list) {
-			const auto it = std::find_if(list.begin(), list.end(), [](const DrawCommand& command) {
+			const auto it = std::ranges::find_if(list, [](const DrawCommand& command) {
 				return command.kind == DrawCommandKind::Image;
 			});
 			return it == list.end() ? ImageId{} : it->image;
 		};
-		assert(state.panes.front().image);
-		assert(blinkImage(firstBlink) == *state.panes.front().image);
-		assert(blinkImage(secondBlink) == encoded.id);
+		CODEC_VIS_CHECK(state.panes.front().image);
+		CODEC_VIS_CHECK(blinkImage(firstBlink) == *state.panes.front().image);
+		CODEC_VIS_CHECK(blinkImage(secondBlink) == encoded.id);
 		auto blinkRect = [](const std::vector<DrawCommand>& list) {
-			const auto it = std::find_if(list.begin(), list.end(), [](const DrawCommand& command) {
+			const auto it = std::ranges::find_if(list, [](const DrawCommand& command) {
 				return command.kind == DrawCommandKind::Image;
 			});
 			return it == list.end() ? Rect{} : it->rect;
 		};
 		const Rect firstRect = blinkRect(firstBlink);
 		const Rect secondRect = blinkRect(secondBlink);
-		assert(std::fabs(firstRect.x - secondRect.x) < 0.01f);
-		assert(std::fabs(firstRect.y - secondRect.y) < 0.01f);
-		assert(std::fabs(firstRect.w - secondRect.w) < 0.01f);
-		assert(std::fabs(firstRect.h - secondRect.h) < 0.01f);
+		CODEC_VIS_CHECK(std::fabs(firstRect.x - secondRect.x) < 0.01f);
+		CODEC_VIS_CHECK(std::fabs(firstRect.y - secondRect.y) < 0.01f);
+		CODEC_VIS_CHECK(std::fabs(firstRect.w - secondRect.w) < 0.01f);
+		CODEC_VIS_CHECK(std::fabs(firstRect.h - secondRect.h) < 0.01f);
 	}
 
 	{
@@ -445,11 +478,11 @@ int main() {
 		splitAssign.pane = splitState.panes.back().id;
 		splitAssign.image = splitEncoded.id;
 		splitState = update(std::move(splitState), splitAssign).state;
-		LayoutResult splitLayout = compute_layout(splitState.layout, 1280, 720, 1.0f);
+		LayoutResult const splitLayout = compute_layout(splitState.layout, 1280, 720, 1.0f);
 		ResourceSnapshot splitResources;
-		splitResources.textures.push_back({splitState.images.front().id, TextureId{21}});
-		splitResources.textures.push_back({splitEncoded.id, TextureId{22}});
-		std::vector<DrawCommand> splitCommands = build_draw_list(splitState, splitLayout, splitResources, 0.0);
+		splitResources.textures.push_back({.image=splitState.images.front().id, .texture=TextureId{21}});
+		splitResources.textures.push_back({.image=splitEncoded.id, .texture=TextureId{22}});
+		std::vector<DrawCommand> const splitCommands = build_draw_list(splitState, splitLayout, splitResources, 0.0);
 		std::vector<Rect> imageRects;
 		std::vector<Rect> scissors;
 		for (const DrawCommand& command : splitCommands) {
@@ -463,14 +496,14 @@ int main() {
 				imageRects.push_back(command.rect);
 			}
 		}
-		assert(imageRects.size() >= 2);
-		assert(scissors.size() >= 2);
-		assert(std::fabs(imageRects[0].x - imageRects[1].x) < 0.01f);
-		assert(std::fabs(imageRects[0].y - imageRects[1].y) < 0.01f);
-		assert(std::fabs(imageRects[0].w - imageRects[1].w) < 0.01f);
-		assert(std::fabs(imageRects[0].h - imageRects[1].h) < 0.01f);
-		assert(scissors[0].w < splitLayout.viewer.w);
-		assert(scissors[1].x > splitLayout.viewer.x);
+		CODEC_VIS_CHECK(imageRects.size() >= 2);
+		CODEC_VIS_CHECK(scissors.size() >= 2);
+		CODEC_VIS_CHECK(std::fabs(imageRects[0].x - imageRects[1].x) < 0.01f);
+		CODEC_VIS_CHECK(std::fabs(imageRects[0].y - imageRects[1].y) < 0.01f);
+		CODEC_VIS_CHECK(std::fabs(imageRects[0].w - imageRects[1].w) < 0.01f);
+		CODEC_VIS_CHECK(std::fabs(imageRects[0].h - imageRects[1].h) < 0.01f);
+		CODEC_VIS_CHECK(scissors[0].w < splitLayout.viewer.w);
+		CODEC_VIS_CHECK(scissors[1].x > splitLayout.viewer.x);
 	}
 
 	return 0;

@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+APPDIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+LIBDIR="$APPDIR/lib"
+
+export LIBHEIF_PLUGIN_PATHS="$LIBDIR/libheif"
+export CODEC_VIS_ASSET_DIR="$APPDIR/share/codec_vis/shaders"
+export FONTCONFIG_FILE="$APPDIR/etc/fonts/fonts.conf"
+export FONTCONFIG_PATH="$APPDIR/etc/fonts"
+export FONTCONFIG_SYSROOT="$APPDIR"
+
+if [ ! -x "$LIBDIR/@LOADER@" ]; then
+	printf '%s\n' "codec_vis: bundled ELF loader is missing: $LIBDIR/@LOADER@" >&2
+	exit 127
+fi
+
+exec "$LIBDIR/@LOADER@" \
+	--library-path "$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+	"$APPDIR/bin/@PROGRAM@" "$@"

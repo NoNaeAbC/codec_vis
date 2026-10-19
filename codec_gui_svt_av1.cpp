@@ -1,18 +1,24 @@
 // codec_gui_svt_av1.cpp
+#include "EbSvtAv1.h"
+#include "EbSvtAv1Formats.h"
 #include "codec_gui_x265.hpp"
 
 #include <algorithm>
 #include <array>
+#include <cstdarg>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <ios>
 #include <memory>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 extern "C" {
@@ -73,21 +79,21 @@ struct FormatInfo {
 [[nodiscard]] FormatInfo format_info(const PixelFormat format) {
 	switch (format) {
 		case PixelFormat::YUV420P8:
-			return {EB_YUV420, MAIN_PROFILE, 8, 3, {1, 2, 2}, {1, 2, 2}};
+			return {.colorFormat=EB_YUV420, .profile=MAIN_PROFILE, .bitDepth=8, .planeCount=3, .widthDiv={1, 2, 2}, .heightDiv={1, 2, 2}};
 			case PixelFormat::YUV420P10LE:
-				return {EB_YUV420, MAIN_PROFILE, 10, 3, {1, 2, 2}, {1, 2, 2}};
+				return {.colorFormat=EB_YUV420, .profile=MAIN_PROFILE, .bitDepth=10, .planeCount=3, .widthDiv={1, 2, 2}, .heightDiv={1, 2, 2}};
 			case PixelFormat::YUV422P8:
-				return {EB_YUV422, PROFESSIONAL_PROFILE, 8, 3, {1, 2, 2}, {1, 1, 1}};
+				return {.colorFormat=EB_YUV422, .profile=PROFESSIONAL_PROFILE, .bitDepth=8, .planeCount=3, .widthDiv={1, 2, 2}, .heightDiv={1, 1, 1}};
 			case PixelFormat::YUV422P10LE:
-				return {EB_YUV422, PROFESSIONAL_PROFILE, 10, 3, {1, 2, 2}, {1, 1, 1}};
+				return {.colorFormat=EB_YUV422, .profile=PROFESSIONAL_PROFILE, .bitDepth=10, .planeCount=3, .widthDiv={1, 2, 2}, .heightDiv={1, 1, 1}};
 			case PixelFormat::YUV444P8:
-			return {EB_YUV444, HIGH_PROFILE, 8, 3, {1, 1, 1}, {1, 1, 1}};
+			return {.colorFormat=EB_YUV444, .profile=HIGH_PROFILE, .bitDepth=8, .planeCount=3, .widthDiv={1, 1, 1}, .heightDiv={1, 1, 1}};
 		case PixelFormat::YUV444P10LE:
-			return {EB_YUV444, PROFESSIONAL_PROFILE, 10, 3, {1, 1, 1}, {1, 1, 1}};
+			return {.colorFormat=EB_YUV444, .profile=PROFESSIONAL_PROFILE, .bitDepth=10, .planeCount=3, .widthDiv={1, 1, 1}, .heightDiv={1, 1, 1}};
 		case PixelFormat::Gray8:
-			return {EB_YUV400, MAIN_PROFILE, 8, 1, {1, 1, 1}, {1, 1, 1}};
+			return {.colorFormat=EB_YUV400, .profile=MAIN_PROFILE, .bitDepth=8, .planeCount=1, .widthDiv={1, 1, 1}, .heightDiv={1, 1, 1}};
 		case PixelFormat::Gray10LE:
-			return {EB_YUV400, MAIN_PROFILE, 10, 1, {1, 1, 1}, {1, 1, 1}};
+			return {.colorFormat=EB_YUV400, .profile=MAIN_PROFILE, .bitDepth=10, .planeCount=1, .widthDiv={1, 1, 1}, .heightDiv={1, 1, 1}};
 		case PixelFormat::YUV420P12LE: case PixelFormat::YUV420P14LE:
 		case PixelFormat::YUV422P12LE: case PixelFormat::YUV422P14LE:
 		case PixelFormat::YUV444P12LE: case PixelFormat::YUV444P14LE:
@@ -364,9 +370,9 @@ void force_still_image_config(EbSvtAv1EncConfiguration& cfg, const RawImage& ima
 	std::string explanation
 ) {
 	parameter.enabledWhen.push_back({
-		std::move(controller),
-		std::move(acceptedValues),
-		std::move(explanation),
+		.parameter=std::move(controller),
+		.acceptedValues=std::move(acceptedValues),
+		.explanation=std::move(explanation),
 	});
 	return parameter;
 }
@@ -380,7 +386,7 @@ std::vector<EncoderParamInfo> query_svt_av1_parameters() {
 			"Preset",
 			"Speed / Quality",
 			8,
-			{-1, 13, 1},
+			{.min=-1, .max=13, .step=1},
 			"SVT-AV1 encoder preset. Lower is slower and higher quality; higher is faster."
 		),
 		enum_param(
@@ -388,7 +394,7 @@ std::vector<EncoderParamInfo> query_svt_av1_parameters() {
 			"Mode",
 			"Rate Control",
 			"crf",
-			{{"crf", "Constant quality (CRF)"}, {"cqp", "Constant QP"}, {"lossless", "Lossless"}},
+			{{.value="crf", .label="Constant quality (CRF)"}, {.value="cqp", .label="Constant QP"}, {.value="lossless", .label="Lossless"}},
 			"Select one mutually exclusive SVT-AV1 rate-control strategy."
 		),
 		enabled_when(float_param(
@@ -396,7 +402,7 @@ std::vector<EncoderParamInfo> query_svt_av1_parameters() {
 			"CRF",
 			"Rate Control",
 			35.0,
-			{1.0, 70.0, 0.25},
+			{.min=1.0, .max=70.0, .step=0.25},
 			"Constant rate factor. Lower values improve quality and increase size."
 		), "rate-control", {"crf"}, "CRF applies only in constant-quality mode."),
 		enabled_when(int_param(
@@ -404,7 +410,7 @@ std::vector<EncoderParamInfo> query_svt_av1_parameters() {
 			"QP",
 			"Rate Control",
 			35,
-			{1, 63, 1},
+			{.min=1, .max=63, .step=1},
 			"Initial quantizer. Used directly when adaptive quantization is disabled."
 		), "rate-control", {"cqp"}, "QP applies only in constant-QP mode."),
 		enabled_when(enum_param(
@@ -413,35 +419,35 @@ std::vector<EncoderParamInfo> query_svt_av1_parameters() {
 			"Rate Control",
 			"2",
 			{
-				{"0", "Off / CQP"},
-				{"1", "Variance AQ"},
-				{"2", "Delta-Q / CRF"},
+				{.value="0", .label="Off / CQP"},
+				{.value="1", .label="Variance AQ"},
+				{.value="2", .label="Delta-Q / CRF"},
 			},
 			"Adaptive quantization mode. SVT-AV1 CRF mode uses aq-mode 2."
 		), "rate-control", {"crf"}, "Adaptive quantization applies only in CRF mode."),
-		enum_param(
+		enabled_when(enum_param(
 			"tune",
 			"Tune",
 			"Quality Metric",
 			"3",
 			{
-				{"0", "VQ"},
-				{"1", "PSNR"},
-				{"2", "SSIM"},
-				{"3", "Image Quality"},
-				{"4", "MS-SSIM / SSIMULACRA2"},
+				{.value="0", .label="VQ"},
+				{.value="1", .label="PSNR"},
+				{.value="2", .label="SSIM"},
+				{.value="3", .label="Image Quality"},
+				{.value="4", .label="MS-SSIM / SSIMULACRA2"},
 			},
-			"Metric or perceptual target used by SVT-AV1 mode decisions."
-		),
+			"Metric or perceptual target used by SVT-AV1 mode decisions. Lossless coding uses PSNR tuning to preserve samples."
+		), "rate-control", {"crf", "cqp"}, "Lossless coding uses PSNR tuning; IQ tuning changes samples in the tested SVT build."),
 		enum_param(
 			"enable-dlf",
 			"Deblocking",
 			"Filters",
 			"1",
 			{
-				{"0", "Disabled"},
-				{"1", "Enabled"},
-				{"2", "Accurate"},
+				{.value="0", .label="Disabled"},
+				{.value="1", .label="Enabled"},
+				{.value="2", .label="Accurate"},
 			},
 			"Deblocking loop filter control."
 		),
@@ -465,10 +471,10 @@ std::vector<EncoderParamInfo> query_svt_av1_parameters() {
 			"Content Tools",
 			"2",
 			{
-				{"0", "Off"},
-				{"1", "On"},
-				{"2", "Adaptive"},
-				{"3", "Adaptive anti-aliased"},
+				{.value="0", .label="Off"},
+				{.value="1", .label="On"},
+				{.value="2", .label="Adaptive"},
+				{.value="3", .label="Adaptive anti-aliased"},
 			},
 			"Screen-content detection level."
 		),
@@ -484,7 +490,7 @@ std::vector<EncoderParamInfo> query_svt_av1_parameters() {
 			"Sharpness",
 			"Psychovisual",
 			0,
-			{-7, 7, 1},
+			{.min=-7, .max=7, .step=1},
 			"Bias deblocking and rate distortion toward softer or sharper output."
 		),
 		bool_param(
@@ -500,9 +506,9 @@ std::vector<EncoderParamInfo> query_svt_av1_parameters() {
 			"Psychovisual",
 			"0",
 			{
-				{"0", "Default"},
-				{"1", "Low-medium contrast"},
-				{"2", "Still picture"},
+				{.value="0", .label="Default"},
+				{.value="1", .label="Low-medium contrast"},
+				{.value="2", .label="Still picture"},
 			},
 			"Curve used by variance boost. Curve 2 is intended for still pictures."
 		),
@@ -511,7 +517,7 @@ std::vector<EncoderParamInfo> query_svt_av1_parameters() {
 			"Max transform size",
 			"Transforms",
 			64,
-			{32, 64, 32},
+			{.min=32, .max=64, .step=32},
 			"Limit AV1 transform size. 32 can be useful for still-image detail."
 		),
 		float_param(
@@ -519,7 +525,7 @@ std::vector<EncoderParamInfo> query_svt_av1_parameters() {
 			"AC bias",
 			"Psychovisual",
 			0.0,
-			{0.0, 8.0, 0.05},
+			{.min=0.0, .max=8.0, .step=0.05},
 			"Bias the internal RD metric toward high-frequency detail preservation."
 		),
 	};
@@ -537,7 +543,7 @@ EncodedImage encode_svt_av1_still_image(const RawImage& image, std::span<const E
 
 	force_still_image_config(cfg, image, info);
 
-	const auto rateControl = std::find_if(params.begin(), params.end(), [](const EncoderParam& param) {
+	const auto rateControl = std::ranges::find_if(params, [](const EncoderParam& param) {
 		return param.name == "rate-control";
 	});
 	const std::string rateControlMode =
@@ -558,6 +564,9 @@ EncodedImage encode_svt_av1_still_image(const RawImage& image, std::span<const E
 		parse_or_throw(cfg, "aq-mode", "0");
 	} else if (rateControlMode == "lossless") {
 		parse_or_throw(cfg, "lossless", "1");
+        // SVT 4.2 IQ tuning (the GUI default) changes samples even when its
+        // lossless flag is set. PSNR tuning preserves the lossless contract.
+        parse_or_throw(cfg, "tune", "1");
 	} else if (!rateControlMode.empty() && rateControlMode != "crf") {
 		throw std::invalid_argument("unsupported SVT-AV1 rate-control mode: " + rateControlMode);
 	}
@@ -572,7 +581,7 @@ EncodedImage encode_svt_av1_still_image(const RawImage& image, std::span<const E
 
 	EbBufferHeaderType* rawHeader = nullptr;
 	checked_svt_call(svt_av1_enc_stream_header(encoder.get(), &rawHeader), "stream_header");
-	HeaderPtr header{rawHeader};
+	HeaderPtr const header{rawHeader};
 	append_buffer(obu, *header);
 
 	EbSvtIOFormat input{};

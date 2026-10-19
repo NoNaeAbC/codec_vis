@@ -11,10 +11,15 @@ Checks: >
   -readability-magic-numbers,
   -readability-function-cognitive-complexity,
   -misc-non-private-member-variables-in-classes,
+  -misc-include-cleaner,
   -modernize-avoid-c-arrays,
+  -readability-identifier-naming
 
 
 WarningsAsErrors: ''
+
+HeaderFilterRegex: '^(?!/usr/)'
+ExcludeHeaderFilterRegex: '(^|/)build/'
 
 FormatStyle: none
 
@@ -35,8 +40,6 @@ CheckOptions:
     value: Camel_Snake_Case
   - key: readability-identifier-naming.StructCase
     value: Camel_Snake_Case
-  - key: readability-identifier-naming.FunctionCase
-    value: lower_case
   - key: readability-identifier-naming.FunctionCase
     value: lower_case
   - key: readability-identifier-naming.VariableCase

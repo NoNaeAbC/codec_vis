@@ -1,4 +1,5 @@
 #include "layout.hpp"
+#include "app_state.hpp"
 
 #include <algorithm>
 
@@ -12,10 +13,10 @@ LayoutResult compute_layout(const LayoutState& layout, int framebufferWidth, int
 	const float minViewerW = 480.0f * scale;
 
 	LayoutResult out;
-	out.commandBar = {0, 0, static_cast<float>(framebufferWidth), commandH};
-	out.statusBar = {0, static_cast<float>(framebufferHeight) - statusH, static_cast<float>(framebufferWidth), statusH};
+	out.commandBar = {.x=0, .y=0, .w=static_cast<float>(framebufferWidth), .h=commandH};
+	out.statusBar = {.x=0, .y=static_cast<float>(framebufferHeight) - statusH, .w=static_cast<float>(framebufferWidth), .h=statusH};
 
-	Rect content{0, commandH, static_cast<float>(framebufferWidth), std::max(0.0f, static_cast<float>(framebufferHeight) - commandH - statusH)};
+	Rect const content{.x=0, .y=commandH, .w=static_cast<float>(framebufferWidth), .h=std::max(0.0f, static_cast<float>(framebufferHeight) - commandH - statusH)};
 	float imageListW = layout.imageListCollapsed ? collapsedW : layout.imageListWidth * scale;
 	float inspectorW = layout.inspectorCollapsed ? collapsedW : layout.inspectorWidth * scale;
 	out.imageListCollapsed = layout.imageListCollapsed;
@@ -36,9 +37,9 @@ LayoutResult compute_layout(const LayoutState& layout, int framebufferWidth, int
 		out.imageListCollapsed = true;
 	}
 
-	out.imageList = {content.x, content.y, imageListW, content.h};
-	out.inspector = {content.x + content.w - inspectorW, content.y, inspectorW, content.h};
-	out.viewer = {content.x + imageListW, content.y, std::max(0.0f, content.w - imageListW - inspectorW), content.h};
+	out.imageList = {.x=content.x, .y=content.y, .w=imageListW, .h=content.h};
+	out.inspector = {.x=content.x + content.w - inspectorW, .y=content.y, .w=inspectorW, .h=content.h};
+	out.viewer = {.x=content.x + imageListW, .y=content.y, .w=std::max(0.0f, content.w - imageListW - inspectorW), .h=content.h};
 	return out;
 }
 

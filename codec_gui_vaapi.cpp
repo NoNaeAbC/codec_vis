@@ -1,5 +1,6 @@
 // codec_gui_vaapi.cpp
 #include "codec_gui_x265.hpp"
+#include "gui/image_size_target.hpp"
 
 #include <algorithm>
 #include <array>
@@ -8,14 +9,18 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <fcntl.h>
 #include <filesystem>
 #include <iterator>
-#include <memory>
+#include <limits>
+#include <tuple>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -163,7 +168,7 @@ int bits_required(uint32_t value) {
 std::vector<uint8_t> escape_rbsp(const std::vector<uint8_t>& rbsp) {
 	std::vector<uint8_t> out;
 	int zeroCount = 0;
-	for (uint8_t byte : rbsp) {
+	for (uint8_t const byte : rbsp) {
 		if (zeroCount >= 2 && byte <= 0x03) {
 			out.push_back(0x03);
 			zeroCount = 0;
@@ -174,18 +179,35 @@ std::vector<uint8_t> escape_rbsp(const std::vector<uint8_t>& rbsp) {
 	return out;
 }
 
-std::vector<std::byte> hevc_slice_header(int32_t qpDelta, bool sao, bool loopFilterAcrossSlices, bool entryPointsPresent) {
+std::vector<std::byte> hevc_slice_header(const VAEncSliceParameterBufferHEVC& slice, bool sao, bool loopFilterAcrossSlices, bool entryPointsPresent, uint32_t pictureCtuCount) {
 	BitWriter bw;
-	bw.bit(true);      // first_slice_segment_in_pic_flag
+	const bool first = slice.slice_segment_address == 0;
+	bw.bit(first);
 	bw.bit(false);     // no_output_of_prior_pics_flag
 	bw.ue(0);          // slice_pic_parameter_set_id
-	bw.ue(2);          // slice_type: I
+	if (!first) bw.bits(slice.slice_segment_address, bits_required(pictureCtuCount - 1));
+	bw.ue(slice.slice_type);
 	if (sao) {
-		bw.bit(true);  // slice_sao_luma_flag
-		bw.bit(true);  // slice_sao_chroma_flag
+		bw.bit(slice.slice_fields.bits.slice_sao_luma_flag != 0);
+		bw.bit(slice.slice_fields.bits.slice_sao_chroma_flag != 0);
 	}
-	bw.se(qpDelta);    // slice_qp_delta
-	if (sao) {
+	if (slice.slice_type == 1) {
+		bw.bit(false); // one current-picture reference, no override
+		bw.ue(5u - slice.max_num_merge_cand);
+	}
+	bw.se(slice.slice_qp_delta);
+	bw.se(slice.slice_cb_qp_offset);
+	bw.se(slice.slice_cr_qp_offset);
+	bw.bit(true); // deblocking_filter_override_flag
+	const bool deblock = slice.slice_fields.bits.slice_deblocking_filter_disabled_flag == 0;
+	bw.bit(!deblock);
+	if (deblock) {
+		bw.se(slice.slice_beta_offset_div2);
+		bw.se(slice.slice_tc_offset_div2);
+	}
+	if (loopFilterAcrossSlices && (deblock || (sao && (slice.slice_fields.bits.slice_sao_luma_flag || slice.slice_fields.bits.slice_sao_chroma_flag)))) {
+        // Deblocking is enabled even when SAO is off, so this flag remains
+        // present whenever the PPS permits filtering across slices.
 		bw.bit(loopFilterAcrossSlices);
 	}
 	if (entryPointsPresent) {
@@ -197,24 +219,38 @@ std::vector<std::byte> hevc_slice_header(int32_t qpDelta, bool sao, bool loopFil
 		std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x01},
 		std::byte{0x26}, std::byte{0x01},
 	};
-	for (uint8_t byte : escape_rbsp(bw.bytes)) {
+	for (uint8_t const byte : escape_rbsp(bw.bytes)) {
 		nal.push_back(std::byte{byte});
 	}
 	return nal;
 }
 
-void hevc_profile_tier_level(BitWriter& bw, uint8_t profileIdc, uint8_t levelIdc, bool highTier) {
+void hevc_profile_tier_level(BitWriter& bw, uint8_t profileIdc, uint8_t levelIdc, bool highTier, uint32_t depth, uint32_t chroma) {
 	bw.bits(0, 2);
 	bw.bit(highTier);
 	bw.bits(profileIdc, 5);
-	for (uint8_t idc = 1; idc <= 32; ++idc) {
+	for (uint8_t idc = 0; idc < 32; ++idc) {
 		bw.bit(idc == profileIdc);
 	}
 	bw.bit(true);
 	bw.bit(false);
-	bw.bit(false);
+	bw.bit(true); // non-packed source
 	bw.bit(true);
-	bw.bits(0, 44);
+	if (profileIdc == 4 || profileIdc == 9) {
+		bw.bit(depth <= 12);
+		bw.bit(depth <= 10);
+		// HEVC has Main 4:2:2 10, but no Main 4:2:2 8 profile.
+		bw.bit(depth == 8 && chroma != 2);
+		bw.bit(chroma <= 2);
+		bw.bit(chroma <= 1);
+		bw.bit(false); // not monochrome
+		bw.bit(false); // no intra profile constraint (SCC uses self prediction)
+		bw.bit(false); // no one-picture-only profile constraint
+		bw.bit(true); // lower bit rate constraint
+		if (profileIdc == 9) { bw.bit(true); bw.bits(0, 33); }
+		else bw.bits(0, 34);
+		bw.bit(false); // inbld
+	} else bw.bits(0, 44);
 	bw.bits(levelIdc, 8);
 }
 
@@ -223,13 +259,13 @@ std::vector<std::byte> make_hevc_nal(uint8_t nalType, const std::vector<uint8_t>
 		std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x01},
 		std::byte{static_cast<uint8_t>(nalType << 1u)}, std::byte{0x01},
 	};
-	for (uint8_t byte : escape_rbsp(rbsp)) {
+	for (uint8_t const byte : escape_rbsp(rbsp)) {
 		nal.push_back(std::byte{byte});
 	}
 	return nal;
 }
 
-std::vector<std::byte> hevc_vps_header(uint8_t profileIdc, uint8_t levelIdc, bool highTier) {
+std::vector<std::byte> hevc_vps_header(uint8_t profileIdc, uint8_t levelIdc, bool highTier, uint32_t depth, uint32_t chroma, bool ibc) {
 	BitWriter bw;
 	bw.bits(0, 4);
 	bw.bit(true);
@@ -238,11 +274,11 @@ std::vector<std::byte> hevc_vps_header(uint8_t profileIdc, uint8_t levelIdc, boo
 	bw.bits(0, 3);
 	bw.bit(true);
 	bw.bits(0xffff, 16);
-	hevc_profile_tier_level(bw, profileIdc, levelIdc, highTier);
+	hevc_profile_tier_level(bw, profileIdc, levelIdc, highTier, depth, chroma);
 	bw.bit(false);
-	bw.ue(0);
-	bw.bits(0, 5);
-	bw.ue(0);
+	bw.ue(ibc ? 1 : 0); // filtered and unfiltered current picture for IBC
+	bw.ue(0); // vps_max_num_reorder_pics
+	bw.ue(0); // vps_max_latency_increase_plus1
 	bw.bits(0, 6);
 	bw.ue(0);
 	bw.bit(false);
@@ -254,19 +290,24 @@ std::vector<std::byte> hevc_vps_header(uint8_t profileIdc, uint8_t levelIdc, boo
 std::vector<std::byte> hevc_sps_header(
 	int width,
 	int height,
+	int displayWidth,
+	int displayHeight,
 	uint8_t profileIdc,
 	uint8_t levelIdc,
 	bool highTier,
 	uint32_t chromaFormat,
 	uint32_t depthMinus8,
 	bool sao,
-	bool strongIntraSmoothing
+	bool strongIntraSmoothing,
+    const ColorDescription& color,
+    bool palette,
+    bool ibc
 ) {
 	BitWriter bw;
 	bw.bits(0, 4);
 	bw.bits(0, 3);
 	bw.bit(true);
-	hevc_profile_tier_level(bw, profileIdc, levelIdc, highTier);
+	hevc_profile_tier_level(bw, profileIdc, levelIdc, highTier, depthMinus8 + 8, chromaFormat);
 	bw.ue(0);
 	bw.ue(chromaFormat);
 	if (chromaFormat == 3) {
@@ -274,12 +315,19 @@ std::vector<std::byte> hevc_sps_header(
 	}
 	bw.ue(static_cast<uint32_t>(width));
 	bw.ue(static_cast<uint32_t>(height));
-	bw.bit(false);
+	const bool cropped = width != displayWidth || height != displayHeight;
+	bw.bit(cropped);
+	if (cropped) {
+		bw.ue(0);
+		bw.ue(static_cast<uint32_t>((width - displayWidth) / (chromaFormat == 3 ? 1 : 2)));
+		bw.ue(0);
+		bw.ue(static_cast<uint32_t>((height - displayHeight) / (chromaFormat == 1 ? 2 : 1)));
+	}
 	bw.ue(depthMinus8);
 	bw.ue(depthMinus8);
 	bw.ue(4);
 	bw.bit(false);
-	bw.ue(0);
+	bw.ue(ibc ? 1 : 0); // sps_max_dec_pic_buffering_minus1
 	bw.ue(0);
 	bw.ue(0);
 	bw.ue(0);
@@ -296,13 +344,49 @@ std::vector<std::byte> hevc_sps_header(
 	bw.bit(false);
 	bw.bit(false);
 	bw.bit(strongIntraSmoothing);
-	bw.bit(false);
-	bw.bit(false);
+    bw.bit(true); // vui_parameters_present_flag
+    bw.bit(false); // aspect_ratio_info_present_flag
+    bw.bit(false); // overscan_info_present_flag
+    bw.bit(true); // video_signal_type_present_flag
+    bw.bits(5, 3); // unspecified video format
+    bw.bit(color.range == ColorRange::Full);
+    bw.bit(true); // colour_description_present_flag
+    bw.bits(static_cast<uint8_t>(color.primaries), 8);
+    bw.bits(static_cast<uint8_t>(color.transfer), 8);
+    bw.bits(static_cast<uint8_t>(color.matrix), 8);
+    const bool chromaLocation = chromaFormat == 1 && color.chroma420Location.has_value();
+    bw.bit(chromaLocation);
+    if (chromaLocation) {
+        bw.ue(static_cast<uint32_t>(*color.chroma420Location));
+        bw.ue(static_cast<uint32_t>(*color.chroma420Location));
+    }
+    bw.bit(false); // neutral_chroma_indication_flag
+    bw.bit(false); // field_seq_flag
+    bw.bit(false); // frame_field_info_present_flag
+    bw.bit(false); // default_display_window_flag
+    bw.bit(false); // vui_timing_info_present_flag
+    bw.bit(false); // bitstream_restriction_flag
+	const bool scc = profileIdc == 9;
+	bw.bit(scc);
+	if (scc) {
+		bw.bits(0, 3); // range / multilayer / 3D extensions
+		bw.bit(true); // SCC extension
+		bw.bits(0, 4);
+		bw.bit(ibc);
+		bw.bit(palette);
+		if (palette) {
+			bw.ue(64); // Intel hardware palette capacity
+			bw.ue(32); // additional predictor entries
+			bw.bit(false); // no initial palette
+		}
+		bw.bits(0, 2); // fractional motion vector resolution
+		bw.bit(false); // intra boundary filtering enabled
+	}
 	bw.trailing_bits();
 	return make_hevc_nal(33, bw.bytes);
 }
 
-std::vector<std::byte> hevc_pps_header(const VAEncPictureParameterBufferHEVC& pic) {
+std::vector<std::byte> hevc_pps_header(const VAEncPictureParameterBufferHEVC& pic, bool scc, bool ibc) {
 	BitWriter bw;
 	bw.ue(0);
 	bw.ue(0);
@@ -322,7 +406,7 @@ std::vector<std::byte> hevc_pps_header(const VAEncPictureParameterBufferHEVC& pi
 	}
 	bw.se(pic.pps_cb_qp_offset);
 	bw.se(pic.pps_cr_qp_offset);
-	bw.bit(false);
+	bw.bit(true); // pps_slice_chroma_qp_offsets_present_flag
 	bw.bit(false);
 	bw.bit(false);
 	bw.bit(false);
@@ -341,19 +425,31 @@ std::vector<std::byte> hevc_pps_header(const VAEncPictureParameterBufferHEVC& pi
 		bw.bit(pic.pic_fields.bits.loop_filter_across_tiles_enabled_flag != 0);
 	}
 	bw.bit(pic.pic_fields.bits.pps_loop_filter_across_slices_enabled_flag != 0);
-	bw.bit(false);
+	bw.bit(true); // deblocking_filter_control_present_flag
+	bw.bit(true); // deblocking_filter_override_enabled_flag
+	bw.bit(false); // pps_deblocking_filter_disabled_flag
+	bw.se(0); // pps_beta_offset_div2
+	bw.se(0); // pps_tc_offset_div2
 	bw.bit(false);
 	bw.bit(false);
 	bw.ue(0);
 	bw.bit(false);
-	bw.bit(false);
+	bw.bit(scc);
+	if (scc) {
+		bw.bits(0, 3);
+		bw.bit(true); // PPS SCC extension
+		bw.bits(0, 4);
+		bw.bit(ibc);
+		bw.bit(false); // adaptive colour transform disabled
+		bw.bit(false); // no initial palette
+	}
 	bw.trailing_bits();
 	return make_hevc_nal(34, bw.bytes);
 }
 
 void append_leb128(std::vector<std::byte>& out, uint64_t value) {
 	do {
-		uint8_t byte = static_cast<uint8_t>(value & 0x7fu);
+		auto byte = static_cast<uint8_t>(value & 0x7fu);
 		value >>= 7u;
 		if (value != 0) {
 			byte |= 0x80u;
@@ -364,7 +460,7 @@ void append_leb128(std::vector<std::byte>& out, uint64_t value) {
 
 void append_leb128_fixed4(std::vector<std::byte>& out, uint64_t value) {
 	for (int i = 0; i < 4; ++i) {
-		uint8_t byte = static_cast<uint8_t>(value & 0x7fu);
+		auto byte = static_cast<uint8_t>(value & 0x7fu);
 		value >>= 7u;
 		if (i != 3) {
 			byte |= 0x80u;
@@ -381,7 +477,7 @@ std::vector<std::byte> make_av1_obu(uint8_t type, const std::vector<uint8_t>& pa
 	} else {
 		append_leb128(out, payload.size());
 	}
-	for (uint8_t byte : payload) {
+	for (uint8_t const byte : payload) {
 		out.push_back(std::byte{byte});
 	}
 	return out;
@@ -696,18 +792,18 @@ uint8_t av1_level_idx_for_picture(int width, int height) {
 		uint32_t maxHeight;
 	};
 	constexpr LevelLimit levels[] = {
-		{0, 147456, 2048, 1152},
-		{1, 278784, 2816, 1584},
-		{4, 665856, 4352, 2448},
-		{5, 1065024, 5504, 3096},
-		{8, 2359296, 6144, 3456},
-		{12, 8912896, 8192, 4352},
-		{16, 35651584, 16384, 8704},
+		{.idx=0, .maxPictureSamples=147456, .maxWidth=2048, .maxHeight=1152},
+		{.idx=1, .maxPictureSamples=278784, .maxWidth=2816, .maxHeight=1584},
+		{.idx=4, .maxPictureSamples=665856, .maxWidth=4352, .maxHeight=2448},
+		{.idx=5, .maxPictureSamples=1065024, .maxWidth=5504, .maxHeight=3096},
+		{.idx=8, .maxPictureSamples=2359296, .maxWidth=6144, .maxHeight=3456},
+		{.idx=12, .maxPictureSamples=8912896, .maxWidth=8192, .maxHeight=4352},
+		{.idx=16, .maxPictureSamples=35651584, .maxWidth=16384, .maxHeight=8704},
 	};
 	for (const LevelLimit& level : levels) {
 		if (samples <= level.maxPictureSamples &&
-		    static_cast<uint32_t>(width) <= level.maxWidth &&
-		    static_cast<uint32_t>(height) <= level.maxHeight) {
+		    std::cmp_less_equal(width, level.maxWidth) &&
+		    std::cmp_less_equal(height, level.maxHeight)) {
 			return level.idx;
 		}
 	}
@@ -736,7 +832,7 @@ uint8_t av1_level_idx_from_params(std::span<const EncoderParam> params, int widt
 	if (requested > 23) {
 		throw std::runtime_error("AV1 level index must be between 0 and 23");
 	}
-	const uint8_t levelIdx = static_cast<uint8_t>(requested);
+	const auto levelIdx = static_cast<uint8_t>(requested);
 	if (!av1_picture_fits_level(levelIdx, width, height)) {
 		throw std::runtime_error(
 			"AV1 level index " + std::to_string(requested) + " is too low for picture dimensions " +
@@ -744,6 +840,30 @@ uint8_t av1_level_idx_from_params(std::span<const EncoderParam> params, int widt
 		);
 	}
 	return levelIdx;
+}
+
+uint8_t hevc_level_from_params(std::span<const EncoderParam> params, int width, int height,
+                               uint32_t bitrateKbps, bool bitrateControlled) {
+	struct Limit { int idc; uint64_t samples; uint32_t mainKbps; uint32_t highKbps; };
+	constexpr Limit limits[] = {
+		{30,36864,128,0}, {60,122880,1500,0}, {63,245760,3000,0},
+		{90,552960,6000,0}, {93,983040,10000,0}, {120,2228224,12000,30000},
+		{123,2228224,20000,50000}, {150,8912896,25000,100000},
+		{153,8912896,40000,160000}, {156,8912896,60000,240000},
+		{180,35651584,60000,240000}, {183,35651584,120000,480000},
+		{186,35651584,240000,800000}
+	};
+	const int64_t requested = get_int_param(params, "level-idc", -1);
+	const bool high = get_param<bool>(params, "high-tier", false);
+	for (const auto& limit : limits) {
+		if (requested == -1 ? limit.idc < 120 : requested != limit.idc) continue;
+		const uint64_t pixels = static_cast<uint64_t>(width) * height;
+		const uint32_t bitrateLimit = high ? limit.highKbps : limit.mainKbps;
+		if (pixels <= limit.samples && uint64_t(width)*width <= 8*limit.samples &&
+		    uint64_t(height)*height <= 8*limit.samples && bitrateLimit != 0 &&
+		    (!bitrateControlled || bitrateKbps <= bitrateLimit)) return static_cast<uint8_t>(limit.idc);
+	}
+	throw std::invalid_argument("HEVC level/tier cannot represent the selected dimensions and target bitrate; select Auto or a higher valid level");
 }
 
 int bit_depth(PixelFormat format) {
@@ -825,6 +945,27 @@ void write_sample(ImagePlane& plane, int x, int y, int bps, uint16_t sample) {
 	}
 }
 
+RawImage pad_hevc_coding_blocks(const RawImage& image) {
+	RawImage out;
+	out.width = (image.width + 7) & ~7;
+	out.height = (image.height + 7) & ~7;
+	out.format = image.format;
+	out.color = image.color;
+	out.nominalPeakNits = image.nominalPeakNits;
+	const int bps = bit_depth(image.format) == 8 ? 1 : 2;
+	for (int p = 0; p < 3; ++p) {
+		out.planes[p].strideBytes = plane_width(out, p) * bps;
+		out.planes[p].bytes.resize(static_cast<std::size_t>(out.planes[p].strideBytes) * plane_height(out, p));
+		for (int y = 0; y < plane_height(out, p); ++y) {
+			for (int x = 0; x < plane_width(out, p); ++x) {
+				write_sample(out.planes[p], x, y, bps, read_sample(image.planes[p],
+				             std::min(x, plane_width(image, p) - 1), std::min(y, plane_height(image, p) - 1), bps));
+			}
+		}
+	}
+	return out;
+}
+
 uint16_t rescale_sample(uint16_t sample, int srcDepth, int dstDepth) {
 	if (srcDepth == dstDepth) return sample;
 	return dstDepth == 8 ? static_cast<uint16_t>(sample >> 2u) : static_cast<uint16_t>(sample << 2u);
@@ -892,7 +1033,7 @@ RawImage convert_yuv_format(const RawImage& image, PixelFormat targetFormat) {
 }
 
 int requested_bit_depth(std::span<const EncoderParam> params, const RawImage& image) {
-	const std::string value = get_param<std::string>(params, "bit-depth", "source");
+	const auto value = get_param<std::string>(params, "bit-depth", "source");
 	if (value == "source") return bit_depth(image.format);
 	if (value == "8") return 8;
 	if (value == "10") return 10;
@@ -995,15 +1136,15 @@ ProfileCapabilities query_profile_capabilities(VADisplay dpy, VAProfile profile)
 		throw VaError("VA-API profile " + std::to_string(static_cast<int>(profile)) + " has no EncSlice entrypoint");
 	}
 	std::array<VAConfigAttrib, 9> attributes{{
-		{VAConfigAttribRTFormat, 0},
-		{VAConfigAttribRateControl, 0},
-		{VAConfigAttribEncPackedHeaders, 0},
-		{VAConfigAttribEncQualityRange, 0},
-		{VAConfigAttribEncTileSupport, 0},
-		{VAConfigAttribEncMaxTileRows, 0},
-		{VAConfigAttribEncMaxTileCols, 0},
-		{VAConfigAttribMaxPictureWidth, 0},
-		{VAConfigAttribMaxPictureHeight, 0},
+		{.type=VAConfigAttribRTFormat, .value=0},
+		{.type=VAConfigAttribRateControl, .value=0},
+		{.type=VAConfigAttribEncPackedHeaders, .value=0},
+		{.type=VAConfigAttribEncQualityRange, .value=0},
+		{.type=VAConfigAttribEncTileSupport, .value=0},
+		{.type=VAConfigAttribEncMaxTileRows, .value=0},
+		{.type=VAConfigAttribEncMaxTileCols, .value=0},
+		{.type=VAConfigAttribMaxPictureWidth, .value=0},
+		{.type=VAConfigAttribMaxPictureHeight, .value=0},
 	}};
 	checked(vaGetConfigAttributes(dpy, profile, VAEntrypointEncSlice, attributes.data(), static_cast<int>(attributes.size())), "query encode attributes");
 	return {
@@ -1020,6 +1161,34 @@ ProfileCapabilities query_profile_capabilities(VADisplay dpy, VAProfile profile)
 	};
 }
 
+std::vector<std::pair<std::string, uint32_t>> hevc_feature_support(VADisplay dpy, VAProfile profile) {
+	VAConfigAttrib attr{.type=VAConfigAttribEncHEVCFeatures, .value=0};
+	checked(vaGetConfigAttributes(dpy, profile, VAEntrypointEncSlice, &attr, 1), "query HEVC coding tools");
+	if (attr.value == VA_ATTRIB_NOT_SUPPORTED) return {};
+	VAConfigAttribValEncHEVCFeatures features{};
+	features.value = attr.value;
+	// The VA capability describes disabling the filter; the UI describes
+	// enabling it, so required/forbidden have opposite meanings here.
+	const uint32_t deblock = features.bits.deblocking_filter_disable == VA_FEATURE_REQUIRED ? VA_FEATURE_NOT_SUPPORTED :
+	                         features.bits.deblocking_filter_disable == VA_FEATURE_NOT_SUPPORTED ? VA_FEATURE_REQUIRED : VA_FEATURE_SUPPORTED;
+	return {{"sao", uint32_t(features.bits.sao)}, {"strong-intra-smoothing", uint32_t(features.bits.strong_intra_smoothing)},
+	        {"sign-data-hiding", uint32_t(features.bits.sign_data_hiding)}, {"constrained-intra", uint32_t(features.bits.constrained_intra_pred)},
+	        {"transform-skip", uint32_t(features.bits.transform_skip)}, {"cu-qp-delta", uint32_t(features.bits.cu_qp_delta)}, {"deblock", deblock}};
+}
+
+bool hevc_feature_value(std::span<const EncoderParam> params,
+                        const std::vector<std::pair<std::string, uint32_t>>& features,
+                        std::string_view name, bool fallback) {
+	const auto support = std::ranges::find_if(features, [&](const auto& feature) { return feature.first == name; });
+	if (support == features.end() || support->second == VA_FEATURE_SUPPORTED) return get_param<bool>(params, name, fallback);
+	const bool required = support->second == VA_FEATURE_REQUIRED;
+	if (get_param<bool>(params, name, required) != required) {
+		throw VaError("VA-API HEVC coding tool '" + std::string(name) + "' is " +
+		              (required ? "required by this profile" : "not supported by this profile"));
+	}
+	return required;
+}
+
 std::optional<ProfileCapabilities> optional_profile_capabilities(VADisplay dpy, VAProfile profile) {
 	if (!supports_profile(dpy, profile)) return std::nullopt;
 	return query_profile_capabilities(dpy, profile);
@@ -1027,10 +1196,10 @@ std::optional<ProfileCapabilities> optional_profile_capabilities(VADisplay dpy, 
 
 std::vector<EnumValue> rate_control_values(uint32_t modes) {
 	std::vector<EnumValue> values;
-	if ((modes & VA_RC_CQP) != 0) values.push_back({"cqp", "CQP"});
-	if ((modes & VA_RC_ICQ) != 0) values.push_back({"icq", "ICQ"});
-	if ((modes & VA_RC_VBR) != 0) values.push_back({"vbr", "VBR"});
-	if ((modes & VA_RC_CBR) != 0) values.push_back({"cbr", "CBR"});
+	if ((modes & VA_RC_CQP) != 0) values.push_back({.value="cqp", .label="CQP"});
+	if ((modes & VA_RC_ICQ) != 0) values.push_back({.value="icq", .label="ICQ"});
+	if ((modes & VA_RC_VBR) != 0) values.push_back({.value="vbr", .label="VBR"});
+	if ((modes & VA_RC_CBR) != 0) values.push_back({.value="cbr", .label="CBR"});
 	return values;
 }
 
@@ -1078,10 +1247,10 @@ void require_encode_configuration(
 	if ((caps.rtFormats & rtFormat) == 0) fail("render-target format is not supported by the selected profile");
 	if ((caps.rateControl & rcMode) == 0) fail("rate-control mode is not supported by the selected profile");
 	if ((caps.packedHeaders & packedHeaders) != packedHeaders) fail("required packed-header types are not supported");
-	if (caps.maxWidth != 0 && static_cast<uint32_t>(width) > caps.maxWidth) {
+	if (caps.maxWidth != 0 && std::cmp_greater(width, caps.maxWidth)) {
 		fail("width " + std::to_string(width) + " exceeds driver maximum " + std::to_string(caps.maxWidth));
 	}
-	if (caps.maxHeight != 0 && static_cast<uint32_t>(height) > caps.maxHeight) {
+	if (caps.maxHeight != 0 && std::cmp_greater(height, caps.maxHeight)) {
 		fail("height " + std::to_string(height) + " exceeds driver maximum " + std::to_string(caps.maxHeight));
 	}
 }
@@ -1106,7 +1275,7 @@ std::vector<std::string> render_node_paths() {
 		    !std::all_of(name.begin() + 7, name.end(), [](unsigned char c) { return c >= '0' && c <= '9'; })) continue;
 		paths.push_back(it->path().string());
 	}
-	std::sort(paths.begin(), paths.end());
+	std::ranges::sort(paths);
 	return paths;
 }
 
@@ -1268,12 +1437,12 @@ struct ImageGuard {
 
 VAConfigID create_config(VADisplay dpy, VAProfile profile, uint32_t rtFormat, uint32_t packedHeaders, uint32_t rcMode) {
 	VAConfigAttrib attrs[3] = {
-		{VAConfigAttribRTFormat, rtFormat},
-		{VAConfigAttribRateControl, rcMode},
+		{.type=VAConfigAttribRTFormat, .value=rtFormat},
+		{.type=VAConfigAttribRateControl, .value=rcMode},
 	};
 	int attrCount = 2;
 	if (packedHeaders != 0) {
-		attrs[attrCount++] = {VAConfigAttribEncPackedHeaders, packedHeaders};
+		attrs[attrCount++] = {.type=VAConfigAttribEncPackedHeaders, .value=packedHeaders};
 	}
 	VAConfigID config = VA_INVALID_ID;
 	checked(vaCreateConfig(dpy, profile, VAEntrypointEncSlice, attrs, attrCount, &config), "create encode config");
@@ -1296,7 +1465,7 @@ VASurfaceID create_surface(VADisplay dpy, const RawImage& image, uint32_t rtForm
 }
 
 void upload_yuv_to_surface(VADisplay dpy, VASurfaceID surface, const RawImage& image) {
-	ImageGuard derived{dpy};
+	ImageGuard derived{.dpy=dpy};
 	checked(vaDeriveImage(dpy, surface, &derived.image), "derive image");
 	derived.valid = true;
 	void* mapped = nullptr;
@@ -1310,7 +1479,7 @@ void upload_yuv_to_surface(VADisplay dpy, VASurfaceID surface, const RawImage& i
 				(void)vaUnmapBuffer(dpy, id);
 			}
 		}
-	} unmap{dpy, derived.image.buf};
+	} unmap{.dpy=dpy, .id=derived.image.buf};
 
 	auto* base = static_cast<uint8_t*>(mapped);
 	const int depth = bit_depth(image.format);
@@ -1322,7 +1491,7 @@ void upload_yuv_to_surface(VADisplay dpy, VASurfaceID surface, const RawImage& i
 	if (!yuv444 && !yuv422 && depth == 10 && derived.image.format.fourcc != VA_FOURCC_P010) {
 		throw std::runtime_error("VA-API driver did not provide a P010 image mapping");
 	}
-	if (yuv444 && depth == 8 && derived.image.format.fourcc != VA_FOURCC_444P) {
+	if (yuv444 && depth == 8 && derived.image.format.fourcc != VA_FOURCC_444P && derived.image.format.fourcc != VA_FOURCC_AYUV) {
 		throw std::runtime_error("VA-API driver did not provide a 444P image mapping");
 	}
 	if (yuv444 && depth == 10 && derived.image.format.fourcc != VA_FOURCC_Y410) {
@@ -1346,18 +1515,32 @@ void upload_yuv_to_surface(VADisplay dpy, VASurfaceID surface, const RawImage& i
 					uint16_t yy = 0;
 					uint16_t u = 0;
 					uint16_t v = 0;
-					std::memcpy(&yy, srcY + x * 2, 2);
-					std::memcpy(&u, srcU + x * 2, 2);
-					std::memcpy(&v, srcV + x * 2, 2);
+					std::memcpy(&yy, srcY + static_cast<ptrdiff_t>(x * 2), 2);
+					std::memcpy(&u, srcU + static_cast<ptrdiff_t>(x * 2), 2);
+					std::memcpy(&v, srcV + static_cast<ptrdiff_t>(x * 2), 2);
 					const uint32_t packed = (3u << 30u) |
 					                        (static_cast<uint32_t>(v & 0x03ffu) << 20u) |
 					                        (static_cast<uint32_t>(yy & 0x03ffu) << 10u) |
 					                        static_cast<uint32_t>(u & 0x03ffu);
-					std::memcpy(dst + x * 4, &packed, 4);
+					std::memcpy(dst + static_cast<ptrdiff_t>(x * 4), &packed, 4);
 				}
 			}
 			return;
 		}
+        if (depth == 8 && derived.image.format.fourcc == VA_FOURCC_AYUV) {
+            for (int y = 0; y < image.height; ++y) {
+                uint8_t* dst = base + derived.image.offsets[0] + static_cast<std::size_t>(y) * derived.image.pitches[0];
+                for (int x = 0; x < image.width; ++x) {
+                    const uint8_t yy = image.planes[0].bytes[static_cast<std::size_t>(y) * image.planes[0].strideBytes + x];
+                    const uint8_t u = image.planes[1].bytes[static_cast<std::size_t>(y) * image.planes[1].strideBytes + x];
+                    const uint8_t v = image.planes[2].bytes[static_cast<std::size_t>(y) * image.planes[2].strideBytes + x];
+                    const uint32_t packed = 0xff000000u | (uint32_t(yy) << 16u) | (uint32_t(u) << 8u) | v;
+                    std::memcpy(dst + x * 4, &packed, 4);
+                }
+            }
+            return;
+        }
+
 		for (int plane = 0; plane < 3; ++plane) {
 			for (int y = 0; y < image.height; ++y) {
 				uint8_t* dst = base + derived.image.offsets[plane] + static_cast<std::size_t>(y) * derived.image.pitches[plane];
@@ -1367,9 +1550,9 @@ void upload_yuv_to_surface(VADisplay dpy, VASurfaceID surface, const RawImage& i
 				} else {
 					for (int x = 0; x < image.width; ++x) {
 						uint16_t sample = 0;
-						std::memcpy(&sample, src + x * 2, 2);
+						std::memcpy(&sample, src + static_cast<ptrdiff_t>(x * 2), 2);
 						sample = static_cast<uint16_t>((sample & 0x03ffu) << 6u);
-						std::memcpy(dst + x * 2, &sample, 2);
+						std::memcpy(dst + static_cast<ptrdiff_t>(x * 2), &sample, 2);
 					}
 				}
 			}
@@ -1420,18 +1603,18 @@ void upload_yuv_to_surface(VADisplay dpy, VASurfaceID surface, const RawImage& i
 					uint16_t y1 = 0;
 					uint16_t u = 0;
 					uint16_t v = 0;
-					std::memcpy(&y0, srcY + x * 4, 2);
-					std::memcpy(&y1, srcY + std::min(x * 2 + 1, image.width - 1) * 2, 2);
-					std::memcpy(&u, srcU + x * 2, 2);
-					std::memcpy(&v, srcV + x * 2, 2);
+					std::memcpy(&y0, srcY + static_cast<ptrdiff_t>(x * 4), 2);
+					std::memcpy(&y1, srcY + static_cast<ptrdiff_t>(std::min(x * 2 + 1, image.width - 1) * 2), 2);
+					std::memcpy(&u, srcU + static_cast<ptrdiff_t>(x * 2), 2);
+					std::memcpy(&v, srcV + static_cast<ptrdiff_t>(x * 2), 2);
 					y0 = static_cast<uint16_t>((y0 & 0x03ffu) << 6u);
 					u = static_cast<uint16_t>((u & 0x03ffu) << 6u);
 					y1 = static_cast<uint16_t>((y1 & 0x03ffu) << 6u);
 					v = static_cast<uint16_t>((v & 0x03ffu) << 6u);
-					std::memcpy(dst + x * 8 + 0, &y0, 2);
-					std::memcpy(dst + x * 8 + 2, &u, 2);
-					std::memcpy(dst + x * 8 + 4, &y1, 2);
-					std::memcpy(dst + x * 8 + 6, &v, 2);
+					std::memcpy(dst + static_cast<ptrdiff_t>(x * 8) + 0, &y0, 2);
+					std::memcpy(dst + static_cast<ptrdiff_t>(x * 8) + 2, &u, 2);
+					std::memcpy(dst + static_cast<ptrdiff_t>(x * 8) + 4, &y1, 2);
+					std::memcpy(dst + static_cast<ptrdiff_t>(x * 8) + 6, &v, 2);
 				}
 			}
 		}
@@ -1445,9 +1628,9 @@ void upload_yuv_to_surface(VADisplay dpy, VASurfaceID surface, const RawImage& i
 		} else {
 			for (int x = 0; x < image.width; ++x) {
 				uint16_t sample = 0;
-				std::memcpy(&sample, src + x * 2, 2);
+				std::memcpy(&sample, src + static_cast<ptrdiff_t>(x * 2), 2);
 				sample = static_cast<uint16_t>((sample & 0x03ffu) << 6u);
-				std::memcpy(dst + x * 2, &sample, 2);
+				std::memcpy(dst + static_cast<ptrdiff_t>(x * 2), &sample, 2);
 			}
 		}
 	}
@@ -1466,12 +1649,12 @@ void upload_yuv_to_surface(VADisplay dpy, VASurfaceID surface, const RawImage& i
 			for (int x = 0; x < chromaWidth; ++x) {
 				uint16_t u = 0;
 				uint16_t v = 0;
-				std::memcpy(&u, srcU + x * 2, 2);
-				std::memcpy(&v, srcV + x * 2, 2);
+				std::memcpy(&u, srcU + static_cast<ptrdiff_t>(x * 2), 2);
+				std::memcpy(&v, srcV + static_cast<ptrdiff_t>(x * 2), 2);
 				u = static_cast<uint16_t>((u & 0x03ffu) << 6u);
 				v = static_cast<uint16_t>((v & 0x03ffu) << 6u);
-				std::memcpy(dst + x * 4 + 0, &u, 2);
-				std::memcpy(dst + x * 4 + 2, &v, 2);
+				std::memcpy(dst + static_cast<ptrdiff_t>(x * 4) + 0, &u, 2);
+				std::memcpy(dst + static_cast<ptrdiff_t>(x * 4) + 2, &v, 2);
 			}
 		}
 	}
@@ -1499,12 +1682,48 @@ uint32_t vaapi_rate_control_mode(std::string_view value) {
 	throw std::runtime_error("unsupported VA-API rate control mode: " + std::string(value));
 }
 
+// Optional diagnostic reconstruction, used only by in-memory decoder checks.
+// The registered preview decoder always reads the coded bytes independently.
+RawImage download_hevc_reconstruction(VADisplay dpy, VASurfaceID surface, const RawImage& layout) {
+	if (!is_420(layout.format)) throw VaError("diagnostic reconstruction capture currently supports only 4:2:0 surfaces");
+	checked(vaSyncSurface(dpy, surface), "sync HEVC reconstruction");
+	ImageGuard derived{.dpy=dpy};
+	checked(vaDeriveImage(dpy, surface, &derived.image), "derive HEVC reconstruction");
+	derived.valid = true;
+	void* data = nullptr;
+	checked(vaMapBuffer(dpy, derived.image.buf, &data), "map HEVC reconstruction");
+	struct Unmap {
+		VADisplay display; VABufferID buffer;
+		~Unmap() { (void)vaUnmapBuffer(display, buffer); }
+	} unmap{dpy, derived.image.buf};
+	RawImage out = layout;
+	const auto* base = static_cast<const uint8_t*>(data);
+	const uint32_t format = derived.image.format.fourcc;
+	const int bps = bit_depth(out.format) == 8 ? 1 : 2;
+	for (int p=0;p<3;++p) for(int y=0;y<plane_height(out,p);++y) for(int x=0;x<plane_width(out,p);++x) {
+		uint16_t sample = 0;
+		if (format == VA_FOURCC_NV12 || format == VA_FOURCC_P010) {
+			const int sourcePlane = p == 0 ? 0 : 1;
+			const int index = p == 0 ? x : x*2+p-1;
+			const auto* row = base+derived.image.offsets[sourcePlane]+std::size_t(y)*derived.image.pitches[sourcePlane];
+			if (bps == 1) sample = row[index];
+			else if (format == VA_FOURCC_NV12) {
+				// Intel's P010 reconstruction variant stores the high eight
+				// and low two bits in separate halves of each NV12 row.
+				sample = uint16_t(row[index])*4 + (row[derived.image.width/2+index]&3u);
+			} else { std::memcpy(&sample,row+index*2,2); sample >>= 6; }
+		} else throw VaError("unsupported HEVC reconstruction mapping for diagnostic comparison");
+		write_sample(out.planes[p],x,y,bps,sample);
+	}
+	return out;
+}
+
 BufferGuard create_misc_rate_control(
 	VADisplay dpy,
 	VAContextID ctx,
 	uint32_t rcMode,
 	uint32_t qp,
-	uint32_t bitrateKbps,
+	uint32_t bitsPerSecond,
 	uint32_t maxQp = 51,
 	uint32_t qualityFactor = 0
 ) {
@@ -1512,12 +1731,13 @@ BufferGuard create_misc_rate_control(
 	auto* misc = reinterpret_cast<VAEncMiscParameterBuffer*>(bytes.data());
 	auto* rc = reinterpret_cast<VAEncMiscParameterRateControl*>(misc->data);
 	misc->type = VAEncMiscParameterTypeRateControl;
-	rc->bits_per_second = bitrateKbps * 1000u;
-	rc->target_percentage = rcMode == VA_RC_VBR ? 66u : 100u;
+	rc->bits_per_second = bitsPerSecond;
+	rc->target_percentage = 100u; // The requested still-image budget is the target, including in VBR.
 	rc->window_size = 1000u;
 	rc->initial_qp = qp;
 	rc->min_qp = 1;
 	rc->max_qp = maxQp;
+	rc->rc_flags.bits.reset = rcMode == VA_RC_CBR || rcMode == VA_RC_VBR; // Each still image starts a new, independent rate-control interval.
 	const uint32_t selectedQualityFactor =
 		qualityFactor == 0 ? std::clamp<uint32_t>(qp, 1, 51) : std::clamp<uint32_t>(qualityFactor, 1, 51);
 	rc->ICQ_quality_factor = selectedQualityFactor;
@@ -1556,8 +1776,8 @@ PackedHeaderBuffers create_packed_header(VADisplay dpy, VAContextID ctx, uint32_
 	params.bit_length = static_cast<unsigned int>(bytes.size() * 8);
 	params.has_emulation_bytes = 1;
 	return {
-		create_buffer(dpy, ctx, VAEncPackedHeaderParameterBufferType, params),
-		create_raw_buffer(dpy, ctx, VAEncPackedHeaderDataBufferType, bytes),
+		.params=create_buffer(dpy, ctx, VAEncPackedHeaderParameterBufferType, params),
+		.data=create_raw_buffer(dpy, ctx, VAEncPackedHeaderDataBufferType, bytes),
 	};
 }
 
@@ -1597,6 +1817,21 @@ EncoderParamInfo int_param(
 	return info;
 }
 
+EncoderParamInfo image_size_param() {
+	EncoderParamInfo p;
+	p.name               = "target-size-kb";
+	p.label              = "Target image size (kB)";
+	p.group              = "Rate Control";
+	p.kind               = ParamKind::Float;
+	p.defaultValue       = 250.;
+	p.floatRange         = FloatRange{.125, 125000., .125};
+	p.directNumericInput = true;
+	p.help = "1 kB = 1000 bytes. The driver receives target bytes × 8 at 1 frame/s. This is a single-frame budget, not "
+			 "a guaranteed output size. First-frame rate control and quantizer limits can cause a miss; compare the "
+			 "live actual size.";
+	return p;
+}
+
 EncoderParamInfo automatic_int_param(
 	std::string name,
 	std::string label,
@@ -1615,7 +1850,7 @@ EncoderParamInfo enum_param(
 	std::string name,
 	std::string label,
 	std::string group,
-	std::string defaultValue,
+	const std::string& defaultValue,
 	std::vector<EnumValue> values,
 	std::string help
 ) {
@@ -1641,7 +1876,7 @@ std::vector<std::byte> collect_coded_buffer(VADisplay dpy, VABufferID codedBuffe
 				(void)vaUnmapBuffer(dpy, id);
 			}
 		}
-	} unmap{dpy, codedBuffer};
+	} unmap{.dpy=dpy, .id=codedBuffer};
 
 	std::vector<std::byte> out;
 	for (auto* segment = static_cast<VACodedBufferSegment*>(mapped);
@@ -1649,6 +1884,13 @@ std::vector<std::byte> collect_coded_buffer(VADisplay dpy, VABufferID codedBuffe
 	     segment = static_cast<VACodedBufferSegment*>(segment->next)) {
 		if ((segment->status & VA_CODED_BUF_STATUS_BAD_BITSTREAM) != 0) {
 			throw std::runtime_error("VA-API encoder reported a bad bitstream");
+		}
+		if ((segment->status & VA_CODED_BUF_STATUS_SLICE_OVERFLOW_MASK) != 0) {
+			throw std::runtime_error("VA-API coded buffer overflowed; refusing a truncated bitstream");
+		}
+		if (segment->size == 0) continue;
+		if (segment->buf == nullptr || segment->bit_offset != 0) {
+			throw std::runtime_error("VA-API returned an invalid or non-byte-aligned coded segment");
 		}
 		const auto* first = reinterpret_cast<const std::byte*>(segment->buf);
 		out.insert(out.end(), first, first + segment->size);
@@ -1702,9 +1944,10 @@ void fill_equal_hevc_tiles(VAEncPictureParameterBufferHEVC& pic, uint32_t width,
 struct VaEncodeObjects {
 	VaDisplay display;
 	ConfigGuard config;
-	ContextGuard context;
 	SurfaceGuard input;
 	SurfaceGuard recon;
+	// libva requires contexts to be destroyed before their render targets.
+	ContextGuard context;
 	BufferGuard coded;
 
 	VaEncodeObjects(const RawImage& image, VAProfile profile, uint32_t rtFormat, uint32_t pixelFormat, const std::string& device, uint32_t packedHeaders, uint32_t rcMode, bool contextRenderTargets = true)
@@ -1715,6 +1958,27 @@ struct VaEncodeObjects {
 		  }()),
 		  input(display.dpy, create_surface(display.dpy, image, rtFormat, pixelFormat)),
 		  recon(display.dpy, create_surface(display.dpy, image, rtFormat, pixelFormat)) {
+		unsigned int count = 0;
+		checked(vaQuerySurfaceAttributes(display.dpy, config.id, nullptr, &count), "query surface attribute count");
+		std::vector<VASurfaceAttrib> attributes(count);
+		checked(vaQuerySurfaceAttributes(display.dpy, config.id, attributes.data(), &count), "query surface attributes");
+		for (const auto& attr : attributes) {
+			if (attr.value.type != VAGenericValueTypeInteger) continue;
+			if ((attr.type == VASurfaceAttribMinWidth && image.width < attr.value.value.i) ||
+			    (attr.type == VASurfaceAttribMinHeight && image.height < attr.value.value.i)) {
+				throw VaError("VA-API picture " + std::to_string(image.width) + "x" + std::to_string(image.height) +
+				              " is below the selected profile's minimum " +
+				              (attr.type == VASurfaceAttribMinWidth ? "width " : "height ") + std::to_string(attr.value.value.i));
+			}
+		}
+		restart_context(image, contextRenderTargets);
+	}
+
+	void restart_context(const RawImage& image, bool contextRenderTargets = true) {
+		// IDR resets picture references, not the driver's rate controller. Destroy
+		// context-owned buffers first while keeping the display/config/surfaces.
+		coded = BufferGuard{};
+		context = ContextGuard{};
 		VAContextID rawContext = VA_INVALID_ID;
 		VASurfaceID renderTargets[] = {input.surface, recon.surface};
 		checked(
@@ -1732,12 +1996,51 @@ struct VaEncodeObjects {
 		);
 		context = ContextGuard(display.dpy, rawContext);
 
-		const unsigned int codedSize = static_cast<unsigned int>(std::max<std::size_t>(1024 * 1024, static_cast<std::size_t>(image.width) * image.height * 4));
+		const std::size_t requestedSize = std::max<std::size_t>(1024u * 1024u, static_cast<std::size_t>(image.width) * image.height * 4);
+		if (requestedSize > std::numeric_limits<unsigned int>::max()) throw VaError("VA-API coded buffer exceeds API size limit");
+		const auto codedSize = static_cast<unsigned int>(requestedSize);
 		VABufferID codedId = VA_INVALID_ID;
 		checked(vaCreateBuffer(display.dpy, context.id, VAEncCodedBufferType, codedSize, 1, nullptr, &codedId), "create coded buffer");
 		coded = BufferGuard(display.dpy, codedId);
 	}
 	};
+
+// Keep device/config/surfaces on the calling worker. CBR/VBR and ICQ retain
+// driver state across IDRs (HEVC even ignores the misc RC reset flag), so each
+// request needs a fresh context. Stateless CQP QP edits can reuse the context.
+// Input is uploaded for every call; no pointer-based pixel cache is assumed.
+struct VaEncodeSession {
+    using Key=std::tuple<std::string,int,int,VAProfile,uint32_t,uint32_t,uint32_t,uint32_t>;
+    Key key;
+    std::vector<std::pair<std::string, ParamValue>> configuration;
+    std::unique_ptr<VaEncodeObjects> objects;
+};
+struct VaEncodeLease {
+    VaEncodeSession& session;
+    int exceptions=std::uncaught_exceptions();
+    VaEncodeLease(const RawImage& image,VAProfile profile,uint32_t rt,uint32_t pixel,const std::string& device,uint32_t headers,uint32_t rc,
+                  std::span<const EncoderParam> params)
+        :session(cached()) {
+        VaEncodeSession::Key key{device,image.width,image.height,profile,rt,pixel,headers,rc};
+        // Only CQP's picture quantizer may change on an existing context.
+        // Sequence-level settings such as target usage can also be latched.
+        std::vector<std::pair<std::string, ParamValue>> configuration;
+        for(const auto& p:params)
+            if(p.name!="qpi" && p.name!="qindex" && p.name!="qp")
+                configuration.emplace_back(p.name,p.value);
+        if(!session.objects || session.key!=key){
+            session.objects.reset();
+            session.objects=std::make_unique<VaEncodeObjects>(image,profile,rt,pixel,device,headers,rc);
+            session.key=std::move(key);
+        } else if(rc != VA_RC_CQP || configuration!=session.configuration) {
+            session.objects->restart_context(image);
+        }
+        session.configuration=std::move(configuration);
+    }
+    ~VaEncodeLease(){if(std::uncaught_exceptions()>exceptions)session.objects.reset();}
+    const VaEncodeObjects& get()const{return *session.objects;}
+    static VaEncodeSession& cached(){thread_local VaEncodeSession s;return s;}
+};
 
 } // namespace
 
@@ -1748,11 +2051,11 @@ std::vector<VaapiDeviceInfo> probe_vaapi_devices(std::span<const std::string> pa
 		VaapiDeviceInfo info;
 		info.path = path;
 		try {
-			VaDisplay display(path);
+			VaDisplay const display(path);
 			info.initialized = true;
 			const char* vendor = vaQueryVendorString(display.dpy);
 			info.vendor = vendor != nullptr && vendor[0] != '\0' ? vendor : "unknown VA driver";
-			for (VAProfile profile : {
+			for (VAProfile const profile : {
 			         VAProfileHEVCMain, VAProfileHEVCMain10, VAProfileHEVCMain422_10,
 			         VAProfileHEVCMain444, VAProfileHEVCMain444_10,
 			         VAProfileHEVCSccMain, VAProfileHEVCSccMain10,
@@ -1774,9 +2077,9 @@ std::vector<VaapiDeviceInfo> discover_vaapi_devices() {
 }
 
 std::vector<EncoderParamInfo> query_vaapi_hevc_parameters(std::string_view device) {
-	VaDisplay display{std::string(device)};
+	VaDisplay const display{std::string(device)};
 	std::vector<ProfileCapabilities> capabilities;
-	for (VAProfile profile : {
+	for (VAProfile const profile : {
 	         VAProfileHEVCMain, VAProfileHEVCMain10, VAProfileHEVCMain422_10,
 	         VAProfileHEVCMain444, VAProfileHEVCMain444_10,
 	         VAProfileHEVCSccMain, VAProfileHEVCSccMain10,
@@ -1786,13 +2089,13 @@ std::vector<EncoderParamInfo> query_vaapi_hevc_parameters(std::string_view devic
 	}
 	constexpr uint32_t requiredPackedHeaders =
 		VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_PICTURE | VA_ENC_PACKED_HEADER_SLICE;
-	capabilities.erase(std::remove_if(capabilities.begin(), capabilities.end(), [](const ProfileCapabilities& caps) {
+	std::erase_if(capabilities, [](const ProfileCapabilities& caps) {
 		return (caps.packedHeaders & requiredPackedHeaders) != requiredPackedHeaders;
-	}), capabilities.end());
+	});
 	if (capabilities.empty()) throw VaError("VA-API driver on '" + std::string(device) + "' has no HEVC EncSlice profile");
 
 	auto has_format = [&](VAProfile profile, uint32_t format) {
-		return std::any_of(capabilities.begin(), capabilities.end(), [&](const ProfileCapabilities& caps) {
+		return std::ranges::any_of(capabilities, [&](const ProfileCapabilities& caps) {
 			return caps.profile == profile && (caps.rtFormats & format) != 0;
 		});
 	};
@@ -1862,25 +2165,27 @@ std::vector<EncoderParamInfo> query_vaapi_hevc_parameters(std::string_view devic
 
 	std::vector<EncoderParamInfo> out{
 		enum_param("rate-control", "Mode", "Rate Control", rateControls.front().value, rateControls, "VA-API rate-control mode advertised by this driver."),
-		int_param("qpi", "QP", "Rate Control", 35, {0, 51, 1}, "I-picture quantization parameter for still-image encoding."),
-		int_param("bitrate-kbps", "Bitrate", "Rate Control", 10000, {1, 1000000, 1000}, "Target bitrate for CBR/VBR modes."),
-		int_param("target-usage", "Target usage", "Speed / Quality", 4, {0, 7, 1}, "VA quality level: 1 highest quality, 7 fastest, 0 driver default."),
-		bool_param("scc", "SCC", "Profile / Level", false, "Use HEVC Screen Content Coding profiles where supported."),
-		int_param("level-idc", "Level IDC", "Profile / Level", 120, {30, 255, 3}, "HEVC general_level_idc value."),
+		int_param("qpi", "QP", "Rate Control", 35, {.min=1, .max=51, .step=1}, "I-picture QP / ICQ quality. This path supports 1..51; QP 0 can abort the Intel driver."),
+		image_size_param(),
+		int_param("target-usage", "Target usage", "Speed / Quality", 4, {.min=0, .max=7, .step=1}, "VA quality level: 1 highest quality, 7 fastest, 0 driver default."),
+		bool_param("scc", "SCC", "Screen Content Coding", false, "Use HEVC Screen Content Coding profiles where supported."),
+		bool_param("scc-palette", "Palette coding", "Screen Content Coding", true, "Enable SCC palette coding for blocks with a small set of colours."),
+		bool_param("scc-ibc", "Intra-block copy (experimental)", "Screen Content Coding", false, "Experimental: reconstruction mismatches reproduced with Intel iHD 26.3.5 at 8 and 10 bits. Independent SCM and hardware decoders agree on the differing output. Leave off for validated palette-only SCC."),
+		automatic_int_param("level-idc", "Level IDC", "Profile / Level", -1, {.min=-1, .max=186, .step=1}, "Auto selects a level of at least 4 appropriate for dimensions and target bitrate. Explicit HEVC level IDs are validated."),
 		bool_param("high-tier", "High tier", "Profile / Level", false, "Set HEVC general_tier_flag."),
-		enum_param("bit-depth", "Bit depth", "Compression", supports10 ? "10" : "8", {{"8", "8-bit"}, {"10", "10-bit"}}, "Encode bit depth."),
+		enum_param("bit-depth", "Bit depth", "Compression", supports10 ? "10" : "8", {{.value="8", .label="8-bit"}, {.value="10", .label="10-bit"}}, "Encode bit depth."),
 		enum_param(
 			"chroma-subsampling",
 			"Chroma subsampling",
 			"Compression",
 			"420",
-			{{"420", "4:2:0"}, {"422", "4:2:2"}, {"444", "4:4:4"}},
+			{{.value="420", .label="4:2:0"}, {.value="422", .label="4:2:2"}, {.value="444", .label="4:4:4"}},
 			"Encode chroma format."
 		),
-		enum_param("color-primaries", "Color primaries", "Color", "source", {{"source", "Source"}, {"bt709", "BT.709"}, {"bt2020", "BT.2020"}}, "Color primaries metadata."),
-		enum_param("transfer", "Transfer", "Color", "source", {{"source", "Source"}, {"srgb", "sRGB"}, {"bt709", "BT.709"}, {"pq", "PQ"}, {"hlg", "HLG"}}, "Transfer characteristics metadata."),
-		enum_param("matrix", "Matrix", "Color", "source", {{"source", "Source"}, {"bt709", "BT.709"}, {"bt2020nc", "BT.2020 non-constant"}}, "Matrix coefficients metadata."),
-		enum_param("range", "Range", "Color", "source", {{"source", "Source"}, {"limited", "Limited"}, {"full", "Full"}}, "YUV sample range metadata."),
+		enum_param("color-primaries", "Color primaries", "Color", "source", {{.value="source", .label="Source"}, {.value="bt709", .label="BT.709"}, {.value="bt2020", .label="BT.2020"}}, "Color primaries metadata."),
+		enum_param("transfer", "Transfer", "Color", "source", {{.value="source", .label="Source"}, {.value="srgb", .label="sRGB"}, {.value="bt709", .label="BT.709"}, {.value="pq", .label="PQ"}, {.value="hlg", .label="HLG"}}, "Transfer characteristics metadata."),
+		enum_param("matrix", "Matrix", "Color", "source", {{.value="source", .label="Source"}, {.value="bt709", .label="BT.709"}, {.value="bt2020nc", .label="BT.2020 non-constant"}}, "Matrix coefficients metadata."),
+		enum_param("range", "Range", "Color", "source", {{.value="source", .label="Source"}, {.value="limited", .label="Limited"}, {.value="full", .label="Full"}}, "YUV sample range metadata."),
 		bool_param("sao", "SAO", "Coding Tools", true, "Enable HEVC sample adaptive offset."),
 		bool_param("slice-sao-luma", "Slice SAO luma", "Coding Tools", true, "Enable luma SAO in the packed slice header."),
 		bool_param("slice-sao-chroma", "Slice SAO chroma", "Coding Tools", true, "Enable chroma SAO in the packed slice header."),
@@ -1889,84 +2194,117 @@ std::vector<EncoderParamInfo> query_vaapi_hevc_parameters(std::string_view devic
 		bool_param("transform-skip", "Transform skip", "Coding Tools", true, "Enable transform skip."),
 		bool_param("sign-data-hiding", "Sign data hiding", "Coding Tools", false, "Enable sign data hiding."),
 		bool_param("cu-qp-delta", "CU QP delta", "Coding Tools", false, "Enable CU QP delta signalling."),
-		int_param("pps-cb-qp-offset", "PPS Cb QP offset", "Quantization", 0, {-12, 12, 1}, "PPS Cb QP offset."),
-		int_param("pps-cr-qp-offset", "PPS Cr QP offset", "Quantization", 0, {-12, 12, 1}, "PPS Cr QP offset."),
-		int_param("slice-cb-qp-offset", "Slice Cb QP offset", "Quantization", 0, {-12, 12, 1}, "Slice Cb QP offset."),
-		int_param("slice-cr-qp-offset", "Slice Cr QP offset", "Quantization", 0, {-12, 12, 1}, "Slice Cr QP offset."),
-		int_param("slice-beta-offset-div2", "Deblock beta offset / 2", "Deblocking", 0, {-6, 6, 1}, "HEVC slice_beta_offset_div2."),
-		int_param("slice-tc-offset-div2", "Deblock tc offset / 2", "Deblocking", 0, {-6, 6, 1}, "HEVC slice_tc_offset_div2."),
-		int_param("num-tile-cols", "Tile columns", "Partitioning", 1, {1, 19, 1}, "Number of HEVC tile columns."),
-		int_param("num-tile-rows", "Tile rows", "Partitioning", 1, {1, 21, 1}, "Number of HEVC tile rows."),
+		int_param("pps-cb-qp-offset", "PPS Cb QP offset", "Quantization", 0, {.min=-12, .max=12, .step=1}, "PPS Cb QP offset."),
+		int_param("pps-cr-qp-offset", "PPS Cr QP offset", "Quantization", 0, {.min=-12, .max=12, .step=1}, "PPS Cr QP offset."),
+		int_param("slice-cb-qp-offset", "Slice Cb QP offset", "Quantization", 0, {.min=-12, .max=12, .step=1}, "Slice Cb QP offset."),
+		int_param("slice-cr-qp-offset", "Slice Cr QP offset", "Quantization", 0, {.min=-12, .max=12, .step=1}, "Slice Cr QP offset."),
+		bool_param("deblock", "Deblock", "Deblocking", true, "Enable the HEVC deblocking filter."),
+		int_param("slice-beta-offset-div2", "Deblock beta offset / 2", "Deblocking", 0, {.min=-6, .max=6, .step=1}, "HEVC slice_beta_offset_div2."),
+		int_param("slice-tc-offset-div2", "Deblock tc offset / 2", "Deblocking", 0, {.min=-6, .max=6, .step=1}, "HEVC slice_tc_offset_div2."),
+		int_param("num-tile-cols", "Tile columns", "Partitioning", 1, {.min=1, .max=19, .step=1}, "Number of HEVC tile columns."),
+		int_param("num-tile-rows", "Tile rows", "Partitioning", 1, {.min=1, .max=21, .step=1}, "Number of HEVC tile rows."),
 		bool_param("entropy-coding-sync", "WPP", "Partitioning", false, "Enable wavefront parallel processing."),
 		bool_param("loop-filter-across-tiles", "Filter across tiles", "Partitioning", true, "Allow filters across tile boundaries."),
 		bool_param("loop-filter-across-slices", "Filter across slices", "Partitioning", true, "Allow filters across slice boundaries."),
 	};
 	auto find_param = [&](std::string_view name) -> EncoderParamInfo* {
-		const auto it = std::find_if(out.begin(), out.end(), [&](const EncoderParamInfo& param) { return param.name == name; });
+		const auto it = std::ranges::find_if(out, [&](const EncoderParamInfo& param) { return param.name == name; });
 		return it == out.end() ? nullptr : &*it;
 	};
-	if (EncoderParamInfo* qpi = find_param("qpi")) {
-		qpi->enabledWhen.push_back({"rate-control", {"cqp", "icq"}, "QP is used directly by CQP and as the quality factor by ICQ."});
+	for (const auto* name : {"scc-palette", "scc-ibc"}) {
+		find_param(name)->enabledWhen.push_back({.parameter="scc", .acceptedValues={"true"}, .explanation="Requires SCC."});
 	}
-	if (EncoderParamInfo* bitrate = find_param("bitrate-kbps")) {
+	if (EncoderParamInfo* qpi = find_param("qpi")) {
+		qpi->enabledWhen.push_back({.parameter="rate-control", .acceptedValues={"cqp", "icq"}, .explanation="QP is used directly by CQP and as the quality factor by ICQ."});
+	}
+	if (EncoderParamInfo* bitrate = find_param("target-size-kb")) {
 		if ((rateControl & (VA_RC_VBR | VA_RC_CBR)) == 0) {
-			out.erase(std::remove_if(out.begin(), out.end(), [](const EncoderParamInfo& param) { return param.name == "bitrate-kbps"; }), out.end());
+			std::erase_if(out, [](const EncoderParamInfo& param) { return param.name == "target-size-kb"; });
 		} else {
-			bitrate->enabledWhen.push_back({"rate-control", {"vbr", "cbr"}, "Bitrate applies only to VBR and CBR."});
+			bitrate->enabledWhen.push_back({.parameter="rate-control", .acceptedValues={"vbr", "cbr"}, .explanation="Target image size applies only to VBR and CBR."});
 			bitrate->directNumericInput = true;
 		}
 	}
 	if (EncoderParamInfo* usage = find_param("target-usage")) {
 		if (qualityRange == 0) {
-			out.erase(std::remove_if(out.begin(), out.end(), [](const EncoderParamInfo& param) { return param.name == "target-usage"; }), out.end());
+			std::erase_if(out, [](const EncoderParamInfo& param) { return param.name == "target-usage"; });
 		} else {
-			usage->intRange = IntRange{0, static_cast<int64_t>(qualityRange), 1};
+			usage->intRange = IntRange{.min=0, .max=static_cast<int64_t>(qualityRange), .step=1};
 			usage->defaultValue = static_cast<int64_t>(std::min<uint32_t>(4, qualityRange));
 		}
 	}
 	if (!sccSupport || selectableSccDepthMask == 0 || selectableSccChromaMask == 0) {
-		out.erase(std::remove_if(out.begin(), out.end(), [](const EncoderParamInfo& param) { return param.name == "scc"; }), out.end());
+		std::erase_if(out, [](const EncoderParamInfo& param) { return param.name == "scc"; });
 	} else if (EncoderParamInfo* scc = find_param("scc")) {
 		std::vector<std::string> acceptedRateControls;
 		for (const EnumValue& value : rate_control_values(sccRateControl)) acceptedRateControls.push_back(value.value);
 		if (acceptedRateControls.empty()) {
-			out.erase(std::remove_if(out.begin(), out.end(), [](const EncoderParamInfo& param) { return param.name == "scc"; }), out.end());
+			std::erase_if(out, [](const EncoderParamInfo& param) { return param.name == "scc"; });
 		} else {
-			scc->enabledWhen.push_back({"rate-control", std::move(acceptedRateControls), "The selected rate-control mode must be supported by every advertised SCC profile."});
+			scc->enabledWhen.push_back({.parameter="rate-control", .acceptedValues=std::move(acceptedRateControls), .explanation="The selected rate-control mode must be supported by every advertised SCC profile."});
 			std::vector<std::string> acceptedDepths;
-			if ((selectableSccDepthMask & 1u) != 0) acceptedDepths.push_back("8");
-			if ((selectableSccDepthMask & 2u) != 0) acceptedDepths.push_back("10");
-			scc->enabledWhen.push_back({"bit-depth", std::move(acceptedDepths), "Select an explicit bit depth supported by the SCC profile."});
+			if ((selectableSccDepthMask & 1u) != 0) acceptedDepths.emplace_back("8");
+			if ((selectableSccDepthMask & 2u) != 0) acceptedDepths.emplace_back("10");
+			scc->enabledWhen.push_back({.parameter="bit-depth", .acceptedValues=std::move(acceptedDepths), .explanation="Select an explicit bit depth supported by the SCC profile."});
 			std::vector<std::string> acceptedChroma;
-			if ((selectableSccChromaMask & 1u) != 0) acceptedChroma.push_back("420");
-			if ((selectableSccChromaMask & 4u) != 0) acceptedChroma.push_back("444");
-			scc->enabledWhen.push_back({"chroma-subsampling", std::move(acceptedChroma), "Select a chroma layout supported by the SCC profile."});
+			if ((selectableSccChromaMask & 1u) != 0) acceptedChroma.emplace_back("420");
+			if ((selectableSccChromaMask & 4u) != 0) acceptedChroma.emplace_back("444");
+			scc->enabledWhen.push_back({.parameter="chroma-subsampling", .acceptedValues=std::move(acceptedChroma), .explanation="Select a chroma layout supported by the SCC profile."});
 		}
 	}
 	if (EncoderParamInfo* depth = find_param("bit-depth")) {
 		depth->enumValues.clear();
-		if (supports8) depth->enumValues.push_back({"8", "8-bit"});
-		if (supports10) depth->enumValues.push_back({"10", "10-bit"});
+		if (supports8) depth->enumValues.push_back({.value="8", .label="8-bit"});
+		if (supports10) depth->enumValues.push_back({.value="10", .label="10-bit"});
 		depth->defaultValue = supports10 ? std::string{"10"} : std::string{"8"};
 	}
 	if (EncoderParamInfo* chroma = find_param("chroma-subsampling")) {
 		chroma->enumValues.clear();
-		if (supports420) chroma->enumValues.push_back({"420", "4:2:0"});
-		if (supports422) chroma->enumValues.push_back({"422", "4:2:2"});
-		if (supports444) chroma->enumValues.push_back({"444", "4:4:4"});
+		if (supports420) chroma->enumValues.push_back({.value="420", .label="4:2:0"});
+		if (supports422) chroma->enumValues.push_back({.value="422", .label="4:2:2"});
+		if (supports444) chroma->enumValues.push_back({.value="444", .label="4:4:4"});
 		chroma->defaultValue = chroma->enumValues.front().value;
 	}
+	// Only optional coding tools are editable. Required and forbidden flags
+	// are resolved again against the actual selected profile during encoding.
+	for (const auto& caps : capabilities) {
+		for (const auto& [name, support] : hevc_feature_support(display.dpy, caps.profile)) {
+			if (support != VA_FEATURE_SUPPORTED) {
+				std::erase_if(out, [&](const EncoderParamInfo& param) { return param.name == name; });
+			}
+		}
+	}
 	if (!tileSupport) {
-		out.erase(std::remove_if(out.begin(), out.end(), [](const EncoderParamInfo& param) {
+		std::erase_if(out, [](const EncoderParamInfo& param) {
 			return param.name == "num-tile-cols" || param.name == "num-tile-rows" ||
 			       param.name == "loop-filter-across-tiles";
-		}), out.end());
+		});
 	} else {
 		if (EncoderParamInfo* columns = find_param("num-tile-cols"); columns != nullptr && maxTileCols != 0) {
 			columns->intRange->max = std::min<int64_t>(columns->intRange->max, maxTileCols);
 		}
 		if (EncoderParamInfo* rows = find_param("num-tile-rows"); rows != nullptr && maxTileRows != 0) {
 			rows->intRange->max = std::min<int64_t>(rows->intRange->max, maxTileRows);
+		}
+	}
+	// The Intel EncSlice driver ignores entropy_coding_sync_enabled_flag;
+	// keep its limitation visible instead of emitting misleading WPP headers.
+	if (auto* wpp = find_param("entropy-coding-sync")) {
+		wpp->enabledWhen.push_back({.parameter="entropy-coding-sync", .acceptedValues={"unsupported"},
+		                          .explanation="WPP is not implemented by this VA-API packed-slice path; use tiles for parallel partitioning."});
+	}
+	for (const auto* name : {"slice-sao-luma", "slice-sao-chroma"}) {
+		find_param(name)->enabledWhen.push_back({.parameter="sao", .acceptedValues={"true"}, .explanation="Requires SAO."});
+	}
+	if (find_param("deblock")) {
+		for (const auto* name : {"slice-beta-offset-div2", "slice-tc-offset-div2"}) {
+			find_param(name)->enabledWhen.push_back({.parameter="deblock", .acceptedValues={"true"}, .explanation="Requires deblocking."});
+		}
+	}
+	if (const auto* scc = find_param("scc")) {
+		for (const auto* name : {"scc-palette", "scc-ibc"}) {
+			auto& conditions = find_param(name)->enabledWhen;
+			conditions.insert(conditions.end(), scc->enabledWhen.begin(), scc->enabledWhen.end());
 		}
 	}
 	return out;
@@ -1978,12 +2316,25 @@ std::vector<EncoderParamInfo> query_vaapi_hevc_parameters() {
 
 EncodedImage encode_vaapi_hevc_still_image(const RawImage& image, std::span<const EncoderParam> params, std::string_view device) {
 	const bool scc = get_param<bool>(params, "scc", false);
-	const std::string chroma = get_param<std::string>(params, "chroma-subsampling", "420");
+	const bool palette = scc && get_param<bool>(params, "scc-palette", true);
+	const bool ibc = scc && get_param<bool>(params, "scc-ibc", false);
+	if (get_param<bool>(params, "entropy-coding-sync", false)) throw VaError("VA-API HEVC WPP substreams are unavailable; use tiles");
+	const auto chroma = get_param<std::string>(params, "chroma-subsampling", is_444(image.format) ? "444" : is_422(image.format) ? "422" : "420");
 	if (scc && chroma == "422") {
 		throw std::runtime_error("VA-API HEVC SCC profiles on this driver do not include 4:2:2");
 	}
 	const int targetDepth = requested_bit_depth(params, image);
-	RawImage encodeImage = convert_yuv_format(image, vaapi_pixel_format(targetDepth, chroma));
+	if (targetDepth != 8 && targetDepth != 10) throw VaError("VA-API HEVC accepts 8-bit or 10-bit input");
+	validate_yuv_image(image);
+	const auto targetFormat = vaapi_pixel_format(targetDepth, chroma);
+	std::optional<RawImage> convertedStorage;
+	const RawImage& converted = image.format == targetFormat ? image :
+	                           convertedStorage.emplace(convert_yuv_format(image, targetFormat));
+	std::optional<RawImage> paddedStorage;
+	// Already aligned input needs neither a second frame allocation nor a
+	// per-sample edge-padding pass. Keep the caller's immutable planes alive.
+	const RawImage& encodeImage = (converted.width % 8 == 0 && converted.height % 8 == 0) ? converted :
+	                             paddedStorage.emplace(pad_hevc_coding_blocks(converted));
 	const int depth = bit_depth(encodeImage.format);
 	const bool yuv444 = is_444(encodeImage.format);
 	const bool yuv422 = is_422(encodeImage.format);
@@ -1994,44 +2345,55 @@ EncodedImage encode_vaapi_hevc_still_image(const RawImage& image, std::span<cons
 			? (depth == 8 ? VA_RT_FORMAT_YUV422 : VA_RT_FORMAT_YUV422_10)
 			: (depth == 8 ? VA_RT_FORMAT_YUV420 : VA_RT_FORMAT_YUV420_10));
 	const uint32_t pixelFormat = yuv444
-		? (depth == 8 ? VA_FOURCC_444P : VA_FOURCC_Y410)
+		? (depth == 8 ? VA_FOURCC_AYUV : VA_FOURCC_Y410)
 		: (yuv422
 			? (depth == 8 ? VA_FOURCC_YUY2 : VA_FOURCC_Y210)
 			: (depth == 8 ? VA_FOURCC_NV12 : VA_FOURCC_P010));
-	const uint32_t qpi = static_cast<uint32_t>(get_int_param(params, "qpi", 35));
+	const auto requestedQp = get_int_param(params, "qpi", 35);
+	if (requestedQp < 1 || requestedQp > 51) throw VaError("VA-API HEVC QP / ICQ quality must be in 1..51 (QP 0 is unsafe on the Intel driver)");
+	const auto qpi = static_cast<uint32_t>(requestedQp);
 	const uint32_t rcMode = vaapi_rate_control_mode(get_param<std::string>(params, "rate-control", "cqp"));
-	const uint32_t bitrateKbps = static_cast<uint32_t>(std::clamp<int64_t>(get_int_param(params, "bitrate-kbps", 10000), 1, 1000000));
-	const uint32_t quality = static_cast<uint32_t>(get_int_param(params, "target-usage", 4));
+	const uint32_t targetBitsPerSecond = vaapi_still_target_bps(params);
+	const uint32_t bitrateKbps = (targetBitsPerSecond + 999u) / 1000u;
+	const auto quality = static_cast<uint32_t>(get_int_param(params, "target-usage", 4));
 	const uint32_t tileCols = static_cast<uint32_t>(std::clamp<int64_t>(get_int_param(params, "num-tile-cols", 1), 1, 19));
 	const uint32_t tileRows = static_cast<uint32_t>(std::clamp<int64_t>(get_int_param(params, "num-tile-rows", 1), 1, 21));
 	const std::string devicePath(device);
-	VaEncodeObjects va(
+	VaEncodeLease lease(
 		encodeImage,
 			profile,
 			rtFormat,
 			pixelFormat,
 			devicePath,
 			VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_PICTURE | VA_ENC_PACKED_HEADER_SLICE,
-			rcMode
+			rcMode, params
 	);
+	const auto& va=lease.get();
+	const auto features = hevc_feature_support(va.display.dpy, profile);
+	auto feature = [&](std::string_view name, bool fallback) {
+		return hevc_feature_value(params, features, name, fallback);
+	};
 	require_tile_configuration(va.display.dpy, profile, tileCols, tileRows, device);
 	upload_yuv_to_surface(va.display.dpy, va.input.surface, encodeImage);
 	checked(vaSyncSurface(va.display.dpy, va.input.surface), "sync HEVC input surface");
 
 	VAEncSequenceParameterBufferHEVC seq{};
-	seq.general_profile_idc = (yuv444 || yuv422) ? 4 : (depth == 8 ? 1 : 2);
-	seq.general_level_idc = static_cast<uint8_t>(get_int_param(params, "level-idc", 120));
+	seq.general_profile_idc = scc ? 9 : (yuv444 || yuv422) ? 4 : (depth == 8 ? 1 : 2);
+	seq.scc_fields.bits.palette_mode_enabled_flag = palette;
+	seq.general_level_idc = hevc_level_from_params(params, encodeImage.width, encodeImage.height,
+	                                             bitrateKbps, rcMode == VA_RC_CBR || rcMode == VA_RC_VBR);
 	seq.general_tier_flag = get_param<bool>(params, "high-tier", false) ? 1 : 0;
 	seq.intra_period = 1;
 	seq.intra_idr_period = 1;
 	seq.ip_period = 1;
+	seq.bits_per_second = (rcMode == VA_RC_CBR || rcMode == VA_RC_VBR) ? targetBitsPerSecond : 0u;
 	seq.pic_width_in_luma_samples = static_cast<uint16_t>(encodeImage.width);
 	seq.pic_height_in_luma_samples = static_cast<uint16_t>(encodeImage.height);
 	seq.seq_fields.bits.chroma_format_idc = yuv444 ? 3u : (yuv422 ? 2u : 1u);
 	seq.seq_fields.bits.bit_depth_luma_minus8 = static_cast<uint32_t>(depth - 8);
 	seq.seq_fields.bits.bit_depth_chroma_minus8 = static_cast<uint32_t>(depth - 8);
-	seq.seq_fields.bits.strong_intra_smoothing_enabled_flag = get_param<bool>(params, "strong-intra-smoothing", false) ? 1u : 0u;
-	seq.seq_fields.bits.sample_adaptive_offset_enabled_flag = get_param<bool>(params, "sao", true) ? 1u : 0u;
+	seq.seq_fields.bits.strong_intra_smoothing_enabled_flag = feature("strong-intra-smoothing", false) ? 1u : 0u;
+	seq.seq_fields.bits.sample_adaptive_offset_enabled_flag = feature("sao", true) ? 1u : 0u;
 	seq.log2_min_luma_coding_block_size_minus3 = 0;
 	seq.log2_diff_max_min_luma_coding_block_size = 3;
 	seq.log2_min_transform_block_size_minus2 = 0;
@@ -2054,11 +2416,13 @@ EncodedImage encode_vaapi_hevc_still_image(const RawImage& image, std::span<cons
 	pic.nal_unit_type = 19;
 	pic.pic_fields.bits.idr_pic_flag = 1;
 	pic.pic_fields.bits.coding_type = 1;
+	pic.pic_fields.bits.screen_content_flag = scc;
+	pic.scc_fields.bits.pps_curr_pic_ref_enabled_flag = ibc;
 	pic.pic_fields.bits.reference_pic_flag = 1;
-	pic.pic_fields.bits.sign_data_hiding_enabled_flag = get_param<bool>(params, "sign-data-hiding", false) ? 1u : 0u;
-	pic.pic_fields.bits.constrained_intra_pred_flag = get_param<bool>(params, "constrained-intra", false) ? 1u : 0u;
-	pic.pic_fields.bits.transform_skip_enabled_flag = get_param<bool>(params, "transform-skip", true) ? 1u : 0u;
-	pic.pic_fields.bits.cu_qp_delta_enabled_flag = get_param<bool>(params, "cu-qp-delta", false) ? 1u : 0u;
+	pic.pic_fields.bits.sign_data_hiding_enabled_flag = feature("sign-data-hiding", false) ? 1u : 0u;
+	pic.pic_fields.bits.constrained_intra_pred_flag = feature("constrained-intra", false) ? 1u : 0u;
+	pic.pic_fields.bits.transform_skip_enabled_flag = feature("transform-skip", true) ? 1u : 0u;
+	pic.pic_fields.bits.cu_qp_delta_enabled_flag = feature("cu-qp-delta", false) ? 1u : 0u;
 	pic.pic_fields.bits.entropy_coding_sync_enabled_flag = get_param<bool>(params, "entropy-coding-sync", false) ? 1u : 0u;
 	pic.pic_fields.bits.loop_filter_across_tiles_enabled_flag = get_param<bool>(params, "loop-filter-across-tiles", true) ? 1u : 0u;
 	pic.pic_fields.bits.pps_loop_filter_across_slices_enabled_flag = get_param<bool>(params, "loop-filter-across-slices", true) ? 1u : 0u;
@@ -2069,12 +2433,25 @@ EncodedImage encode_vaapi_hevc_still_image(const RawImage& image, std::span<cons
 		tileCols,
 		tileRows
 	);
+	const char* vendor = vaQueryVendorString(va.display.dpy);
+	if (vendor && std::string_view(vendor).find("Intel iHD") != std::string_view::npos) {
+		const uint32_t tileCapacity = ((encodeImage.width + 255) / 256) * ((encodeImage.height + 127) / 128);
+		if (tileCols * tileRows > tileCapacity) {
+			throw VaError("Intel HEVC tile layout exceeds this picture's capacity (256x128 tile allocation units); reduce tile count");
+		}
+		if (ibc && (tileCols > 1 || tileRows > 1) && (encodeImage.width + 63) / 64 / tileCols < 5) {
+			throw VaError("Intel HEVC SCC intra-block copy requires tile columns at least 320 pixels wide; reduce columns or disable intra-block copy");
+		}
+	}
 
 	VAEncSliceParameterBufferHEVC slice{};
 	slice.slice_segment_address = 0;
 	const int ctb = 64;
 	slice.num_ctu_in_slice = static_cast<uint32_t>(((encodeImage.width + ctb - 1) / ctb) * ((encodeImage.height + ctb - 1) / ctb));
-	slice.slice_type = 2;
+	// Intel disables IBC for I slices. Use its supported intra-picture P
+	// slice case; the driver inserts the current-picture reference itself.
+	// Never put the reconstruction into the external DPB reference lists.
+	slice.slice_type = ibc ? 1 : 2;
 	for (auto& ref : slice.ref_pic_list0) {
 		ref.picture_id = VA_INVALID_SURFACE;
 		ref.flags = VA_PICTURE_HEVC_INVALID;
@@ -2083,51 +2460,49 @@ EncodedImage encode_vaapi_hevc_still_image(const RawImage& image, std::span<cons
 		ref.picture_id = VA_INVALID_SURFACE;
 		ref.flags = VA_PICTURE_HEVC_INVALID;
 	}
-	slice.max_num_merge_cand = 1;
+	slice.max_num_merge_cand = ibc ? 5 : 1;
 	slice.slice_cb_qp_offset = static_cast<int8_t>(get_int_param(params, "slice-cb-qp-offset", 0));
 	slice.slice_cr_qp_offset = static_cast<int8_t>(get_int_param(params, "slice-cr-qp-offset", 0));
 	slice.slice_beta_offset_div2 = static_cast<int8_t>(get_int_param(params, "slice-beta-offset-div2", 0));
 	slice.slice_tc_offset_div2 = static_cast<int8_t>(get_int_param(params, "slice-tc-offset-div2", 0));
 	slice.slice_qp_delta = 0;
 	slice.slice_fields.bits.last_slice_of_pic_flag = 1;
-	slice.slice_fields.bits.slice_sao_luma_flag = get_param<bool>(params, "slice-sao-luma", true) ? 1u : 0u;
-	slice.slice_fields.bits.slice_sao_chroma_flag = get_param<bool>(params, "slice-sao-chroma", true) ? 1u : 0u;
+	slice.slice_fields.bits.slice_deblocking_filter_disabled_flag = feature("deblock", true) ? 0u : 1u;
+	slice.slice_fields.bits.slice_sao_luma_flag = (seq.seq_fields.bits.sample_adaptive_offset_enabled_flag && get_param<bool>(params, "slice-sao-luma", true)) ? 1u : 0u;
+	slice.slice_fields.bits.slice_sao_chroma_flag = (seq.seq_fields.bits.sample_adaptive_offset_enabled_flag && get_param<bool>(params, "slice-sao-chroma", true)) ? 1u : 0u;
 	slice.slice_fields.bits.slice_loop_filter_across_slices_enabled_flag = get_param<bool>(params, "loop-filter-across-slices", true) ? 1u : 0u;
 
 	auto seqBuf = create_buffer(va.display.dpy, va.context.id, VAEncSequenceParameterBufferType, seq);
-	auto rcBuf = create_misc_rate_control(va.display.dpy, va.context.id, rcMode, qpi, bitrateKbps);
+	auto rcBuf = create_misc_rate_control(va.display.dpy, va.context.id, rcMode, qpi, targetBitsPerSecond);
 	auto frameRateBuf = create_frame_rate(va.display.dpy, va.context.id);
 	BufferGuard qualityBuf;
 	if (query_profile_capabilities(va.display.dpy, profile).qualityRange != 0) {
 		qualityBuf = create_quality_level(va.display.dpy, va.context.id, quality);
 	}
 	auto picBuf = create_buffer(va.display.dpy, va.context.id, VAEncPictureParameterBufferType, pic);
-	auto sliceBuf = create_buffer(va.display.dpy, va.context.id, VAEncSliceParameterBufferType, slice);
 	const bool entryPointsPresent = tileCols > 1 || tileRows > 1 ||
 	                                get_param<bool>(params, "entropy-coding-sync", false);
-	const std::vector<std::byte> sliceHeader = hevc_slice_header(
-		slice.slice_qp_delta,
-		get_param<bool>(params, "sao", true),
-		get_param<bool>(params, "loop-filter-across-slices", true),
-		entryPointsPresent
-	);
-	const std::vector<std::byte> vpsHeader = hevc_vps_header(seq.general_profile_idc, seq.general_level_idc, seq.general_tier_flag != 0);
+	const std::vector<std::byte> vpsHeader = hevc_vps_header(seq.general_profile_idc, seq.general_level_idc, seq.general_tier_flag != 0, depth, seq.seq_fields.bits.chroma_format_idc, ibc);
 	const std::vector<std::byte> spsHeader = hevc_sps_header(
 		encodeImage.width,
 		encodeImage.height,
+		converted.width,
+		converted.height,
 		seq.general_profile_idc,
 		seq.general_level_idc,
 		seq.general_tier_flag != 0,
 		seq.seq_fields.bits.chroma_format_idc,
 		seq.seq_fields.bits.bit_depth_luma_minus8,
 		seq.seq_fields.bits.sample_adaptive_offset_enabled_flag != 0,
-		seq.seq_fields.bits.strong_intra_smoothing_enabled_flag != 0
+		seq.seq_fields.bits.strong_intra_smoothing_enabled_flag != 0,
+        encodeImage.color,
+        palette,
+        ibc
 	);
-	const std::vector<std::byte> ppsHeader = hevc_pps_header(pic);
+	const std::vector<std::byte> ppsHeader = hevc_pps_header(pic, scc, ibc);
 	auto packedVps = create_packed_header(va.display.dpy, va.context.id, VAEncPackedHeaderHEVC_VPS, vpsHeader);
 	auto packedSps = create_packed_header(va.display.dpy, va.context.id, VAEncPackedHeaderHEVC_SPS, spsHeader);
 	auto packedPps = create_packed_header(va.display.dpy, va.context.id, VAEncPackedHeaderHEVC_PPS, ppsHeader);
-	auto packedSlice = create_packed_header(va.display.dpy, va.context.id, VAEncPackedHeaderHEVC_Slice, sliceHeader);
 	std::vector<VABufferID> buffers;
 	buffers.reserve(14);
 	buffers.push_back(seqBuf.id);
@@ -2142,11 +2517,30 @@ EncodedImage encode_vaapi_hevc_still_image(const RawImage& image, std::span<cons
 		packedSps.data.id,
 		packedPps.params.id,
 		packedPps.data.id,
-		packedSlice.params.id,
-		packedSlice.data.id,
-		sliceBuf.id,
 	};
 	buffers.insert(buffers.end(), std::begin(remainingBuffers), std::end(remainingBuffers));
+	// One independent slice per tile keeps each slice inside its tile and
+	// requires no CABAC entry-point offsets inside that slice.
+	const uint32_t ctuCols = (encodeImage.width + 63) / 64;
+	const uint32_t ctuRows = (encodeImage.height + 63) / 64;
+	std::vector<PackedHeaderBuffers> packedSlices;
+	std::vector<BufferGuard> sliceBuffers;
+	packedSlices.reserve(tileCols * tileRows);
+	sliceBuffers.reserve(tileCols * tileRows);
+	for (uint32_t row = 0; row < tileRows; ++row) for (uint32_t col = 0; col < tileCols; ++col) {
+		const uint32_t startX = ctuCols * col / tileCols, endX = ctuCols * (col+1) / tileCols;
+		const uint32_t startY = ctuRows * row / tileRows, endY = ctuRows * (row+1) / tileRows;
+		slice.slice_segment_address = startY * ctuCols + startX;
+		slice.num_ctu_in_slice = (endX-startX) * (endY-startY);
+		slice.slice_fields.bits.last_slice_of_pic_flag = row+1 == tileRows && col+1 == tileCols;
+		const auto header = hevc_slice_header(slice, feature("sao", true),
+		    get_param<bool>(params, "loop-filter-across-slices", true), entryPointsPresent, ctuCols * ctuRows);
+		packedSlices.push_back(create_packed_header(va.display.dpy, va.context.id, VAEncPackedHeaderHEVC_Slice, header));
+		sliceBuffers.push_back(create_buffer(va.display.dpy, va.context.id, VAEncSliceParameterBufferType, slice));
+		buffers.push_back(packedSlices.back().params.id);
+		buffers.push_back(packedSlices.back().data.id);
+		buffers.push_back(sliceBuffers.back().id);
+	}
 	checked(vaBeginPicture(va.display.dpy, va.context.id, va.input.surface), "begin HEVC picture");
 	checked(vaRenderPicture(va.display.dpy, va.context.id, buffers.data(), static_cast<int>(buffers.size())), "render HEVC picture");
 	checked(vaEndPicture(va.display.dpy, va.context.id), "end HEVC picture");
@@ -2155,6 +2549,9 @@ EncodedImage encode_vaapi_hevc_still_image(const RawImage& image, std::span<cons
 	result.hevcAnnexB = collect_coded_buffer(va.display.dpy, va.coded.id);
 	if (result.hevcAnnexB.empty()) {
 		throw std::runtime_error("VA-API HEVC produced an empty bitstream");
+	}
+	if (get_param<bool>(params, "capture-reconstruction", false)) {
+		result.previewImage = std::make_shared<RawImage>(download_hevc_reconstruction(va.display.dpy, va.recon.surface, converted));
 	}
 	return result;
 }
@@ -2175,7 +2572,7 @@ EncodedImage encode_vaapi_hevc_still_image(const RawImage& image, std::span<cons
 }
 
 std::vector<EncoderParamInfo> query_vaapi_av1_parameters(std::string_view device) {
-	VaDisplay display{std::string(device)};
+	VaDisplay const display{std::string(device)};
 	const ProfileCapabilities caps = query_profile_capabilities(display.dpy, VAProfileAV1Profile0);
 	const std::vector<EnumValue> rateControls = rate_control_values(caps.rateControl);
 	if (rateControls.empty()) throw VaError("VA-API AV1 driver on '" + std::string(device) + "' advertises no supported rate-control mode");
@@ -2188,18 +2585,18 @@ std::vector<EncoderParamInfo> query_vaapi_av1_parameters(std::string_view device
 	}
 	std::vector<EncoderParamInfo> out{
 		enum_param("rate-control", "Mode", "Rate Control", rateControls.front().value, rateControls, "VA-API rate-control mode advertised by this driver."),
-		int_param("qindex", "Q index", "Rate Control", 128, {0, 255, 1}, "AV1 base quantizer index for CQP still-image encoding."),
-		int_param("icq-quality", "ICQ quality", "Rate Control", 25, {1, 51, 1}, "VA-API intelligent constant-quality factor; 1 is highest quality and 51 is lowest."),
-		int_param("bitrate-kbps", "Bitrate", "Rate Control", 10000, {1, 1000000, 1000}, "Target bitrate for CBR/VBR modes."),
-		automatic_int_param("level-idx", "Level index", "Profile / Level", -1, {-1, 23, 1}, "Auto is an application-only sentinel that selects the lowest valid AV1 level for the image. Explicit values 0..23 map to AV1 levels 2.0..7.3; -1 is never written as seq_level_idx."),
-		enum_param("bit-depth", "Bit depth", "Compression", supports10 ? "10" : "8", {{"8", "8-bit"}, {"10", "10-bit"}}, "Encode bit depth."),
-		enum_param("chroma-subsampling", "Chroma subsampling", "Output Format", "420", {{"420", "4:2:0"}}, "VA-API AV1 Profile 0 output is 4:2:0."),
+		int_param("qindex", "Q index", "Rate Control", 128, {.min=0, .max=255, .step=1}, "AV1 base quantizer index for CQP still-image encoding."),
+		int_param("icq-quality", "ICQ quality", "Rate Control", 25, {.min=1, .max=51, .step=1}, "VA-API intelligent constant-quality factor; 1 is highest quality and 51 is lowest."),
+		image_size_param(),
+		automatic_int_param("level-idx", "Level index", "Profile / Level", -1, {.min=-1, .max=23, .step=1}, "Auto is an application-only sentinel that selects the lowest valid AV1 level for the image. Explicit values 0..23 map to AV1 levels 2.0..7.3; -1 is never written as seq_level_idx."),
+		enum_param("bit-depth", "Bit depth", "Compression", supports10 ? "10" : "8", {{.value="8", .label="8-bit"}, {.value="10", .label="10-bit"}}, "Encode bit depth."),
+		enum_param("chroma-subsampling", "Chroma subsampling", "Output Format", "420", {{.value="420", .label="4:2:0"}}, "VA-API AV1 Profile 0 output is 4:2:0."),
 		bool_param("disable-cdf-update", "Disable CDF update", "Coding Tools", false, "Disable AV1 CDF updates for the still frame."),
 		bool_param("cdef", "CDEF", "Filters", true, "Enable AV1 constrained directional enhancement filtering."),
-		int_param("loop-filter-level", "Loop filter level", "Filters", 0, {0, 63, 1}, "AV1 luma loop filter level."),
-		enum_param("tx-mode", "TX mode", "Transform", "largest", {{"largest", "Largest"}}, "AV1 transform mode."),
-		int_param("tile-columns", "Tile columns", "Partitioning", 1, {1, 32, 1}, "Requested AV1 uniform-spacing column target; the actual count follows AV1 superblock rounding and every tile must remain at least 2x2 superblocks."),
-		int_param("tile-rows", "Tile rows", "Partitioning", 1, {1, 32, 1}, "Requested AV1 uniform-spacing row target; the actual count follows AV1 superblock rounding and every tile must remain at least 2x2 superblocks."),
+		int_param("loop-filter-level", "Loop filter level", "Filters", 0, {.min=0, .max=63, .step=1}, "AV1 luma loop filter level."),
+		enum_param("tx-mode", "TX mode", "Transform", "largest", {{.value="largest", .label="Largest"}}, "AV1 transform mode."),
+		int_param("tile-columns", "Tile columns", "Partitioning", 1, {.min=1, .max=32, .step=1}, "Requested AV1 uniform-spacing column target; the actual count follows AV1 superblock rounding and every tile must remain at least 2x2 superblocks."),
+		int_param("tile-rows", "Tile rows", "Partitioning", 1, {.min=1, .max=32, .step=1}, "Requested AV1 uniform-spacing row target; the actual count follows AV1 superblock rounding and every tile must remain at least 2x2 superblocks."),
 	};
 	if (caps.qualityRange != 0) {
 		out.push_back(int_param(
@@ -2207,52 +2604,56 @@ std::vector<EncoderParamInfo> query_vaapi_av1_parameters(std::string_view device
 			"Target usage",
 			"Speed / Quality",
 			std::min<int64_t>(4, caps.qualityRange),
-			{0, static_cast<int64_t>(caps.qualityRange), 1},
+			{.min=0, .max=static_cast<int64_t>(caps.qualityRange), .step=1},
 			"VA quality level: 1 is the highest quality, larger values favor speed, and 0 selects the driver default."
 		));
 	}
 	auto find_param = [&](std::string_view name) -> EncoderParamInfo* {
-		const auto it = std::find_if(out.begin(), out.end(), [&](const EncoderParamInfo& param) { return param.name == name; });
+		const auto it = std::ranges::find_if(out, [&](const EncoderParamInfo& param) { return param.name == name; });
 		return it == out.end() ? nullptr : &*it;
 	};
 	if (EncoderParamInfo* qindex = find_param("qindex")) {
 		if ((caps.rateControl & VA_RC_CQP) != 0) {
-			qindex->enabledWhen.push_back({"rate-control", {"cqp"}, "Q index applies only to CQP."});
+			qindex->enabledWhen.push_back({.parameter="rate-control", .acceptedValues={"cqp"}, .explanation="Q index applies only to CQP."});
 		} else {
-			out.erase(std::remove_if(out.begin(), out.end(), [](const EncoderParamInfo& param) { return param.name == "qindex"; }), out.end());
+			std::erase_if(out, [](const EncoderParamInfo& param) { return param.name == "qindex"; });
 		}
+	}
+	if (EncoderParamInfo* filter = find_param("loop-filter-level")) {
+		filter->enabledWhen.push_back({.parameter="rate-control", .acceptedValues={"cqp"},
+		                              .explanation="In bitrate and ICQ modes the driver selects loop-filter strength."});
 	}
 	if (EncoderParamInfo* quality = find_param("icq-quality")) {
 		if ((caps.rateControl & VA_RC_ICQ) != 0) {
-			quality->enabledWhen.push_back({"rate-control", {"icq"}, "ICQ quality applies only to ICQ."});
+			quality->enabledWhen.push_back({.parameter="rate-control", .acceptedValues={"icq"}, .explanation="ICQ quality applies only to ICQ."});
 		} else {
-			out.erase(std::remove_if(out.begin(), out.end(), [](const EncoderParamInfo& param) { return param.name == "icq-quality"; }), out.end());
+			std::erase_if(out, [](const EncoderParamInfo& param) { return param.name == "icq-quality"; });
 		}
 	}
-	if (EncoderParamInfo* bitrate = find_param("bitrate-kbps")) {
+	if (EncoderParamInfo* bitrate = find_param("target-size-kb")) {
 		if ((caps.rateControl & (VA_RC_VBR | VA_RC_CBR)) == 0) {
-			out.erase(std::remove_if(out.begin(), out.end(), [](const EncoderParamInfo& param) { return param.name == "bitrate-kbps"; }), out.end());
+			std::erase_if(out, [](const EncoderParamInfo& param) { return param.name == "target-size-kb"; });
 		} else {
-			bitrate->enabledWhen.push_back({"rate-control", {"vbr", "cbr"}, "Bitrate applies only to VBR and CBR."});
+			bitrate->enabledWhen.push_back({.parameter="rate-control", .acceptedValues={"vbr", "cbr"}, .explanation="Target image size applies only to VBR and CBR."});
 			bitrate->directNumericInput = true;
 		}
 	}
 	if (EncoderParamInfo* depth = find_param("bit-depth")) {
 		depth->enumValues.clear();
-		if (supports8) depth->enumValues.push_back({"8", "8-bit"});
-		if (supports10) depth->enumValues.push_back({"10", "10-bit"});
+		if (supports8) depth->enumValues.push_back({.value="8", .label="8-bit"});
+		if (supports10) depth->enumValues.push_back({.value="10", .label="10-bit"});
 		depth->defaultValue = supports10 ? std::string{"10"} : std::string{"8"};
 	}
 	if (caps.tileSupport == 0) {
-		out.erase(std::remove_if(out.begin(), out.end(), [](const EncoderParamInfo& param) {
+		std::erase_if(out, [](const EncoderParamInfo& param) {
 			return param.name == "tile-columns" || param.name == "tile-rows";
-		}), out.end());
+		});
 	} else {
-		if (EncoderParamInfo* columns = find_param("tile-columns"); columns != nullptr && caps.maxTileCols != 0) {
+		if (EncoderParamInfo* columns = find_param("tile-columns"); columns != nullptr && columns->intRange.has_value() && caps.maxTileCols != 0) {
 			const uint32_t maxPowerOfTwo = 1u << floor_log2_u32(std::min<uint32_t>(caps.maxTileCols, 63u));
 			columns->intRange->max = std::min<int64_t>(columns->intRange->max, maxPowerOfTwo);
 		}
-		if (EncoderParamInfo* rows = find_param("tile-rows"); rows != nullptr && caps.maxTileRows != 0) {
+		if (EncoderParamInfo* rows = find_param("tile-rows"); rows != nullptr && rows->intRange.has_value() && caps.maxTileRows != 0) {
 			const uint32_t maxPowerOfTwo = 1u << floor_log2_u32(std::min<uint32_t>(caps.maxTileRows, 63u));
 			rows->intRange->max = std::min<int64_t>(rows->intRange->max, maxPowerOfTwo);
 		}
@@ -2265,7 +2666,7 @@ std::vector<EncoderParamInfo> query_vaapi_av1_parameters() {
 }
 
 EncodedImage encode_vaapi_av1_still_image(const RawImage& image, std::span<const EncoderParam> params, std::string_view device) {
-	const std::string chroma = get_param<std::string>(params, "chroma-subsampling", "420");
+	const auto chroma = get_param<std::string>(params, "chroma-subsampling", is_444(image.format) ? "444" : is_422(image.format) ? "422" : "420");
 	if (chroma != "420") {
 		throw std::invalid_argument("VA-API AV1 Profile 0 accepts only 4:2:0 output");
 	}
@@ -2273,7 +2674,11 @@ EncodedImage encode_vaapi_av1_still_image(const RawImage& image, std::span<const
 	if (targetDepth != 8 && targetDepth != 10) {
 		throw std::runtime_error("VA-API AV1 accepts 8-bit or 10-bit input");
 	}
-	RawImage encodeImage = convert_yuv_format(image, targetDepth == 8 ? PixelFormat::YUV420P8 : PixelFormat::YUV420P10LE);
+	validate_yuv_image(image);
+	const auto targetFormat = targetDepth == 8 ? PixelFormat::YUV420P8 : PixelFormat::YUV420P10LE;
+	std::optional<RawImage> convertedStorage;
+	const RawImage& encodeImage = image.format == targetFormat ? image :
+	                             convertedStorage.emplace(convert_yuv_format(image, targetFormat));
 	const int depth = bit_depth(encodeImage.format);
 	const uint32_t rtFormat = depth == 8 ? VA_RT_FORMAT_YUV420 : VA_RT_FORMAT_YUV420_10;
 	const uint32_t pixelFormat = depth == 8 ? VA_FOURCC_NV12 : VA_FOURCC_P010;
@@ -2281,7 +2686,7 @@ EncodedImage encode_vaapi_av1_still_image(const RawImage& image, std::span<const
 	const uint32_t rcMode = vaapi_rate_control_mode(get_param<std::string>(params, "rate-control", "cqp"));
 	const uint32_t headerQindex = rcMode == VA_RC_CQP ? qindex : std::max<uint32_t>(1, qindex);
 	const uint32_t icqQuality = static_cast<uint32_t>(std::clamp<int64_t>(get_int_param(params, "icq-quality", 25), 1, 51));
-	const uint32_t bitrateKbps = static_cast<uint32_t>(std::clamp<int64_t>(get_int_param(params, "bitrate-kbps", 10000), 1, 1000000));
+	const uint32_t targetBitsPerSecond = vaapi_still_target_bps(params);
 	const uint32_t targetUsage = static_cast<uint32_t>(std::max<int64_t>(0, get_int_param(params, "target-usage", 4)));
 	const uint8_t levelIdx = av1_level_idx_from_params(params, encodeImage.width, encodeImage.height);
 	const bool highTier = false;
@@ -2301,15 +2706,16 @@ EncodedImage encode_vaapi_av1_still_image(const RawImage& image, std::span<const
 	const uint32_t tileRows = static_cast<uint32_t>(std::clamp<int64_t>(get_int_param(params, "tile-rows", 1), 1, 32));
 	const Av1TileLayout tiles = av1_tile_layout(encodeImage.width, encodeImage.height, use128, tileCols, tileRows);
 
-	VaEncodeObjects va(
+	VaEncodeLease lease(
 		encodeImage,
 		VAProfileAV1Profile0,
 		rtFormat,
 		pixelFormat,
 		std::string(device),
 		VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_PICTURE,
-		rcMode
+		rcMode, params
 	);
+	const auto& va=lease.get();
 	require_tile_configuration(va.display.dpy, VAProfileAV1Profile0, tiles.cols, tiles.rows, device);
 	upload_yuv_to_surface(va.display.dpy, va.input.surface, encodeImage);
 	checked(vaSyncSurface(va.display.dpy, va.input.surface), "sync AV1 input surface");
@@ -2320,7 +2726,7 @@ EncodedImage encode_vaapi_av1_still_image(const RawImage& image, std::span<const
 	seq.seq_tier = highTier ? 1 : 0;
 	seq.intra_period = 1;
 	seq.ip_period = 1;
-	seq.bits_per_second = rcMode == VA_RC_CQP ? 0u : bitrateKbps * 1000u;
+	seq.bits_per_second = rcMode == VA_RC_CQP ? 0u : targetBitsPerSecond;
 	seq.seq_fields.bits.still_picture = 1;
 	seq.seq_fields.bits.use_128x128_superblock = use128 ? 1u : 0u;
 	seq.seq_fields.bits.enable_filter_intra = filterIntra ? 1u : 0u;
@@ -2421,7 +2827,7 @@ EncodedImage encode_vaapi_av1_still_image(const RawImage& image, std::span<const
 	auto seqBuf = create_buffer(va.display.dpy, va.context.id, VAEncSequenceParameterBufferType, seq);
 	// Zero leaves the misc-layer QP limit unset; AV1 limits are carried by the
 	// picture's min_base_qindex and max_base_qindex fields.
-	auto rcBuf = create_misc_rate_control(va.display.dpy, va.context.id, rcMode, headerQindex, bitrateKbps, 0u, icqQuality);
+	auto rcBuf = create_misc_rate_control(va.display.dpy, va.context.id, rcMode, headerQindex, targetBitsPerSecond, 0u, icqQuality);
 	auto frameRateBuf = create_frame_rate(va.display.dpy, va.context.id);
 	BufferGuard qualityBuf;
 	const uint32_t qualityRange = query_profile_capabilities(va.display.dpy, VAProfileAV1Profile0).qualityRange;

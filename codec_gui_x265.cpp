@@ -1,10 +1,19 @@
 // codec_gui_x265.cpp
 #include "codec_gui_x265.hpp"
 
-#include <charconv>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <memory>
+#include <span>
 #include <sstream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <variant>
+#include <vector>
+#include <x265.h>
 
 namespace codec_gui {
 	namespace {
@@ -147,16 +156,16 @@ namespace codec_gui {
 						.defaultValue = std::string{"medium"},
 						.enumValues =
 								{
-										{"ultrafast", "Ultrafast"},
-										{"superfast", "Superfast"},
-										{"veryfast", "Veryfast"},
-										{"faster", "Faster"},
-										{"fast", "Fast"},
-										{"medium", "Medium"},
-										{"slow", "Slow"},
-										{"slower", "Slower"},
-										{"veryslow", "Veryslow"},
-										{"placebo", "Placebo"},
+										{.value="ultrafast", .label="Ultrafast"},
+										{.value="superfast", .label="Superfast"},
+										{.value="veryfast", .label="Veryfast"},
+										{.value="faster", .label="Faster"},
+										{.value="fast", .label="Fast"},
+										{.value="medium", .label="Medium"},
+										{.value="slow", .label="Slow"},
+										{.value="slower", .label="Slower"},
+										{.value="veryslow", .label="Veryslow"},
+										{.value="placebo", .label="Placebo"},
 								},
 						.help = "Global speed/quality preset. Still-image comparison should usually expose slow, "
 								"slower, veryslow, and placebo.",
@@ -169,13 +178,13 @@ namespace codec_gui {
 						.defaultValue = std::string{""},
 						.enumValues =
 								{
-										{"", "None"},
-										{"psnr", "PSNR"},
-										{"ssim", "SSIM"},
-										{"grain", "Grain"},
-										{"zerolatency", "Zero latency"},
-										{"fastdecode", "Fast decode"},
-										{"animation", "Animation"},
+										{.value="", .label="None"},
+										{.value="psnr", .label="PSNR"},
+										{.value="ssim", .label="SSIM"},
+										{.value="grain", .label="Grain"},
+										{.value="zerolatency", .label="Zero latency"},
+										{.value="fastdecode", .label="Fast decode"},
+										{.value="animation", .label="Animation"},
 								},
 						.help = "High-level encoder tuning.",
 				},
@@ -187,7 +196,7 @@ namespace codec_gui {
 						.defaultValue = std::string{"auto"},
 						.enumValues =
 								{
-										{"auto", "Auto"},
+										{.value="auto", .label="Auto"},
 								},
 						.help = "The profile is derived from the selected bit depth and chroma layout so an incompatible restriction cannot be selected.",
 				},
@@ -197,7 +206,7 @@ namespace codec_gui {
 						.group        = "Rate Control",
 						.kind         = ParamKind::Enum,
 						.defaultValue = std::string{"crf"},
-						.enumValues   = {{"qp", "Constant QP"}, {"crf", "Constant quality (CRF)"}, {"lossless", "Lossless"}},
+						.enumValues   = {{.value="qp", .label="Constant QP"}, {.value="crf", .label="Constant quality (CRF)"}, {.value="lossless", .label="Lossless"}},
 						.help         = "Selects exactly one rate-control strategy. Inactive controls are disabled and are not sent to x265.",
 				},
 				{
@@ -206,10 +215,10 @@ namespace codec_gui {
 						.group        = "Rate Control",
 						.kind         = ParamKind::Int,
 						.defaultValue = int64_t{22},
-						.intRange     = IntRange{0, 51, 1},
+						.intRange     = IntRange{.min=0, .max=51, .step=1},
 						.help         = "Constant quantizer. Lower means larger and higher quality. Very relevant for "
 										"still-image comparisons.",
-						.enabledWhen  = {{"rate-control", {"qp"}, "QP is available only in Constant QP mode."}},
+						.enabledWhen  = {{.parameter="rate-control", .acceptedValues={"qp"}, .explanation="QP is available only in Constant QP mode."}},
 				},
 				{
 						.name         = "crf",
@@ -217,10 +226,10 @@ namespace codec_gui {
 						.group        = "Rate Control",
 						.kind         = ParamKind::Float,
 						.defaultValue = double{28.0},
-						.floatRange   = FloatRange{0.0, 51.0, 0.1},
+						.floatRange   = FloatRange{.min=0.0, .max=51.0, .step=0.1},
 						.help         = "Constant rate factor. Better for perceptual target quality than exact "
 										"reproducibility.",
-						.enabledWhen  = {{"rate-control", {"crf"}, "CRF is available only in Constant quality mode."}},
+						.enabledWhen  = {{.parameter="rate-control", .acceptedValues={"crf"}, .explanation="CRF is available only in Constant quality mode."}},
 				},
 				{
 						.name         = "lossless",
@@ -237,7 +246,7 @@ namespace codec_gui {
 						.group        = "Intra Analysis",
 						.kind         = ParamKind::Int,
 						.defaultValue = int64_t{3},
-						.intRange     = IntRange{0, 6, 1},
+						.intRange     = IntRange{.min=0, .max=6, .step=1},
 						.help = "Rate-distortion search depth. One of the most important knobs for I-frame image "
 								"coding.",
 				},
@@ -247,7 +256,7 @@ namespace codec_gui {
 						.group        = "Intra Analysis",
 						.kind         = ParamKind::Int,
 						.defaultValue = int64_t{0},
-						.intRange     = IntRange{0, 2, 1},
+						.intRange     = IntRange{.min=0, .max=2, .step=1},
 						.help         = "Rate-distortion optimized quantization level.",
 				},
 				{
@@ -256,7 +265,7 @@ namespace codec_gui {
 						.group        = "Psychovisual",
 						.kind         = ParamKind::Float,
 						.defaultValue = double{2.0},
-						.floatRange   = FloatRange{0.0, 5.0, 0.05},
+						.floatRange   = FloatRange{.min=0.0, .max=5.0, .step=0.05},
 						.help         = "Psychovisual rate-distortion strength. Useful for photographic detail.",
 				},
 				{
@@ -265,7 +274,7 @@ namespace codec_gui {
 						.group        = "Psychovisual",
 						.kind         = ParamKind::Float,
 						.defaultValue = double{0.0},
-						.floatRange   = FloatRange{0.0, 50.0, 0.05},
+						.floatRange   = FloatRange{.min=0.0, .max=50.0, .step=0.05},
 						.help = "Psychovisual quantization bias. Can retain texture, but may hurt objective metrics.",
 				},
 				{
@@ -276,11 +285,11 @@ namespace codec_gui {
 						.defaultValue = std::string{"3"},
 						.enumValues =
 								{
-										{"0", "Disabled"},
-										{"1", "Variance AQ"},
-										{"2", "Auto-variance AQ"},
-										{"3", "Auto-variance AQ biased"},
-										{"4", "Edge AQ"},
+										{.value="0", .label="Disabled"},
+										{.value="1", .label="Variance AQ"},
+										{.value="2", .label="Auto-variance AQ"},
+										{.value="3", .label="Auto-variance AQ biased"},
+										{.value="4", .label="Edge AQ"},
 								},
 						.help = "Adaptive quantization mode. Edge AQ is interesting for screenshots and text; biased "
 								"auto-variance is often good for photos.",
@@ -291,7 +300,7 @@ namespace codec_gui {
 						.group        = "Quantization",
 						.kind         = ParamKind::Float,
 						.defaultValue = double{1.0},
-						.floatRange   = FloatRange{0.0, 3.0, 0.05},
+						.floatRange   = FloatRange{.min=0.0, .max=3.0, .step=0.05},
 						.help         = "Adaptive quantization strength.",
 				},
 				{
@@ -302,9 +311,9 @@ namespace codec_gui {
 						.defaultValue = std::string{"64"},
 						.enumValues =
 								{
-										{"16", "16"},
-										{"32", "32"},
-										{"64", "64"},
+										{.value="16", .label="16"},
+										{.value="32", .label="32"},
+										{.value="64", .label="64"},
 								},
 						.help = "Coding tree unit size. Smaller can help sharp synthetic content; 64 is normally best "
 								"for photos.",
@@ -317,8 +326,8 @@ namespace codec_gui {
 						.defaultValue = std::string{"8"},
 						.enumValues =
 								{
-										{"8", "8"},
-										{"16", "16"},
+										{.value="8", .label="8"},
+										{.value="16", .label="16"},
 								},
 						.help = "Minimum coding unit sizes valid with every selectable CTU size.",
 				},
@@ -328,7 +337,7 @@ namespace codec_gui {
 						.group        = "Transform",
 						.kind         = ParamKind::Int,
 						.defaultValue = int64_t{1},
-						.intRange     = IntRange{1, 4, 1},
+						.intRange     = IntRange{.min=1, .max=4, .step=1},
 						.help = "Transform recursion depth for intra blocks. Important for still-image texture and "
 								"edges.",
 				},
@@ -338,7 +347,7 @@ namespace codec_gui {
 						.group        = "Transform",
 						.kind         = ParamKind::Int,
 						.defaultValue = int64_t{0},
-						.intRange     = IntRange{0, 4, 1},
+						.intRange     = IntRange{.min=0, .max=4, .step=1},
 						.help         = "Prunes transform search. Keep at 0 for exhaustive still-image comparisons.",
 				},
 				{
@@ -380,7 +389,7 @@ namespace codec_gui {
 						.group        = "Still Image Safety",
 						.kind         = ParamKind::Int,
 						.defaultValue = int64_t{1},
-						.intRange     = IntRange{1, 1000, 1},
+						.intRange     = IntRange{.min=1, .max=1000, .step=1},
 						.help         = "For still-image encoding, force this to 1.",
 						.relevantForStillImage = false,
 				},
@@ -390,7 +399,7 @@ namespace codec_gui {
 						.group        = "Still Image Safety",
 						.kind         = ParamKind::Int,
 						.defaultValue = int64_t{1},
-						.intRange     = IntRange{1, 1000, 1},
+						.intRange     = IntRange{.min=1, .max=1000, .step=1},
 						.help         = "For still-image encoding, force this to 1.",
 						.relevantForStillImage = false,
 				},
@@ -400,7 +409,7 @@ namespace codec_gui {
 						.group        = "Still Image Safety",
 						.kind         = ParamKind::Int,
 						.defaultValue = int64_t{0},
-						.intRange     = IntRange{0, X265_BFRAME_MAX, 1},
+						.intRange     = IntRange{.min=0, .max=X265_BFRAME_MAX, .step=1},
 						.help         = "For still-image encoding, force this to 0.",
 						.relevantForStillImage = false,
 				},
@@ -410,7 +419,7 @@ namespace codec_gui {
 						.group        = "Still Image Safety",
 						.kind         = ParamKind::Int,
 						.defaultValue = int64_t{1},
-						.intRange     = IntRange{1, 16, 1},
+						.intRange     = IntRange{.min=1, .max=16, .step=1},
 						.help         = "For single-frame encoding, extra references are useless.",
 						.relevantForStillImage = false,
 				},
@@ -482,6 +491,13 @@ namespace codec_gui {
 		param->vui.transferCharacteristics = static_cast<int>(image.color.transfer);
 		param->vui.matrixCoeffs = static_cast<int>(image.color.matrix);
 		param->vui.bEnableVideoFullRangeFlag = image.color.range == ColorRange::Full ? 1 : 0;
+		param->vui.bEnableVideoSignalTypePresentFlag = 1;
+		param->vui.bEnableColorDescriptionPresentFlag = 1;
+		if (image.color.chroma420Location) {
+			param->vui.bEnableChromaLocInfoPresentFlag = 1;
+			param->vui.chromaSampleLocTypeTopField = static_cast<int>(*image.color.chroma420Location);
+			param->vui.chromaSampleLocTypeBottomField = static_cast<int>(*image.color.chroma420Location);
+		}
 
 		auto auto_profile = [](PixelFormat format) -> const char* {
 				switch (format) {
@@ -497,9 +513,9 @@ namespace codec_gui {
 				case PixelFormat::YUV444P10LE: return "main444-10";
 				case PixelFormat::YUV444P12LE: return "main444-12";
 				case PixelFormat::YUV444P14LE: return "main444-12";
-				case PixelFormat::Gray8: return "main";
-				case PixelFormat::Gray10LE: return "main10";
-				case PixelFormat::Gray12LE: return "main12";
+				case PixelFormat::Gray8: return "main444-8";
+				case PixelFormat::Gray10LE: return "main444-10";
+				case PixelFormat::Gray12LE: return "main444-12";
 				case PixelFormat::Gray14LE: return "main12";
 				default: break;
 			}
@@ -549,7 +565,7 @@ namespace codec_gui {
 			}
 		}
 
-		EncoderPtr encoder{api->encoder_open(param.get()), X265EncoderDeleter{api}};
+		EncoderPtr const encoder{api->encoder_open(param.get()), X265EncoderDeleter{api}};
 		if (!encoder) {
 			throw std::runtime_error(
 					"x265_encoder_open failed; selected parameters are probably out of range or incompatible");
@@ -574,7 +590,7 @@ namespace codec_gui {
 		pic.bitDepth   = bitDepth;
 
 		for (int i = 0; i < planes; ++i) {
-			pic.planes[i] = (void *) image.planes[i].bytes.data();
+			pic.planes[i] = const_cast<uint8_t*>(image.planes[i].bytes.data());
 			pic.stride[i] = image.planes[i].strideBytes;
 		}
 

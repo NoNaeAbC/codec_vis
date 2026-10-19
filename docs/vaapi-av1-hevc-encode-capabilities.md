@@ -2,10 +2,9 @@
 
 Source hardware/driver snapshot:
 
-- `~/vainfo.txt`
 - VA-API version: 1.23, libva 2.22.0
 - Driver: Intel iHD, `Intel(R) Gen Graphics - 26.1.5`
-- Local headers: installed libva `va.h`, `va_enc_av1.h`, and `va_enc_hevc.h`.
+- Headers: libva `va.h`, `va_enc_av1.h`, and `va_enc_hevc.h`.
 - External references checked: Intel/libva API docs and Intel media-driver notes.
 
 This document focuses on encode entrypoints and still-image / intra-coded-frame use.

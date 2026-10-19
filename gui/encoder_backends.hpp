@@ -13,6 +13,11 @@ namespace codec_gui::gui {
 	struct DecodeResult {
 		std::shared_ptr<const RawImage> image;
 		std::string error;
+		// Source import can pass an embedded RGB/gray ICC profile to the common
+		// color-management path instead of guessing a display interpretation.
+		std::vector<uint8_t> iccProfile;
+		// Completed codec work, excluding device/context setup and CPU readback.
+		std::optional<double> codecSeconds;
 	};
 
 	struct CapabilityResult {
@@ -20,10 +25,23 @@ namespace codec_gui::gui {
 		std::vector<EncoderParamInfo> params;
 	};
 
+	enum class InputGeometryPolicy {
+		Preserve,
+		PadToChromaAlignment,
+	};
+
 	struct EncodeResult {
 		EncodedImage encoded;
 		EncodedMetadata metadata;
 		std::shared_ptr<const RawImage> comparisonReference;
+	};
+
+	// One immutable source/preparation retained per worker. Codec-only settings
+	// (QP, speed, bitrate) never invalidate this cache.
+	struct EncodePreparationCache {
+		std::shared_ptr<const RawImage> source, prepared;
+		BackendId backend;
+		std::vector<std::pair<std::string,ParamValue>> conversionKey;
 	};
 
 	struct EncoderBackend {
@@ -36,6 +54,8 @@ namespace codec_gui::gui {
 		std::function<EncodedImage(const RawImage&, std::span<const EncoderParam>)> encode;
 		DecodeResult (*decodePreview)(const EncodedImage&);
 		std::vector<ParamSummary> (*summarizeParams)(std::span<const EncoderParam>);
+		InputGeometryPolicy inputGeometry = InputGeometryPolicy::Preserve;
+		std::string device;
 	};
 
 	[[nodiscard]] std::vector<EncoderBackend> initial_encoder_backends();
@@ -47,5 +67,8 @@ namespace codec_gui::gui {
 		const RawImage& image,
 		std::span<const EncoderParam> params
 	);
+	[[nodiscard]] EncodeResult run_backend_encode(const EncoderBackend&, std::shared_ptr<const RawImage>,
+		std::span<const EncoderParam>, EncodePreparationCache&);
+	[[nodiscard]] DecodeResult decode_backend_preview(const EncoderBackend&,const EncodedImage&);
 
 } // namespace codec_gui::gui

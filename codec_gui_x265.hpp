@@ -175,6 +175,7 @@ namespace codec_gui {
 		int                        strideBytes = 0;
 	};
 
+	struct EncodedImage;
 	struct RawImage {
 		int         width  = 0;
 		int         height = 0;
@@ -183,6 +184,10 @@ namespace codec_gui {
 		// HLG requires the nominal display peak to invert its system OOTF. This
 		// is image interpretation context, not an H.273 color-description field.
 		std::optional<double> nominalPeakNits;
+		// Human-readable assumptions made when importing untagged codestreams.
+		std::string importNote;
+		std::shared_ptr<const EncodedImage> compressedSource;
+		std::string compressedCodec;
 		ImagePlane  planes[3];
 	};
 
@@ -195,6 +200,9 @@ namespace codec_gui {
 		// formats do not carry a YCbCr matrix or range, but the preview decoder
 		// needs both to reconstruct comparable YCbCr samples for quality metrics.
 		std::optional<ColorDescription> codedColor;
+		// A native encoder may require its decoded preview to verify actual
+		// stream signaling. This is an assertion, never replacement metadata.
+		std::optional<ColorDescription> requiredStreamColor;
 	};
 
 	std::vector<EncoderParamInfo> query_x265_parameters();
@@ -215,6 +223,8 @@ namespace codec_gui {
 	EncodedImage encode_uvg266_still_image(const RawImage &image, std::span<const EncoderParam> params);
 
 	std::vector<EncoderParamInfo> query_av2_parameters();
+	std::shared_ptr<const RawImage> decode_av2_reference_frame(std::span<const std::byte> payload, double* codecSeconds=nullptr);
+	[[nodiscard]] std::string av2_unavailable_reason();
 
 	EncodedImage encode_av2_still_image(const RawImage &image, std::span<const EncoderParam> params);
 

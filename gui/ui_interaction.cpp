@@ -1,14 +1,24 @@
+#include "decoder_ui.hpp"
+#include "command_controls.hpp"
 #include "ui_interaction.hpp"
 
+#include "../codec_gui_x265.hpp"
+#include "app_state.hpp"
 #include "image_list_model.hpp"
 #include "encoder_param_state.hpp"
-#include "storage.hpp"
+#include "layout.hpp"
+#include "ui_widgets.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <string>
 #include <type_traits>
+#include <utility>
+#include <variant>
+#include <vector>
 
 namespace codec_gui::gui {
 namespace {
@@ -17,24 +27,8 @@ bool contains(Rect rect, Point point) {
 	return point.x >= rect.x && point.y >= rect.y && point.x < rect.x + rect.w && point.y < rect.y + rect.h;
 }
 
-Rect image_row_pane_button_rect(Rect row, std::size_t index) {
-	constexpr float ButtonW = 34.0f;
-	constexpr float ButtonH = 18.0f;
-	constexpr float Gap = 4.0f;
-	const float x = row.x + row.w - (ButtonW + Gap) * static_cast<float>(index + 1u);
-	return Rect{x, row.y + 26.0f, ButtonW, ButtonH};
-}
-
-Rect image_row_difference_button_rect(Rect row, std::size_t paneButtonCount) {
-	constexpr float ButtonW = 42.0f;
-	constexpr float ButtonH = 18.0f;
-	constexpr float Gap = 4.0f;
-	const float x = row.x + row.w - (ButtonW + Gap) * static_cast<float>(paneButtonCount + 1u);
-	return Rect{x, row.y + 26.0f, ButtonW, ButtonH};
-}
-
 Rect backend_row_rect(Rect inspector, float y) {
-	return Rect{inspector.x + 12.0f, y, inspector.w - 24.0f, 22.0f};
+	return Rect{.x=inspector.x + 12.0f, .y=y, .w=inspector.w - 24.0f, .h=22.0f};
 }
 
 float backend_selector_end_y(const AppState& state, Rect inspector) {
@@ -43,7 +37,7 @@ float backend_selector_end_y(const AppState& state, Rect inspector) {
 
 const BackendInfo* selected_backend(const AppState& state) {
 	if (valid(state.selection.selectedBackend)) {
-		const auto it = std::find_if(state.backends.begin(), state.backends.end(), [&](const BackendInfo& backend) {
+		const auto it = std::ranges::find_if(state.backends, [&](const BackendInfo& backend) {
 			return backend.id == state.selection.selectedBackend;
 		});
 		if (it != state.backends.end()) {
@@ -54,21 +48,21 @@ const BackendInfo* selected_backend(const AppState& state) {
 }
 
 const EncodeRun* run_by_id(const AppState& state, EncodeRunId id) {
-	const auto it = std::find_if(state.encodeRuns.begin(), state.encodeRuns.end(), [&](const EncodeRun& run) {
+	const auto it = std::ranges::find_if(state.encodeRuns, [&](const EncodeRun& run) {
 		return run.id == id;
 	});
 	return it == state.encodeRuns.end() ? nullptr : &*it;
 }
 
 const ImageObject* image_by_id(const AppState& state, ImageId id) {
-	const auto it = std::find_if(state.images.begin(), state.images.end(), [&](const ImageObject& image) {
+	const auto it = std::ranges::find_if(state.images, [&](const ImageObject& image) {
 		return image.id == id;
 	});
 	return it == state.images.end() ? nullptr : &*it;
 }
 
 const EncoderConfig* config_for_backend(const AppState& state, BackendId backend) {
-	const auto it = std::find_if(state.encoderConfigs.begin(), state.encoderConfigs.end(), [&](const EncoderConfig& config) {
+	const auto it = std::ranges::find_if(state.encoderConfigs, [&](const EncoderConfig& config) {
 		return config.backend == backend;
 	});
 	return it == state.encoderConfigs.end() ? nullptr : &*it;
@@ -76,7 +70,7 @@ const EncoderConfig* config_for_backend(const AppState& state, BackendId backend
 
 ParamValue current_value(const AppState& state, BackendId backend, const EncoderParamInfo& param) {
 	if (const EncoderConfig* config = config_for_backend(state, backend)) {
-		const auto it = std::find_if(config->params.begin(), config->params.end(), [&](const EncoderParam& existing) {
+		const auto it = std::ranges::find_if(config->params, [&](const EncoderParam& existing) {
 			return existing.name == param.name;
 		});
 		if (it != config->params.end()) {
@@ -113,7 +107,7 @@ double control_ratio(Rect control, Point point) {
 }
 
 int64_t slider_int_value(const EncoderParamInfo& param, Rect control, Point point) {
-	const IntRange range = param.intRange.value_or(IntRange{0, 100, 1});
+	const IntRange range = param.intRange.value_or(IntRange{.min=0, .max=100, .step=1});
 	const int64_t step = range.step <= 0 ? 1 : range.step;
 	const double raw = static_cast<double>(range.min) + control_ratio(control, point) * static_cast<double>(range.max - range.min);
 	const auto steps = static_cast<int64_t>(std::llround((raw - static_cast<double>(range.min)) / static_cast<double>(step)));
@@ -122,7 +116,7 @@ int64_t slider_int_value(const EncoderParamInfo& param, Rect control, Point poin
 }
 
 double slider_float_value(const EncoderParamInfo& param, Rect control, Point point) {
-	const FloatRange range = param.floatRange.value_or(FloatRange{0.0, 1.0, 0.01});
+	const FloatRange range = param.floatRange.value_or(FloatRange{.min=0.0, .max=1.0, .step=0.01});
 	const double step = range.step <= 0.0 ? 0.01 : range.step;
 	const double raw = range.min + control_ratio(control, point) * (range.max - range.min);
 	const double snapped = range.min + std::round((raw - range.min) / step) * step;
@@ -144,27 +138,6 @@ std::vector<EncoderParam> config_params_or_defaults(const AppState& state, const
 		params.push_back(std::move(param));
 	}
 	return params;
-}
-
-ImageId first_source_image(const AppState& state) {
-	const auto it = std::find_if(state.images.begin(), state.images.end(), [](const ImageObject& image) {
-		return image.type == ImageObjectType::Source;
-	});
-	return it == state.images.end() ? ImageId{} : it->id;
-}
-
-ImageId first_encoded_image(const AppState& state) {
-	const auto it = std::find_if(state.images.begin(), state.images.end(), [](const ImageObject& image) {
-		return image.encoded.has_value();
-	});
-	return it == state.images.end() ? ImageId{} : it->id;
-}
-
-EncodeRunId first_cancelable_run(const AppState& state) {
-	const auto it = std::find_if(state.encodeRuns.begin(), state.encodeRuns.end(), [](const EncodeRun& run) {
-		return run.state == EncodeRunState::Queued || run.state == EncodeRunState::Running;
-	});
-	return it == state.encodeRuns.end() ? EncodeRunId{} : it->id;
 }
 
 float selected_run_details_end_y(const AppState& state, Rect inspector, float y) {
@@ -216,7 +189,7 @@ std::vector<Action> queue_panel_action(const AppState& state, Rect inspector, fl
 		if (y + 36.0f > inspector.y + inspector.h) {
 			break;
 		}
-		const Rect row{inspector.x + 12.0f, y, inspector.w - 24.0f, 36.0f};
+		const Rect row{.x=inspector.x + 12.0f, .y=y, .w=inspector.w - 24.0f, .h=36.0f};
 		if (contains(row, point)) {
 			Action action;
 			action.kind = ActionKind::SelectEncodeRun;
@@ -237,31 +210,16 @@ Action key_action(std::string text) {
 }
 
 std::vector<Action> command_bar_action(const AppState& state, const LayoutResult& layout, Point point) {
-	struct Button {
-		float x;
-		float w;
-		const char* name;
-	};
-	const Button buttons[] = {
-		{140, 78, "import"},
-		{224, 78, "encode"},
-		{308, 78, "cancel"},
-		{392, 62, "save"},
-		{462, 78, "single"},
-		{546, 64, "side"},
-		{616, 70, "split"},
-		{692, 70, "blink"},
-		{768, 60, "diff"},
-		{834, 60, "grid"},
-		{900, 52, "fit"},
-		{958, 64, "100"},
-		{1028, 110, "delete"},
-		{1144, 144, "scratch"},
-	};
-	for (const Button& button : buttons) {
-		Rect rect{layout.commandBar.x + button.x, layout.commandBar.y, button.w, layout.commandBar.h};
+	for (const CommandButton& button : CommandButtons) {
+		Rect const rect=command_button_rect(layout.commandBar,button);
 		if (!contains(rect, point)) {
 			continue;
+		}
+		if (!command_is_enabled(state, button.name)) {
+			return {};
+		}
+		if (std::string(button.name) == "metrics") {
+			Action action;action.kind=ActionKind::RequestMetrics;action.image=state.selection.selectedImage;return {action};
 		}
 		if (std::string(button.name) == "import") {
 			Action action;
@@ -270,7 +228,7 @@ std::vector<Action> command_bar_action(const AppState& state, const LayoutResult
 		}
 		if (std::string(button.name) == "encode") {
 			const BackendInfo* backend = selected_backend(state);
-			const ImageId source = first_source_image(state);
+			const ImageId source = selected_encode_source(state);
 			if (backend == nullptr || !valid(source)) {
 				return {};
 			}
@@ -282,7 +240,7 @@ std::vector<Action> command_bar_action(const AppState& state, const LayoutResult
 			return {std::move(action)};
 		}
 		if (std::string(button.name) == "cancel") {
-			const EncodeRunId run = first_cancelable_run(state);
+			const EncodeRunId run = state.selection.selectedRun;
 			if (!valid(run)) {
 				return {};
 			}
@@ -292,12 +250,8 @@ std::vector<Action> command_bar_action(const AppState& state, const LayoutResult
 			return {action};
 		}
 		if (std::string(button.name) == "save") {
-			ImageId image = state.selection.selectedImage;
+			const ImageId image = state.selection.selectedImage;
 			const ImageObject* selected = find_image(state, image);
-			if (selected == nullptr || !selected->encoded) {
-				image = first_encoded_image(state);
-				selected = find_image(state, image);
-			}
 			if (selected == nullptr || !selected->encoded) {
 				return {};
 			}
@@ -368,21 +322,21 @@ std::vector<Action> image_list_action(const AppState& state, const LayoutResult&
 	if (!contains(layout.imageList, point)) {
 		return {};
 	}
-	Rect header{layout.imageList.x, layout.imageList.y, layout.imageList.w, 40};
+	Rect const header{.x=layout.imageList.x, .y=layout.imageList.y, .w=layout.imageList.w, .h=ImageListHeaderHeight};
 	if (contains(header, point)) {
 		Action action;
 		action.kind = ActionKind::SetImageListSort;
 		action.sortKey = next_sort_key(state.imageList.sortKey);
 		return {action};
 	}
-	float y = layout.imageList.y + 42.0f - state.imageList.scrollOffset;
+	float y = layout.imageList.y + ImageListHeaderHeight + 4.0f - state.imageList.scrollOffset;
 	for (const ImageObject* imagePtr : ordered_images(state)) {
 		const ImageObject& image = *imagePtr;
-		Rect row{layout.imageList.x + 6, y - 2, layout.imageList.w - 12, 50};
+		Rect const row = image_list_row_rect(layout.imageList, y);
 		if (contains(row, point)) {
 			const std::size_t paneButtons = std::min<std::size_t>(state.panes.size(), 4);
 			if (valid(state.selection.selectedImage) && state.selection.selectedImage != image.id &&
-			    contains(image_row_difference_button_rect(row, paneButtons), point)) {
+			    contains(image_list_difference_button_rect(row, paneButtons), point)) {
 				Action action;
 				action.kind = ActionKind::CreateDifferenceImage;
 				action.image = state.selection.selectedImage;
@@ -390,7 +344,7 @@ std::vector<Action> image_list_action(const AppState& state, const LayoutResult&
 				return {action};
 			}
 			for (std::size_t i = 0; i < paneButtons; ++i) {
-				if (contains(image_row_pane_button_rect(row, i), point)) {
+				if (contains(image_list_pane_button_rect(row, i), point)) {
 					Action select;
 					select.kind = ActionKind::SelectImage;
 					select.image = image.id;
@@ -415,15 +369,19 @@ std::vector<Action> image_list_action(const AppState& state, const LayoutResult&
 			}
 			return actions;
 		}
-		y += 56;
+		y += ImageListRowStep;
 	}
 	return {};
 }
 
 std::vector<Action> inspector_action(const AppState& state, const LayoutResult& layout, Point point) {
-	if (!contains(layout.inspector, point)) {
+	if (layout.inspector.w<160 || !contains(layout.inspector, point)) {
 		return {};
 	}
+    for(const auto& control:decoder_controls(state,layout.inspector)) {
+        if((control.id.starts_with("inspector:") || control.rect.y>=layout.inspector.y+40) && contains(control.rect,point))return control.enabled?std::vector<Action>{control.action}:std::vector<Action>{};
+    }
+    if(state.decoderInspector || point.y<layout.inspector.y+40)return {};
 	float y = layout.inspector.y + 42.0f + 22.0f - state.layout.inspectorScrollOffset;
 	for (const BackendInfo& candidate : state.backends) {
 		if (contains(backend_row_rect(layout.inspector, y), point)) {
@@ -449,7 +407,7 @@ std::vector<Action> inspector_action(const AppState& state, const LayoutResult& 
 			currentGroup = param.group;
 			y += 24;
 		}
-		Rect control{layout.inspector.x + layout.inspector.w * 0.50f, y - 2, layout.inspector.w * 0.44f, 20};
+		Rect const control{.x=layout.inspector.x + layout.inspector.w * 0.50f, .y=y - 2, .w=layout.inspector.w * 0.44f, .h=20};
 		if (contains(control, point)) {
 			if (param.name == "implementation" || !parameter_is_enabled(state, *backend, param)) {
 				return {};
@@ -499,7 +457,7 @@ std::vector<Action> inspector_action(const AppState& state, const LayoutResult& 
 		}
 		y += 24;
 	}
-	const std::vector<Action> queueActions = queue_panel_action(state, layout.inspector, selected_run_details_end_y(state, layout.inspector, y), point);
+	std::vector<Action> queueActions = queue_panel_action(state, layout.inspector, selected_run_details_end_y(state, layout.inspector, y), point);
 	if (!queueActions.empty()) {
 		return queueActions;
 	}
@@ -524,10 +482,26 @@ std::vector<Action> actions_for_pointer_press(const AppState& state, const Layou
 	if (contains(layout.inspector, point)) {
 		return inspector_action(state, layout, point);
 	}
+	if (state.images.empty() && contains(layout.viewer, point)) {
+		constexpr float width = 150.0f;
+		constexpr float height = 34.0f;
+		const Rect importRect{
+			.x=layout.viewer.x + (layout.viewer.w - width) * 0.5f,
+			.y=layout.viewer.y + layout.viewer.h * 0.5f + 28.0f,
+			.w=width,
+			.h=height,
+		};
+		if (contains(importRect, point) && command_is_enabled(state, "import")) {
+			Action action;
+			action.kind = ActionKind::RequestOpenSource;
+			return {action};
+		}
+	}
 	return {};
 }
 
 std::vector<Action> actions_for_pointer_move(const AppState& state, const LayoutResult& layout, Point point) {
+    if(state.decoderInspector)return {};
 	const BackendInfo* backend = selected_backend(state);
 	if (backend == nullptr || state.interaction.activePointerCapture.empty()) return {};
 	float y = backend_selector_end_y(state, layout.inspector) + 22.0f - state.layout.inspectorScrollOffset;
@@ -540,7 +514,7 @@ std::vector<Action> actions_for_pointer_move(const AppState& state, const Layout
 		}
 		const std::string widgetId = "param:" + std::to_string(backend->id.value) + ":" + param.name;
 		if (widgetId == state.interaction.activePointerCapture && parameter_is_enabled(state, *backend, param)) {
-			const Rect control{layout.inspector.x + layout.inspector.w * 0.50f, y - 2.0f, layout.inspector.w * 0.44f, 20.0f};
+			const Rect control{.x=layout.inspector.x + layout.inspector.w * 0.50f, .y=y - 2.0f, .w=layout.inspector.w * 0.44f, .h=20.0f};
 			if (param.kind == ParamKind::Int && param.intRange && !param.directNumericInput) return {set_param_action(backend->id, param, slider_int_value(param, control, point))};
 			if (param.kind == ParamKind::Float && param.floatRange && !param.directNumericInput) return {set_param_action(backend->id, param, slider_float_value(param, control, point))};
 			return {};

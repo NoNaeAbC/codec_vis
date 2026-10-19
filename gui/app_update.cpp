@@ -1,4 +1,7 @@
+#include "decoder_ui.hpp"
+#include "../codec_gui_x265.hpp"
 #include "app_state.hpp"
+#include "image_list_model.hpp"
 #include "layout.hpp"
 #include "storage.hpp"
 #include "viewer_model.hpp"
@@ -6,12 +9,19 @@
 #include <algorithm>
 #include <cmath>
 #include <charconv>
-#include <iterator>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <optional>
 #include <sstream>
 #include <span>
+#include <string>
 #include <string_view>
 #include <system_error>
 #include <type_traits>
+#include <utility>
+#include <variant>
+#include <vector>
 
 namespace codec_gui::gui {
 namespace {
@@ -19,10 +29,6 @@ namespace {
 template <typename Id>
 Id make_id(uint64_t value) {
 	return Id{value};
-}
-
-bool source_dependent(const ImageObject& image) {
-	return image.type != ImageObjectType::Source;
 }
 
 void ensure_first_pane(AppState& state) {
@@ -45,6 +51,10 @@ void append_command(UpdateResult& result, CommandKind kind) {
 const char* action_name(ActionKind kind) {
 	switch (kind) {
 		case ActionKind::RequestOpenSource: return "RequestOpenSource";
+        case ActionKind::SetLivePreviewEnabled:return "SetLivePreviewEnabled";
+        case ActionKind::RequestLivePreview:return "RequestLivePreview";
+        case ActionKind::LivePreviewCompleted:return "LivePreviewCompleted";
+        case ActionKind::LivePreviewFailed:return "LivePreviewFailed";
 		case ActionKind::OpenSourceCanceled: return "OpenSourceCanceled";
 		case ActionKind::SourcePathChosen: return "SourcePathChosen";
 		case ActionKind::SourceLoaded: return "SourceLoaded";
@@ -64,6 +74,7 @@ const char* action_name(ActionKind kind) {
 		case ActionKind::SetDifferenceGain: return "SetDifferenceGain";
 		case ActionKind::SetImageListSort: return "SetImageListSort";
 		case ActionKind::SelectBackend: return "SelectBackend";
+		case ActionKind::InspectEncoderInput: return "InspectEncoderInput";
 		case ActionKind::SetEncoderParam: return "SetEncoderParam";
 		case ActionKind::ToggleScratchResults: return "ToggleScratchResults";
 		case ActionKind::RefreshBackendCapabilities: return "RefreshBackendCapabilities";
@@ -80,6 +91,24 @@ const char* action_name(ActionKind kind) {
 		case ActionKind::EncodeRunFailed: return "EncodeRunFailed";
 		case ActionKind::CancelEncodeRun: return "CancelEncodeRun";
 		case ActionKind::EncodeRunCanceled: return "EncodeRunCanceled";
+        case ActionKind::ShowEncoderInspector: return "ShowEncoderInspector";
+        case ActionKind::ShowDecoderInspector: return "ShowDecoderInspector";
+        case ActionKind::QueryDecoders: return "QueryDecoders";
+        case ActionKind::DecodersReady: return "DecodersReady";
+        case ActionKind::SelectDecoder: return "SelectDecoder";
+        case ActionKind::SetDecodeRepetitions: return "SetDecodeRepetitions";
+        case ActionKind::StartDecode: return "StartDecode";
+        case ActionKind::CancelDecode: return "CancelDecode";
+        case ActionKind::DecodeProgress: return "DecodeProgress";
+        case ActionKind::DecodeFinished: return "DecodeFinished";
+		case ActionKind::RequestEnergyAccess: return "RequestEnergyAccess";
+        case ActionKind::ReleaseEnergyAccess: return "ReleaseEnergyAccess";
+        case ActionKind::EnergyAccessReady: return "EnergyAccessReady";
+		case ActionKind::RequestMetrics: return "RequestMetrics";
+		case ActionKind::MetricsStarted: return "MetricsStarted";
+		case ActionKind::MetricComputed: return "MetricComputed";
+		case ActionKind::MetricsCompleted: return "MetricsCompleted";
+		case ActionKind::MetricsFailed: return "MetricsFailed";
 		case ActionKind::SaveEncodedResult: return "SaveEncodedResult";
 		case ActionKind::SaveCompleted: return "SaveCompleted";
 		case ActionKind::SaveCanceled: return "SaveCanceled";
@@ -89,6 +118,9 @@ const char* action_name(ActionKind kind) {
 		case ActionKind::PointerReleased: return "PointerReleased";
 		case ActionKind::PointerScrolled: return "PointerScrolled";
 		case ActionKind::KeyPressed: return "KeyPressed";
+        case ActionKind::KeyReleased: return "KeyReleased";
+        case ActionKind::WindowFocusLost: return "WindowFocusLost";
+        case ActionKind::ClipboardText: return "ClipboardText";
 		case ActionKind::WindowResized: return "WindowResized";
 		case ActionKind::ErrorDismissed: return "ErrorDismissed";
 	}
@@ -102,7 +134,14 @@ const char* command_name(CommandKind kind) {
 		case CommandKind::LoadSourceImage: return "LoadSourceImage";
 		case CommandKind::QueryBackendCapabilities: return "QueryBackendCapabilities";
 		case CommandKind::RunEncode: return "RunEncode";
+        case CommandKind::RunLivePreview:return "RunLivePreview";
+        case CommandKind::CancelLivePreview:return "CancelLivePreview";
 		case CommandKind::RequestEncodeCancel: return "RequestEncodeCancel";
+        case CommandKind::QueryImageDecoders: return "QueryImageDecoders";
+        case CommandKind::RunImageDecode: return "RunImageDecode";
+        case CommandKind::CancelImageDecode: return "CancelImageDecode";
+		case CommandKind::AuthorizeEnergyAccess: return "AuthorizeEnergyAccess";
+        case CommandKind::CloseEnergyAccess: return "CloseEnergyAccess";
 		case CommandKind::DecodeEncodedBytes: return "DecodeEncodedBytes";
 		case CommandKind::ComputeMetric: return "ComputeMetric";
 		case CommandKind::ComputeDerivedImage: return "ComputeDerivedImage";
@@ -148,7 +187,7 @@ std::string param_widget_id(BackendId backend, const std::string& name) {
 
 bool parse_param_widget_id(const std::string& id, BackendId& backend, std::string& name) {
 	const std::string prefix = "param:";
-	if (id.rfind(prefix, 0) != 0) {
+	if (!id.starts_with(prefix)) {
 		return false;
 	}
 	const std::size_t nameBegin = id.find(':', prefix.size());
@@ -167,7 +206,7 @@ bool parse_param_widget_id(const std::string& id, BackendId& backend, std::strin
 }
 
 const EncoderParamInfo* find_param_info(const AppState& state, BackendId backend, const std::string& name) {
-	const auto backendIt = std::find_if(state.backends.begin(), state.backends.end(), [&](const BackendInfo& info) {
+	const auto backendIt = std::ranges::find_if(state.backends, [&](const BackendInfo& info) {
 		return info.id == backend;
 	});
 	if (backendIt == state.backends.end()) {
@@ -180,14 +219,14 @@ const EncoderParamInfo* find_param_info(const AppState& state, BackendId backend
 }
 
 const BackendInfo* find_backend(const AppState& state, BackendId id) {
-	const auto it = std::find_if(state.backends.begin(), state.backends.end(), [id](const BackendInfo& backend) {
+	const auto it = std::ranges::find_if(state.backends, [id](const BackendInfo& backend) {
 		return backend.id == id;
 	});
 	return it == state.backends.end() ? nullptr : &*it;
 }
 
 EncoderConfig& ensure_encoder_config(AppState& state, BackendId backend) {
-	auto config = std::find_if(state.encoderConfigs.begin(), state.encoderConfigs.end(), [backend](const EncoderConfig& cfg) {
+	auto config = std::ranges::find_if(state.encoderConfigs, [backend](const EncoderConfig& cfg) {
 		return cfg.backend == backend;
 	});
 	if (config == state.encoderConfigs.end()) {
@@ -199,11 +238,17 @@ EncoderConfig& ensure_encoder_config(AppState& state, BackendId backend) {
 	return *config;
 }
 
-void set_encoder_param(AppState& state, BackendId backend, EncoderParam param) {
-	EncoderConfig& config = ensure_encoder_config(state, backend);
-	auto existing = std::find_if(config.params.begin(), config.params.end(), [&](const EncoderParam& current) {
-		return current.name == param.name;
-	});
+void set_encoder_param(AppState &state, BackendId backend, EncoderParam param) {
+	if (param.name == "bitrate-kbps") {
+		const auto *info = find_backend(state, backend);
+		if (info && std::ranges::any_of(info->params, [](const auto &p) { return p.name == "target-size-kb"; })) {
+			param.name  = "target-size-kb";
+			param.value = double(std::get<int64_t>(param.value)) / 8.;
+		}
+	}
+	EncoderConfig &config = ensure_encoder_config(state, backend);
+	auto existing = std::ranges::find_if(config.params,
+										 [&](const EncoderParam &current) { return current.name == param.name; });
 	if (existing == config.params.end()) {
 		config.params.push_back(std::move(param));
 	} else {
@@ -212,7 +257,7 @@ void set_encoder_param(AppState& state, BackendId backend, EncoderParam param) {
 }
 
 ParamValue current_param_value(const AppState& state, BackendId backend, const EncoderParamInfo& info) {
-	const auto config = std::find_if(state.encoderConfigs.begin(), state.encoderConfigs.end(), [backend](const EncoderConfig& cfg) {
+	const auto config = std::ranges::find_if(state.encoderConfigs, [backend](const EncoderConfig& cfg) {
 		return cfg.backend == backend;
 	});
 	if (config != state.encoderConfigs.end()) {
@@ -253,7 +298,7 @@ bool apply_text_input(AppState& state, const Action& action) {
 		text = std::to_string(*existing);
 	}
 	if (action.text == "backspace") {
-		if (info->directNumericInput && state.interaction.replaceFocusedNumericValue) text.clear();
+		if (state.interaction.replaceFocusedNumericValue) text.clear();
 		if (!text.empty()) {
 			text.pop_back();
 		}
@@ -261,7 +306,7 @@ bool apply_text_input(AppState& state, const Action& action) {
 		state.interaction.replaceFocusedNumericValue = false;
 		return false;
 	} else {
-		if (info->directNumericInput && state.interaction.replaceFocusedNumericValue) text = action.text;
+		if (state.interaction.replaceFocusedNumericValue) text = action.text;
 		else text += action.text;
 	}
 	state.interaction.replaceFocusedNumericValue = false;
@@ -270,13 +315,13 @@ bool apply_text_input(AppState& state, const Action& action) {
 	if (info->kind == ParamKind::Int) {
 		try {
 			const int64_t parsed = std::stoll(text.empty() || text == "-" ? "0" : text);
-			const IntRange range = info->intRange.value_or(IntRange{INT64_MIN, INT64_MAX, 1});
+			const IntRange range = info->intRange.value_or(IntRange{.min=INT64_MIN, .max=INT64_MAX, .step=1});
 			param.value = std::clamp(parsed, range.min, range.max);
 		} catch (const std::exception&) { return true; }
 	} else if (info->kind == ParamKind::Float) {
 		try {
 			const double parsed = std::stod(text.empty() || text == "-" ? "0" : text);
-			const FloatRange range = info->floatRange.value_or(FloatRange{-1.0e300, 1.0e300, 0.01});
+			const FloatRange range = info->floatRange.value_or(FloatRange{.min=-1.0e300, .max=1.0e300, .step=0.01});
 			param.value = std::clamp(parsed, range.min, range.max);
 		} catch (const std::exception&) { return true; }
 	} else {
@@ -319,13 +364,13 @@ std::optional<Rect> current_pane_rect(const AppState& state, PaneId id) {
 	);
 	if (state.viewMode.kind == ViewModeKind::Blink) {
 		const auto begin = state.viewMode.paneOrder.begin();
-		const auto end = state.viewMode.paneOrder.begin() + std::min<std::size_t>(state.viewMode.paneOrder.size(), 2);
+		const auto end = state.viewMode.paneOrder.begin() + static_cast<std::ptrdiff_t>(std::min<std::size_t>(state.viewMode.paneOrder.size(), 2));
 		if (std::find(begin, end, id) != end) {
 			return layout.viewer;
 		}
 	}
 	const std::vector<PaneRect> rects = compute_pane_rects(state.viewMode, state.panes, layout.viewer);
-	const auto it = std::find_if(rects.begin(), rects.end(), [id](const PaneRect& rect) {
+	const auto it = std::ranges::find_if(rects, [id](const PaneRect& rect) {
 		return rect.pane == id;
 	});
 	return it == rects.end() ? std::nullopt : std::optional<Rect>{it->rect};
@@ -387,7 +432,7 @@ void set_pane_transform(AppState& state, PaneId id, ViewportTransform transform)
 	pane->transform = transform;
 	if (state.viewMode.kind == ViewModeKind::Blink) {
 		const auto begin = state.viewMode.paneOrder.begin();
-		const auto end = state.viewMode.paneOrder.begin() + std::min<std::size_t>(state.viewMode.paneOrder.size(), 2);
+		const auto end = state.viewMode.paneOrder.begin() + static_cast<std::ptrdiff_t>(std::min<std::size_t>(state.viewMode.paneOrder.size(), 2));
 		if (std::find(begin, end, id) != end) {
 			for (auto it = begin; it != end; ++it) {
 				if (*it == id) {
@@ -437,34 +482,6 @@ void set_pane_transform(AppState& state, PaneId id, ViewportTransform transform)
 	}
 }
 
-void fit_visible_panes(AppState& state) {
-	const LayoutResult layout = compute_layout(
-		state.layout,
-		state.interaction.framebufferWidth,
-		state.interaction.framebufferHeight,
-		state.interaction.outputScale
-	);
-	if (state.viewMode.kind == ViewModeKind::Blink) {
-		const std::size_t count = std::min<std::size_t>(state.viewMode.paneOrder.size(), 2);
-		for (std::size_t i = 0; i < count; ++i) {
-			Pane* pane = find_pane(state, state.viewMode.paneOrder[i]);
-			const ImageObject* image = pane != nullptr && pane->image ? find_image(state, *pane->image) : nullptr;
-			if (pane != nullptr && image != nullptr) {
-				set_pane_transform(state, pane->id, fit_transform(image->width, image->height, layout.viewer, state.interaction.outputScale));
-			}
-		}
-		return;
-	}
-	const std::vector<PaneRect> rects = compute_pane_rects(state.viewMode, state.panes, layout.viewer);
-	for (const PaneRect& paneRect : rects) {
-		Pane* pane = find_pane(state, paneRect.pane);
-		const ImageObject* image = pane != nullptr && pane->image ? find_image(state, *pane->image) : nullptr;
-		if (pane != nullptr && image != nullptr) {
-			const Rect fitRect = state.viewMode.kind == ViewModeKind::Split ? layout.viewer : paneRect.rect;
-			pane->transform = fit_transform(image->width, image->height, fitRect, state.interaction.outputScale);
-		}
-	}
-}
 
 } // namespace
 
@@ -474,35 +491,35 @@ EncodeRunId next_run_id(AppState& state) { return make_id<EncodeRunId>(state.nex
 uint64_t next_error_id(AppState& state) { return state.nextId++; }
 
 ImageObject* find_image(AppState& state, ImageId id) {
-	const auto it = std::find_if(state.images.begin(), state.images.end(), [id](const ImageObject& image) {
+	const auto it = std::ranges::find_if(state.images, [id](const ImageObject& image) {
 		return image.id == id;
 	});
 	return it == state.images.end() ? nullptr : &*it;
 }
 
 const ImageObject* find_image(const AppState& state, ImageId id) {
-	const auto it = std::find_if(state.images.begin(), state.images.end(), [id](const ImageObject& image) {
+	const auto it = std::ranges::find_if(state.images, [id](const ImageObject& image) {
 		return image.id == id;
 	});
 	return it == state.images.end() ? nullptr : &*it;
 }
 
 Pane* find_pane(AppState& state, PaneId id) {
-	const auto it = std::find_if(state.panes.begin(), state.panes.end(), [id](const Pane& pane) {
+	const auto it = std::ranges::find_if(state.panes, [id](const Pane& pane) {
 		return pane.id == id;
 	});
 	return it == state.panes.end() ? nullptr : &*it;
 }
 
 const Pane* find_pane(const AppState& state, PaneId id) {
-	const auto it = std::find_if(state.panes.begin(), state.panes.end(), [id](const Pane& pane) {
+	const auto it = std::ranges::find_if(state.panes, [id](const Pane& pane) {
 		return pane.id == id;
 	});
 	return it == state.panes.end() ? nullptr : &*it;
 }
 
 EncodeRun* find_run(AppState& state, EncodeRunId id) {
-	const auto it = std::find_if(state.encodeRuns.begin(), state.encodeRuns.end(), [id](const EncodeRun& run) {
+	const auto it = std::ranges::find_if(state.encodeRuns, [id](const EncodeRun& run) {
 		return run.id == id;
 	});
 	return it == state.encodeRuns.end() ? nullptr : &*it;
@@ -518,7 +535,7 @@ void append_error(AppState& state, ErrorSeverity severity, std::string operation
 	state.errors.push_back(std::move(error));
 }
 
-ColorMetadata color_metadata(const ColorDescription& color) {
+static ColorMetadata color_metadata(const ColorDescription& color) {
 	ColorMetadata out;
 	switch (color.primaries) {
 		case ColorPrimaries::BT709: out.primaries = "bt709"; break;
@@ -547,6 +564,8 @@ ColorMetadata color_metadata(const ColorDescription& color) {
 }
 
 UpdateResult update(AppState state, const Action& action) {
+    std::vector<ImageId> decoderWork;
+    for(const auto& image:state.images)if(image.decoder.running || image.decoder.querying)decoderWork.push_back(image.id);
 	UpdateResult result;
 	result.state = std::move(state);
 
@@ -569,15 +588,12 @@ UpdateResult update(AppState state, const Action& action) {
 			break;
 		}
 		case ActionKind::SourceLoaded: {
+			result.state.interaction.importPending = false;
 			if (!action.sourceLoaded.image) {
 				append_error(result.state, ErrorSeverity::Error, "load source", "image", "source loaded without image data");
 				break;
 			}
-			result.state.images.erase(
-				std::remove_if(result.state.images.begin(), result.state.images.end(), source_dependent),
-				result.state.images.end()
-			);
-			result.state.encodeRuns.clear();
+			// Imports add to the workbench; completed experiments and active jobs retain their source.
 			result.state.viewMode.generatedImage.reset();
 			ImageObject source;
 			source.id = next_image_id(result.state);
@@ -589,12 +605,8 @@ UpdateResult update(AppState state, const Action& action) {
 			source.color = color_metadata(action.sourceLoaded.image->color);
 			source.sourceByteSize = action.sourceLoaded.fileByteSize;
 			source.decoded = action.sourceLoaded.image;
-			result.state.images.erase(
-				std::remove_if(result.state.images.begin(), result.state.images.end(), [](const ImageObject& image) {
-					return image.type == ImageObjectType::Source;
-				}),
-				result.state.images.end()
-			);
+			source.sourceCompressed=source.decoded->compressedSource;source.sourceCodec=source.decoded->compressedCodec;
+
 			result.state.images.push_back(source);
 			result.state.panes.clear();
 			ensure_first_pane(result.state);
@@ -606,6 +618,7 @@ UpdateResult update(AppState state, const Action& action) {
 				result.state.panes.front().transform = fit_transform(source.width, source.height, *rect, result.state.interaction.outputScale);
 			}
 			result.state.selection.selectedImage = source.id;
+            result.state.selection.selectedRun = {};
 			result.state.selection.activePane = result.state.panes.front().id;
 			Command upload;
 			upload.kind = CommandKind::UploadImageTexture;
@@ -645,6 +658,8 @@ UpdateResult update(AppState state, const Action& action) {
 			}
 			result.state.selection.activePane = action.pane;
 			result.state.selection.selectedImage = action.image;
+            if(const auto* selected=find_image(result.state,action.image))result.state.selection.selectedRun=selected->encoded?selected->encoded->run:EncodeRunId{};
+            if(result.state.decoderInspector)result.state.layout.inspectorScrollOffset=0;
 			Command upload;
 			upload.kind = CommandKind::UploadImageTexture;
 			upload.image = action.image;
@@ -664,12 +679,14 @@ UpdateResult update(AppState state, const Action& action) {
 		case ActionKind::SelectImage:
 			if (find_image(result.state, action.image) != nullptr) {
 				result.state.selection.selectedImage = action.image;
+            if(const auto* selected=find_image(result.state,action.image))result.state.selection.selectedRun=selected->encoded?selected->encoded->run:EncodeRunId{};
+            if(result.state.decoderInspector)result.state.layout.inspectorScrollOffset=0;
 			} else {
 				append_error(result.state, ErrorSeverity::Warning, "select image", "viewer", "invalid image id");
 			}
 			break;
 		case ActionKind::RemoveImage: {
-			const auto active = std::find_if(result.state.encodeRuns.begin(), result.state.encodeRuns.end(), [&](const EncodeRun& run) {
+			const auto active = std::ranges::find_if(result.state.encodeRuns, [&](const EncodeRun& run) {
 				return run.source == action.image && (run.state == EncodeRunState::Queued || run.state == EncodeRunState::Running || run.state == EncodeRunState::CancelRequested);
 			});
 			if (active != result.state.encodeRuns.end()) {
@@ -677,13 +694,17 @@ UpdateResult update(AppState state, const Action& action) {
 				append_command(result, CommandKind::RequestRedraw);
 				break;
 			}
-			result.state.images.erase(std::remove_if(result.state.images.begin(), result.state.images.end(), [&](const ImageObject& image) { return image.id == action.image; }), result.state.images.end());
+			std::vector<ImageId> removed{action.image};
+			for (const auto& image : result.state.images)
+				if (image.derived && image.derived->kind == "encoder-input" && std::ranges::find(image.parents, action.image) != image.parents.end()) removed.push_back(image.id);
+			auto isRemoved = [&](ImageId id) { return std::ranges::find(removed, id) != removed.end(); };
+			std::erase_if(result.state.images, [&](const ImageObject& image) { return isRemoved(image.id); });
 			for (ImageObject& image : result.state.images) {
-				image.parents.erase(std::remove(image.parents.begin(), image.parents.end(), action.image), image.parents.end());
+				std::erase_if(image.parents, isRemoved);
 			}
-			for (Pane& pane : result.state.panes) if (pane.image == action.image) pane.image.reset();
+			for (Pane& pane : result.state.panes) if (pane.image && isRemoved(*pane.image)) pane.image.reset();
 			for (EncodeRun& run : result.state.encodeRuns) if (run.producedImage == action.image) run.producedImage.reset();
-			if (result.state.selection.selectedImage == action.image) result.state.selection.selectedImage = {};
+			if (isRemoved(result.state.selection.selectedImage)) result.state.selection.selectedImage = {};
 			append_command(result, CommandKind::RequestRedraw);
 			break;
 		}
@@ -709,16 +730,10 @@ UpdateResult update(AppState state, const Action& action) {
 			break;
 		}
 		case ActionKind::ClosePane:
-			result.state.panes.erase(
-				std::remove_if(result.state.panes.begin(), result.state.panes.end(), [action](const Pane& pane) {
+			std::erase_if(result.state.panes, [action](const Pane& pane) {
 					return pane.id == action.pane;
-				}),
-				result.state.panes.end()
-			);
-			result.state.viewMode.paneOrder.erase(
-				std::remove(result.state.viewMode.paneOrder.begin(), result.state.viewMode.paneOrder.end(), action.pane),
-				result.state.viewMode.paneOrder.end()
-			);
+				});
+			std::erase(result.state.viewMode.paneOrder, action.pane);
 			if (result.state.panes.empty()) {
 				ensure_first_pane(result.state);
 			}
@@ -730,15 +745,29 @@ UpdateResult update(AppState state, const Action& action) {
 			apply_mode_transition(result.state.panes, result.state.viewMode, [&] {
 				Pane pane;
 				pane.id = next_pane_id(result.state);
+				if (const Pane* active = find_pane(result.state, result.state.selection.activePane)) pane.transform = active->transform;
 				result.state.panes.push_back(pane);
 				return pane.id;
 			});
-			fit_visible_panes(result.state);
+			// Opening a comparison of the selected result starts with its source
+			// and decoded output. Existing explicit pane assignments are retained.
+			if (action.viewMode != ViewModeKind::Single && result.state.viewMode.paneOrder.size() >= 2) {
+				Pane* first = find_pane(result.state, result.state.viewMode.paneOrder[0]);
+				Pane* second = find_pane(result.state, result.state.viewMode.paneOrder[1]);
+				const ImageObject* selected = find_image(result.state, result.state.selection.selectedImage);
+				if (first && second && !second->image && selected && selected->decoded &&
+				    selected->type == ImageObjectType::EncodedResult && selected->parents.size() == 1 &&
+				    (first->image == selected->id || first->image == selected->parents.front())) {
+					first->image = selected->parents.front();
+					second->image = selected->id;
+					second->transform = first->transform;
+				}
+			}
 			queue_difference_compute(result);
 			append_command(result, CommandKind::RequestRedraw);
 			break;
 		case ActionKind::SetPaneTransform:
-			if (Pane* pane = find_pane(result.state, action.pane)) {
+			if (Pane const* pane = find_pane(result.state, action.pane)) {
 				(void)pane;
 				set_pane_transform(result.state, action.pane, action.transform);
 			} else {
@@ -750,8 +779,8 @@ UpdateResult update(AppState state, const Action& action) {
 			if (Pane* pane = find_pane(result.state, action.pane)) {
 				if (pane->image) {
 					if (const ImageObject* image = find_image(result.state, *pane->image)) {
-						Rect rect = current_pane_rect(result.state, action.pane).value_or(
-							Rect{0, 0, static_cast<float>(result.state.interaction.framebufferWidth), static_cast<float>(result.state.interaction.framebufferHeight)}
+						Rect const rect = current_pane_rect(result.state, action.pane).value_or(
+							Rect{.x=0, .y=0, .w=static_cast<float>(result.state.interaction.framebufferWidth), .h=static_cast<float>(result.state.interaction.framebufferHeight)}
 						);
 						set_pane_transform(result.state, action.pane, fit_transform(image->width, image->height, rect, result.state.interaction.outputScale));
 						append_command(result, CommandKind::RequestRedraw);
@@ -788,13 +817,17 @@ UpdateResult update(AppState state, const Action& action) {
 			append_command(result, CommandKind::RequestRedraw);
 			break;
 		case ActionKind::SelectBackend:
+			if(result.state.selection.selectedBackend!=action.backend){
+                auto& live=result.state.livePreview;live.minimumGeneration=++live.requested;live.busy=false;live.requestedParams.clear();
+                append_command(result,CommandKind::CancelLivePreview);
+            }
 			result.state.selection.selectedBackend = action.backend;
 			break;
 		case ActionKind::SetEncoderParam: {
 			const std::string widgetId = param_widget_id(action.backend, action.param.name);
 			result.state.interaction.focusedWidget = widgetId;
 			if (const BackendInfo* backend = find_backend(result.state, action.backend)) {
-				const auto info = std::find_if(backend->params.begin(), backend->params.end(), [&](const EncoderParamInfo& param) { return param.name == action.param.name; });
+				const auto info = std::ranges::find_if(backend->params, [&](const EncoderParamInfo& param) { return param.name == action.param.name; });
 				if (info != backend->params.end() &&
 				    !info->directNumericInput &&
 				    ((info->kind == ParamKind::Int && info->intRange) || (info->kind == ParamKind::Float && info->floatRange))) {
@@ -820,7 +853,7 @@ UpdateResult update(AppState state, const Action& action) {
 			break;
 		}
 		case ActionKind::BackendCapabilitiesReady: {
-			auto backend = std::find_if(result.state.backends.begin(), result.state.backends.end(), [action](const BackendInfo& info) {
+			auto backend = std::ranges::find_if(result.state.backends, [action](const BackendInfo& info) {
 				return info.id == action.backendCapabilities.backend;
 			});
 			if (backend == result.state.backends.end()) {
@@ -853,8 +886,31 @@ UpdateResult update(AppState state, const Action& action) {
 			command.kind = CommandKind::ComputeDerivedImage;
 			command.image = first->id;
 			command.otherImage = second->id;
-			command.value = result.state.viewMode.differenceGain;
+			command.value = action.text=="explicit-gain"||action.text=="linear-difference"?action.value:result.state.viewMode.differenceGain;
+            command.text=action.text;
 			result.commands.push_back(command);
+			break;
+		}
+		case ActionKind::InspectEncoderInput: {
+			const auto* resultImage = find_image(result.state, action.image);
+			if (!resultImage || resultImage->type != ImageObjectType::EncodedResult || !resultImage->encoded || !resultImage->encoded->encoderInput) break;
+			const bool exists = std::ranges::any_of(result.state.images, [&](const ImageObject& image) {
+				return image.derived && image.derived->kind == "encoder-input" &&
+					std::ranges::find(image.parents, action.image) != image.parents.end();
+			});
+			if (!exists) {
+				ImageObject input;
+				input.id = next_image_id(result.state);
+				input.type = ImageObjectType::Derived;
+				input.displayName = "Prepared input · run #" + std::to_string(resultImage->encoded->run.value);
+				input.decoded = resultImage->encoded->encoderInput;
+				input.width = input.decoded->width; input.height = input.decoded->height;
+				input.pixelFormat = input.decoded->format; input.color = color_metadata(input.decoded->color);
+				input.parents = resultImage->parents; input.parents.push_back(action.image);
+				input.derived = DerivedMetadata{.kind="encoder-input"};
+				result.state.images.push_back(std::move(input));
+			}
+			append_command(result, CommandKind::RequestRedraw);
 			break;
 		}
 		case ActionKind::DerivedImageComputed: {
@@ -884,10 +940,10 @@ UpdateResult update(AppState state, const Action& action) {
 			image->color = color_metadata(action.derivedImage.image->color);
 			image->decoded = action.derivedImage.image;
 			image->encoded.reset();
-			image->derived = DerivedMetadata{"absolute-difference", action.derivedImage.gain};
+			image->derived = DerivedMetadata{.kind="absolute-difference", .gain=action.derivedImage.gain,.firstRevision=action.derivedImage.firstRevision,.secondRevision=action.derivedImage.secondRevision};
 			image->parents = {action.derivedImage.first, action.derivedImage.second};
 			result.state.viewMode.generatedImage = image->id;
-			result.state.selection.selectedImage = action.derivedImage.second;
+
 			Command upload;
 			upload.kind = CommandKind::UploadImageTexture;
 			upload.image = image->id;
@@ -906,6 +962,53 @@ UpdateResult update(AppState state, const Action& action) {
 				append_error(result.state, ErrorSeverity::Warning, "select encode run", "encoder", "invalid run id");
 			}
 			break;
+		case ActionKind::SetLivePreviewEnabled: {
+            auto& live=result.state.livePreview;live.enabled=action.value!=0;
+            if(live.enabled)live.requestedParams.clear();
+            if(!live.enabled){live.minimumGeneration=++live.requested;live.busy=false;
+                append_command(result,CommandKind::CancelLivePreview);}
+            append_command(result,CommandKind::RequestRedraw);break;
+        }
+        case ActionKind::RequestLivePreview: {
+            auto& live=result.state.livePreview;
+            const auto* source=find_image(result.state,action.image);
+            const auto* backend=find_backend(result.state,action.backend);
+            if(!live.enabled || !source || !source->decoded || !backend || !backend->capabilities.available)break;
+            if(live.source!=action.image || live.backend!=action.backend || live.requestedSource.lock()!=source->decoded)live.minimumGeneration=live.requested+1;
+            bool sameSource=live.source==action.image;
+            live.source=action.image;live.requestedSource=source->decoded;live.backend=action.backend;live.requestedParams=action.params;live.error.clear();live.busy=true;
+            Command command;command.kind=CommandKind::RunLivePreview;command.image=action.image;command.backend=action.backend;
+            command.params=action.params;command.revision=++live.requested;result.commands.push_back(std::move(command));
+            result.state.selection.selectedRun={};
+            result.state.selection.selectedImage=sameSource && find_image(result.state,live.image)?live.image:live.source;
+            break;
+        }
+        case ActionKind::LivePreviewCompleted: {
+            auto& live=result.state.livePreview;
+            if(!live.enabled || live.source!=action.image || live.backend!=action.backend ||
+                result.state.selection.selectedBackend!=action.backend || action.revision<live.minimumGeneration ||
+                action.revision<=live.displayed || action.revision>live.requested)break;
+            if(!action.encodeCompleted.preview || !find_image(result.state,live.source))break;
+            ImageObject* image=find_image(result.state,live.image);
+            if(!image){ImageObject fresh;fresh.id=next_image_id(result.state);live.image=fresh.id;
+                result.state.images.push_back(std::move(fresh));image=&result.state.images.back();}
+            image->type=ImageObjectType::LivePreview;image->parents={live.source};image->decoded=action.encodeCompleted.preview;
+            image->width=image->decoded->width;image->height=image->decoded->height;image->pixelFormat=image->decoded->format;
+            image->color=color_metadata(image->decoded->color);image->encoded=action.encodeCompleted.metadata;
+            image->displayName="Live preview · "+image->encoded->backendName;
+            image->decoder={};++image->previewRevision;
+            live.displayed=action.revision;live.shownParams=action.params;live.seconds=action.value;live.error.clear();
+            live.busy=live.displayed!=live.requested;
+            if(!valid(result.state.selection.selectedRun) &&
+                (result.state.selection.selectedImage==live.source || result.state.selection.selectedImage==live.image))
+                result.state.selection.selectedImage=live.image;
+            append_command(result,CommandKind::RequestRedraw);break;
+        }
+        case ActionKind::LivePreviewFailed: {
+            auto& live=result.state.livePreview;
+            if(action.revision==live.requested && action.image==live.source && action.backend==live.backend){live.busy=false;live.error=action.text;}
+            append_command(result,CommandKind::RequestRedraw);break;
+        }
 		case ActionKind::StartEncodeRun: {
 			if (!valid(action.image) || !valid(action.backend)) {
 				append_error(result.state, ErrorSeverity::Warning, "start encode", "encoder", "missing source image or backend");
@@ -930,14 +1033,125 @@ UpdateResult update(AppState state, const Action& action) {
 		}
 		case ActionKind::EncodeRunStarted:
 			if (EncodeRun* run = find_run(result.state, action.run)) {
+				if (run->state == EncodeRunState::Canceled || run->state == EncodeRunState::CancelRequested) break;
 				run->state = EncodeRunState::Running;
 				run->startedSeconds = action.value;
 			}
 			break;
+        case ActionKind::RequestEnergyAccess:
+            if(!result.state.energyAccessPending && !result.state.energyAccessEnabled) {
+                result.state.energyAccessPending=true;result.state.energyAccessError.clear();
+                Command command;command.kind=CommandKind::AuthorizeEnergyAccess;result.commands.push_back(command);
+            }break;
+        case ActionKind::ReleaseEnergyAccess: {
+            result.state.energyAccessPending=false;result.state.energyAccessEnabled=false;
+            result.state.energyAccessDomain.clear();result.state.energyAccessError.clear();
+            Command command;command.kind=CommandKind::CloseEnergyAccess;result.commands.push_back(command);break;
+        }
+        case ActionKind::EnergyAccessReady:
+            if(result.state.energyAccessPending) {
+                result.state.energyAccessPending=false;result.state.energyAccessEnabled=action.value==1;
+                result.state.energyAccessDomain=action.value==1?action.text:"";
+                result.state.energyAccessError=action.value==1?"":action.text;
+            }break;
+        case ActionKind::ShowEncoderInspector:
+            result.state.decoderInspector=false;result.state.layout.inspectorScrollOffset=0;break;
+        case ActionKind::ShowDecoderInspector:
+            result.state.decoderInspector=true;result.state.layout.inspectorScrollOffset=0;break;
+        case ActionKind::QueryDecoders:
+            if(auto* image=find_image(result.state,action.image);image && !image->decoder.running && !image->decoder.querying)image->decoder.queried=false;
+            break;
+        case ActionKind::DecodersReady:
+            if(auto* image=find_image(result.state,action.image);image && image->decoder.generation==action.decoder.generation) {
+                auto& d=image->decoder;d.querying=false;d.queried=true;d.available=action.decoder.available;d.error=action.decoder.error;
+                if(std::none_of(d.available.begin(),d.available.end(),[&](const auto& info){return info.id==d.selected;}))d.selected=d.available.empty()?"":d.available.front().id;
+            } break;
+        case ActionKind::SelectDecoder:
+            if(auto* image=find_image(result.state,action.image);image && !image->decoder.running) {
+                if(std::any_of(image->decoder.available.begin(),image->decoder.available.end(),[&](const auto& info){return info.id==action.text;}))image->decoder.selected=action.text;
+            }break;
+        case ActionKind::SetDecodeRepetitions:
+            if(auto* image=find_image(result.state,action.image))image->decoder.repetitions=std::clamp(int(action.value),1,1000);
+            break;
+        case ActionKind::StartDecode:
+            if(auto* image=find_image(result.state,action.image);image && !image->decoder.running && !image->decoder.selected.empty() && !image->decoder.querying) {
+                // Serialize benchmarking with metrics to avoid compute contention.
+                if(decode_metrics_busy(result.state,*image))break;
+                auto& d=image->decoder;d.running=true;d.error.clear();++d.generation;
+                DecodeMeasurement measurement;measurement.decoderId=d.selected;measurement.requested=action.value==1?1:d.repetitions;d.history.push_back(measurement);
+                Command command;command.kind=CommandKind::RunImageDecode;command.image=image->id;command.text=d.selected;command.value=measurement.requested;command.revision=d.generation;result.commands.push_back(command);
+            }break;
+        case ActionKind::CancelDecode: {
+            Command command;command.kind=CommandKind::CancelImageDecode;command.image=action.image;result.commands.push_back(command);break;
+        }
+        case ActionKind::DecodeProgress:
+        case ActionKind::DecodeFinished:
+            if(auto* image=find_image(result.state,action.image);image && image->decoder.generation==action.decoder.generation && image->decoder.running) {
+                auto& d=image->decoder;if(!d.history.empty())d.history.back()=action.decoder.measurement;
+                if(action.kind==ActionKind::DecodeFinished) {
+                    d.running=false;d.error=action.decoder.error;
+                    if(d.error.empty() && !action.decoder.measurement.samples.empty() && !action.decoder.measurement.samples.back().error.empty())d.error="Decode failed. See the recorded attempt below.";
+                    // Decode measurement records attempts only. The established
+                    // image and its quality scores remain the comparison target.
+                }
+            }break;
+		case ActionKind::RequestMetrics: {
+			ImageObject* image=find_image(result.state,action.image);
+			if(!image || !image->decoded || !image->encoded || image->parents.empty() || image->decoder.running) break;
+            if(const auto* reference=find_image(result.state,image->parents.front());reference && reference->decoder.running)break;
+			auto& metadata=*image->encoded;
+			if(metadata.metricState==MetricState::Queued || metadata.metricState==MetricState::Running) break;
+			metadata.metricState=MetricState::Queued;
+			metadata.requestedMetrics.clear();
+            for(const auto& id:action.metricIds) {
+                auto previous=std::ranges::find_if(metadata.metrics,[&](const auto& m){return m.id==id;});
+                if(previous!=metadata.metrics.end() && previous->value)continue;
+                metadata.requestedMetrics.push_back(id);
+            }
+            if(!action.metricIds.empty() && metadata.requestedMetrics.empty()){metadata.metricState=MetricState::Ready;break;}
+            metadata.metricError.clear();
+			Command command;command.kind=CommandKind::ComputeMetric;command.image=image->id;command.otherImage=image->parents.front();command.metricIds=metadata.requestedMetrics;
+			result.commands.push_back(command);append_command(result,CommandKind::RequestRedraw);break;
+		}
+		case ActionKind::MetricsStarted:
+			if(auto* image=find_image(result.state,action.image);image && image->encoded && image->encoded->metricState==MetricState::Queued)
+				image->encoded->metricState=MetricState::Running;
+			append_command(result,CommandKind::RequestRedraw);break;
+		case ActionKind::MetricComputed:
+			if(auto* image=find_image(result.state,action.image);image && image->encoded &&
+			   (image->encoded->metricState==MetricState::Queued || image->encoded->metricState==MetricState::Running)) {
+				auto& metadata=*image->encoded;
+				std::erase_if(metadata.metrics,[&](const auto& m){return m.id==action.metric.id;});
+				metadata.metrics.push_back(action.metric);
+				if(action.metric.id=="psnr-y") metadata.psnrY=action.metric.value;
+				if(action.metric.id=="psnr-all") metadata.psnrRgb=action.metric.value;
+			}
+			append_command(result,CommandKind::RequestRedraw);break;
+		case ActionKind::MetricsCompleted:
+			if(auto* image=find_image(result.state,action.image);image && image->encoded && image->encoded->metricState==MetricState::Running) {
+				image->encoded->metricState=MetricState::Ready;
+				image->encoded->metricSeconds=action.value;
+				if(std::ranges::any_of(image->encoded->metrics,[](const auto& m){return !m.value;})) {
+					image->encoded->metricState=MetricState::Failed;
+					image->encoded->metricError="one or more metrics failed; inspect individual results";
+				}
+			}
+			append_command(result,CommandKind::RequestRedraw);break;
+		case ActionKind::MetricsFailed:
+			if(auto* image=find_image(result.state,action.image);image && image->encoded) {
+				image->encoded->metricState=MetricState::Failed;image->encoded->metricError=action.text;
+			}
+			append_command(result,CommandKind::RequestRedraw);break;
 		case ActionKind::EncodeRunCompleted: {
 			EncodeRun* run = find_run(result.state, action.encodeCompleted.run);
 			if (run == nullptr) {
 				append_error(result.state, ErrorSeverity::Error, "complete encode", "encoder", "invalid encode completion payload");
+				break;
+			}
+			if (run->state == EncodeRunState::CancelRequested || run->state == EncodeRunState::Canceled) {
+				run->state = EncodeRunState::Canceled;
+				run->finishedSeconds = action.value;
+				append_command(result, CommandKind::RequestRedraw);
 				break;
 			}
 			const ImageObject* source = find_image(result.state, run->source);
@@ -965,16 +1179,34 @@ UpdateResult update(AppState state, const Action& action) {
 			resultImage.parents.push_back(run->source);
 			if (run->replacePreviousResult) {
 				std::vector<ImageId> removed;
-				for (const ImageObject& image : result.state.images) {
-					if (image.encoded && image.encoded->backend == run->backend &&
-					    std::find(image.parents.begin(), image.parents.end(), run->source) != image.parents.end()) {
+				for (const ImageObject &image: result.state.images) {
+					if (image.type == ImageObjectType::EncodedResult && image.encoded &&
+						image.encoded->backend == run->backend &&
+						std::ranges::find(image.parents, run->source) != image.parents.end() &&
+						!image.decoder.running && image.encoded->metricState != MetricState::Queued &&
+						image.encoded->metricState != MetricState::Running &&
+						std::ranges::none_of(result.state.images, [&](const ImageObject &dependent) {
+							return (!dependent.derived || dependent.derived->kind != "encoder-input") &&
+								std::ranges::find(dependent.parents, image.id) != dependent.parents.end();
+						})) {
 						removed.push_back(image.id);
 					}
 				}
-				auto isRemoved = [&](ImageId id) { return std::find(removed.begin(), removed.end(), id) != removed.end(); };
-				result.state.images.erase(std::remove_if(result.state.images.begin(), result.state.images.end(), [&](const ImageObject& image) { return isRemoved(image.id); }), result.state.images.end());
-				for (Pane& pane : result.state.panes) if (pane.image && isRemoved(*pane.image)) pane.image.reset();
-				for (EncodeRun& oldRun : result.state.encodeRuns) if (oldRun.producedImage && isRemoved(*oldRun.producedImage)) oldRun.producedImage.reset();
+				auto isRemoved = [&](ImageId id) { return std::ranges::find(removed, id) != removed.end(); };
+				for (const auto& image : result.state.images)
+					if (image.derived && image.derived->kind == "encoder-input" && std::ranges::any_of(image.parents, isRemoved)) removed.push_back(image.id);
+				if (isRemoved(result.state.selection.selectedImage)) {
+					result.state.selection.selectedImage = resultImage.id;
+					result.state.selection.selectedRun   = run->id;
+				}
+				std::erase_if(result.state.images, [&](const ImageObject &image) { return isRemoved(image.id); });
+				for (Pane &pane: result.state.panes)
+					if (pane.image && isRemoved(*pane.image)) pane.image = resultImage.id;
+				for (EncodeRun &oldRun: result.state.encodeRuns)
+					if (oldRun.producedImage && isRemoved(*oldRun.producedImage)) {
+						oldRun.producedImage.reset();
+						oldRun.replacedBy = run->id;
+					}
 			}
 			run->state = EncodeRunState::Completed;
 			if (action.value > 0.0) {
@@ -984,7 +1216,12 @@ UpdateResult update(AppState state, const Action& action) {
 			}
 			run->producedImage = resultImage.id;
 			result.state.images.push_back(resultImage);
-			result.state.selection.selectedImage = resultImage.id;
+			if(result.state.selection.selectedRun==run->id)result.state.selection.selectedImage = resultImage.id;
+			if (resultImage.decoded && result.state.viewMode.kind == ViewModeKind::Single) {
+				if (Pane* pane = find_pane(result.state, result.state.selection.activePane)) {
+					pane->image = resultImage.id;
+				}
+			}
 			if (resultImage.decoded) {
 				Command upload;
 				upload.kind = CommandKind::UploadImageTexture;
@@ -1012,9 +1249,7 @@ UpdateResult update(AppState state, const Action& action) {
 			break;
 		case ActionKind::CancelEncodeRun:
 			if (EncodeRun* run = find_run(result.state, action.run)) {
-				if (run->state == EncodeRunState::Queued) {
-					run->state = EncodeRunState::Canceled;
-				} else if (run->state == EncodeRunState::Running) {
+				if (run->state == EncodeRunState::Queued || run->state == EncodeRunState::Running) {
 					run->state = EncodeRunState::CancelRequested;
 					Command command;
 					command.kind = CommandKind::RequestEncodeCancel;
@@ -1091,6 +1326,7 @@ UpdateResult update(AppState state, const Action& action) {
 			break;
 		}
 		case ActionKind::PointerPressed:
+            if(action.button!=272)break;
 			if (split_divider_at_point(result.state, action.point)) {
 				result.state.interaction.activePointerCapture = "split-divider";
 				result.state.interaction.lastPointer = action.point;
@@ -1119,8 +1355,9 @@ UpdateResult update(AppState state, const Action& action) {
 				       point.x < rect.x + rect.w && point.y < rect.y + rect.h;
 			};
 			if (contains(layout.imageList, action.point)) {
-				const float contentHeight = 42.0f + 56.0f * static_cast<float>(result.state.images.size());
-				const float maximum = std::max(0.0f, contentHeight - layout.imageList.h);
+				const float contentHeight = 4.0f + ImageListRowStep * static_cast<float>(result.state.images.size());
+				const float viewportHeight = std::max(0.0f, layout.imageList.h - ImageListHeaderHeight);
+				const float maximum = std::max(0.0f, contentHeight - viewportHeight);
 				result.state.imageList.scrollOffset = std::clamp(
 					result.state.imageList.scrollOffset + static_cast<float>(action.value), 0.0f, maximum
 				);
@@ -1129,18 +1366,31 @@ UpdateResult update(AppState state, const Action& action) {
 			}
 			if (contains(layout.inspector, action.point)) {
 				std::size_t parameterCount = 0;
+				std::size_t parameterGroupCount = 0;
+				bool selectedBackendAvailable = true;
 				for (const BackendInfo& backend : result.state.backends) {
 					if (backend.id == result.state.selection.selectedBackend) {
-						parameterCount = static_cast<std::size_t>(std::count_if(
-							backend.params.begin(), backend.params.end(),
-							[](const EncoderParamInfo& param) { return param.relevantForStillImage; }
-						));
+						std::string previousGroup;
+						for (const EncoderParamInfo& param : backend.params) {
+							if (!param.relevantForStillImage) continue;
+							++parameterCount;
+							if (param.group != previousGroup) {
+								previousGroup = param.group;
+								++parameterGroupCount;
+							}
+						}
+						selectedBackendAvailable = backend.capabilities.available;
 						break;
 					}
 				}
-				const float estimatedHeight = 120.0f + 24.0f * static_cast<float>(result.state.backends.size()) +
-				                              48.0f * static_cast<float>(parameterCount) + 420.0f;
-				const float maximum = std::max(0.0f, estimatedHeight - layout.inspector.h);
+				const float backendHeight = 54.0f + 24.0f * static_cast<float>(result.state.backends.size()) +
+				                            (selectedBackendAvailable ? 0.0f : 38.0f);
+				const float parameterHeight = 24.0f * static_cast<float>(parameterCount + parameterGroupCount);
+				const float runHeight = result.state.encodeRuns.empty() ? 0.0f : 220.0f + 40.0f * static_cast<float>(std::min<std::size_t>(4, result.state.encodeRuns.size()));
+				const float imageHeight = valid(result.state.selection.selectedImage) ? 260.0f : 0.0f;
+				const float estimatedHeight = result.state.decoderInspector ? decoder_content_height(find_image(result.state,result.state.selection.selectedImage)) : backendHeight + parameterHeight + runHeight + imageHeight + 24.0f;
+				const float viewportHeight = std::max(0.0f, layout.inspector.h - 40.0f);
+				const float maximum = std::max(0.0f, estimatedHeight - viewportHeight);
 				result.state.layout.inspectorScrollOffset = std::clamp(
 					result.state.layout.inspectorScrollOffset + static_cast<float>(action.value), 0.0f, maximum
 				);
@@ -1161,9 +1411,27 @@ UpdateResult update(AppState state, const Action& action) {
 			}
 			break;
 		}
+        case ActionKind::WindowFocusLost:
+            result.state.interaction.activePointerCapture.clear();
+            break;
+        case ActionKind::KeyReleased:
+        case ActionKind::ClipboardText:
+            break;
 		case ActionKind::KeyPressed:
+            if(action.control || action.alt) {
+                if(action.control && (action.text=="a" || action.text=="A"))result.state.interaction.replaceFocusedNumericValue=true;
+                break;
+            }
+            if(action.text=="tab" || action.text=="left" || action.text=="right" || action.text=="up" || action.text=="down" || action.text=="home" || action.text=="end" || action.text=="pageup" || action.text=="pagedown" || action.text=="delete")break;
 			if (action.text == "debug") {
 				result.state.debug.enabled = !result.state.debug.enabled;
+				append_command(result, CommandKind::RequestRedraw);
+				break;
+			}
+			if (action.text == "escape") {
+				result.state.interaction.focusedWidget.clear();
+				result.state.interaction.activePointerCapture.clear();
+				if (!result.state.errors.empty()) result.state.errors.erase(result.state.errors.begin());
 				append_command(result, CommandKind::RequestRedraw);
 				break;
 			}
@@ -1175,11 +1443,11 @@ UpdateResult update(AppState state, const Action& action) {
 				Pane* pane = find_pane(result.state, result.state.selection.activePane);
 				if (pane != nullptr && pane->image) {
 					if (const ImageObject* image = find_image(result.state, *pane->image)) {
-						if (action.text == "fit") {
+						if (action.text == "fit" || action.text == "f") {
 							const Rect rect = current_pane_rect(result.state, pane->id).value_or(Rect{});
 							set_pane_transform(result.state, pane->id, fit_transform(image->width, image->height, rect, result.state.interaction.outputScale));
 							append_command(result, CommandKind::RequestRedraw);
-						} else if (action.text == "100%") {
+						} else if (action.text == "100%" || action.text == "0") {
 							set_pane_transform(result.state, pane->id, one_to_one_transform(image->width, image->height));
 							append_command(result, CommandKind::RequestRedraw);
 						}
@@ -1194,18 +1462,24 @@ UpdateResult update(AppState state, const Action& action) {
 			append_command(result, CommandKind::RequestRedraw);
 			break;
 		case ActionKind::ErrorDismissed:
-			result.state.errors.erase(
-				std::remove_if(result.state.errors.begin(), result.state.errors.end(), [&](const AppError& error) {
+			std::erase_if(result.state.errors, [&](const AppError& error) {
 					return error.id == static_cast<uint64_t>(action.value);
-				}),
-				result.state.errors.end()
-			);
+				});
 			break;
 		default:
 			break;
 	}
 
 	log_update(result.state, action.kind, result.commands);
+    if(result.state.decoderInspector && valid(result.state.selection.selectedImage)) {
+        if(auto* image=find_image(result.state,result.state.selection.selectedImage);image && !image->decoder.queried && !image->decoder.querying && !image->decoder.running) {
+            image->decoder.querying=true;++image->decoder.generation;
+            Command query;query.kind=CommandKind::QueryImageDecoders;query.image=image->id;query.revision=image->decoder.generation;result.commands.push_back(query);
+        }
+    }
+    for(const auto id:decoderWork)if(!find_image(result.state,id)) {
+        Command cancel;cancel.kind=CommandKind::CancelImageDecode;cancel.image=id;result.commands.push_back(cancel);
+    }
 	return result;
 }
 

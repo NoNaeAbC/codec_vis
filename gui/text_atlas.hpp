@@ -5,6 +5,8 @@
 
 #include <cstdint>
 #include <vector>
+#include <memory>
+#include <limits>
 
 namespace codec_gui::gui {
 
@@ -14,7 +16,24 @@ namespace codec_gui::gui {
 		Color color;
 		bool elision = false;
 		int layer = 0;
-		Rect clip{-1000000.0f, -1000000.0f, 2000000.0f, 2000000.0f};
+		Rect clip{.x=-1000000.0f, .y=-1000000.0f, .w=2000000.0f, .h=2000000.0f};
+		std::size_t commandIndex = std::numeric_limits<std::size_t>::max();
+	};
+	struct TextAtlas;
+	struct TextLine { std::string text; float width = 0; };
+	[[nodiscard]] std::vector<TextLine> wrap_text(TextShaper& shaper, std::string_view text, float physicalWidth);
+	// One instance per GUI view. Glyph locations stay stable as labels/numbers change.
+	class TextAtlasCache {
+		struct Impl;
+		std::unique_ptr<Impl> impl_;
+	public:
+		TextAtlasCache();
+		~TextAtlasCache();
+		void clear();
+		[[nodiscard]] TextAtlas& atlas();
+		[[nodiscard]] uint64_t rasterized_glyph_count() const;
+		const TextAtlas& build(const std::vector<DrawCommand>& commands, TextShaper& defaultShaper,
+							  int atlasWidth = 1024, float deviceScale = 1);
 	};
 
 	struct TextAtlas {

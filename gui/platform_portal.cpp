@@ -1,5 +1,10 @@
 #include "platform_portal.hpp"
+#include "app_state.hpp"
+#include "../codec_gui_image_io.hpp"
 
+#include <cstdint>
+#include <algorithm>
+#include <cctype>
 #include <sdbus-c++/sdbus-c++.h>
 
 #include <atomic>
@@ -39,12 +44,12 @@ std::string percent_decode(std::string_view text) {
 
 std::filesystem::path decode_portal_file_uri(std::string_view uri) {
 	const std::string prefix = "file://";
-	if (uri.rfind(prefix, 0) != 0) {
+	if (!uri.starts_with(prefix)) {
 		return std::filesystem::path{std::string{uri}};
 	}
 	std::string_view path = uri.substr(prefix.size());
 	const std::string localhost = "localhost/";
-	if (path.rfind(localhost, 0) == 0) {
+	if (path.starts_with(localhost)) {
 		path.remove_prefix(localhost.size() - 1);
 	} else if (!path.empty() && path.front() != '/') {
 		const std::size_t slash = path.find('/');
@@ -89,6 +94,16 @@ Action show_open_file_portal() {
 	std::map<std::string, sdbus::Variant> options;
 	options.emplace("modal", sdbus::Variant{true});
 	options.emplace("multiple", sdbus::Variant{false});
+	using Pattern=sdbus::Struct<uint32_t,std::string>;
+	using Filter=sdbus::Struct<std::string,std::vector<Pattern>>;
+	std::vector<Pattern> patterns;
+	for(auto ext:supported_input_extensions()) {
+		patterns.emplace_back(0u,"*"+ext);
+		std::transform(ext.begin(),ext.end(),ext.begin(),[](unsigned char c){return std::toupper(c);});
+		patterns.emplace_back(0u,"*"+ext);
+	}
+	options.emplace("filters",sdbus::Variant{std::vector<Filter>{
+		Filter{"Supported images and codestreams",patterns},Filter{"All files",std::vector<Pattern>{Pattern{0u,"*"}}}}});
 	sdbus::ObjectPath requestPath;
 	portal->callMethod("OpenFile")
 		.onInterface("org.freedesktop.portal.FileChooser")

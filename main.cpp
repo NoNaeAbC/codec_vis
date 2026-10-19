@@ -1,6 +1,9 @@
 #include "codec_gui_x265.hpp"
 #include "codec_gui_image_io.hpp"
 #include "gui/raw_image_conversion.hpp"
+#include "libraw_const.h"
+#include "libraw_types.h"
+#include "pngconf.h"
 
 #include <algorithm>
 #include <array>
@@ -14,6 +17,7 @@
 #include <cstdlib>
 #include <cctype>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -21,8 +25,12 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <system_error>
+#include <variant>
 #include <vector>
 
 #include <libraw/libraw.h>
@@ -102,7 +110,7 @@ PngImage load_png_rgb(const std::filesystem::path& path) {
 		throw std::runtime_error("failed to create PNG metadata decoder");
 	}
 
-	PngAllocations* allocations = static_cast<PngAllocations*>(std::calloc(1, sizeof(PngAllocations)));
+	auto* allocations = static_cast<PngAllocations*>(std::calloc(1, sizeof(PngAllocations)));
 	if (allocations == nullptr) {
 		png_destroy_read_struct(&png, &info, nullptr);
 		std::fclose(file);
@@ -261,7 +269,7 @@ Rgb16Image load_nef_rgb16(const std::filesystem::path &path) {
 			LibRaw::dcraw_clear_mem(image);
 		}
 	};
-	std::unique_ptr<libraw_processed_image_t, ProcessedImageDeleter> imageGuard{processed};
+	std::unique_ptr<libraw_processed_image_t, ProcessedImageDeleter> const imageGuard{processed};
 
 	if (processed->type != LIBRAW_IMAGE_BITMAP || processed->colors != 3 || processed->bits != 16) {
 		throw std::runtime_error("LibRaw produced an unsupported image format");
@@ -285,7 +293,7 @@ Rgb16Image load_nef_rgb16(const std::filesystem::path &path) {
 
 bool has_extension(const std::filesystem::path &path, const std::string &extension) {
 	std::string ext = path.extension().string();
-	std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+	std::ranges::transform(ext, ext.begin(), [](unsigned char c) {
 		return static_cast<char>(std::tolower(c));
 	});
 	return ext == extension;
@@ -319,7 +327,7 @@ YCbCr rgb_to_bt709_limited(const double r, const double g, const double b) {
 	const double cb    = 128.0 + 224.0 * (b - yFull) / (2.0 * (255.0 - 255.0 * 0.0722));
 	const double cr    = 128.0 + 224.0 * (r - yFull) / (2.0 * (255.0 - 255.0 * 0.2126));
 
-	return {clamp_u8(y), clamp_u8(cb), clamp_u8(cr)};
+	return {.y=clamp_u8(y), .cb=clamp_u8(cb), .cr=clamp_u8(cr)};
 }
 
 YCbCr10 rgb16_to_bt709_limited_10(const double r, const double g, const double b) {
@@ -328,7 +336,7 @@ YCbCr10 rgb16_to_bt709_limited_10(const double r, const double g, const double b
 	const double cb    = 512.0 + 896.0 * (b - yFull) / (2.0 * (65535.0 - 65535.0 * 0.0722));
 	const double cr    = 512.0 + 896.0 * (r - yFull) / (2.0 * (65535.0 - 65535.0 * 0.2126));
 
-	return {clamp_u10(y), clamp_u10(cb), clamp_u10(cr)};
+	return {.y=clamp_u10(y), .cb=clamp_u10(cb), .cr=clamp_u10(cr)};
 }
 
 void store_u16le(std::vector<uint8_t> &bytes, const std::size_t sampleIndex, const uint16_t value) {
@@ -472,7 +480,7 @@ codec_gui::RawImage load_input_image(const std::filesystem::path &path) {
 	}
 
 	if (has_extension(path, ".png")) {
-		PngImage png = load_png_rgb(path);
+		PngImage const png = load_png_rgb(path);
 		return png.sixteenBit
 			? rgb16_to_yuv420p10_bt709_limited(png.rgb16)
 			: rgb_to_yuv420_bt709_limited(png.rgb8);
@@ -499,7 +507,7 @@ codec_gui::RawImage make_test_pattern() {
 	image.color.range = codec_gui::ColorRange::Limited;
 	image.color.chroma420Location = codec_gui::Chroma420SampleLocation::Center;
 
-	image.planes[0].bytes.resize(HEIGHT * WIDTH);
+	image.planes[0].bytes.resize(static_cast<std::size_t>(HEIGHT * WIDTH));
 	image.planes[0].strideBytes = WIDTH;
 	image.planes[1].bytes.resize(HEIGHT * WIDTH / 4);
 	image.planes[1].strideBytes = WIDTH / 2;
@@ -509,8 +517,8 @@ codec_gui::RawImage make_test_pattern() {
 	for (uint32_t y = 0; y < HEIGHT; y++) {
 		for (uint32_t x = 0; x < WIDTH; x++) {
 			image.planes[0].bytes[y * WIDTH + x] =
-					std::clamp((std::sin(float(x) / float(HEIGHT) * 4) / 2.0f + 0.5f) *
-									   (std::sin(float(y) / float(HEIGHT) * 4) / 2.0f + 0.5f),
+					std::clamp((std::sin(static_cast<float>(x) / static_cast<float>(HEIGHT) * 4) / 2.0f + 0.5f) *
+									   (std::sin(static_cast<float>(y) / static_cast<float>(HEIGHT) * 4) / 2.0f + 0.5f),
 							   0.0f, std::bit_cast<float>(std::bit_cast<uint32_t>(1.0f) - 1)) *
 					256;
 		}
@@ -519,11 +527,11 @@ codec_gui::RawImage make_test_pattern() {
 	for (uint32_t y = 0; y < HEIGHT / 2; y++) {
 		for (uint32_t x = 0; x < WIDTH / 2; x++) {
 			image.planes[1].bytes[y * (WIDTH / 2) + x] =
-					std::clamp(float(x) / float(WIDTH / 2), 0.0f,
+					std::clamp(static_cast<float>(x) / static_cast<float>(WIDTH / 2), 0.0f,
 							   std::bit_cast<float>(std::bit_cast<uint32_t>(1.0f) - 1)) *
 					256;
 			image.planes[2].bytes[y * (WIDTH / 2) + x] =
-					std::clamp(float(y) / float(HEIGHT / 2), 0.0f,
+					std::clamp(static_cast<float>(y) / static_cast<float>(HEIGHT / 2), 0.0f,
 							   std::bit_cast<float>(std::bit_cast<uint32_t>(1.0f) - 1)) *
 					256;
 		}
@@ -560,8 +568,8 @@ codec_gui::EncoderParam parse_av1_param(std::string_view argument) {
 		throw std::invalid_argument("--av1-param expects NAME=VALUE");
 	}
 	return {
-		std::string(argument.substr(0, separator)),
-		parse_av1_param_value(argument.substr(0, separator), argument.substr(separator + 1)),
+		.name=std::string(argument.substr(0, separator)),
+		.value=parse_av1_param_value(argument.substr(0, separator), argument.substr(separator + 1)),
 	};
 }
 
@@ -639,9 +647,9 @@ void validate_av1_params(std::span<const codec_gui::EncoderParam> params) {
 		                [&](const codec_gui::EncoderParam& earlier) { return earlier.name == param.name; })) {
 			throw std::invalid_argument("duplicate AV1 parameter: " + param.name);
 		}
-		const auto definition = std::find_if(
-			advertised.begin(),
-			advertised.end(),
+		const auto definition = std::ranges::find_if(
+			advertised,
+
 			[&](const codec_gui::EncoderParamInfo& candidate) { return candidate.name == param.name; }
 		);
 		if (definition == advertised.end()) {
@@ -727,58 +735,58 @@ int main(int argc, char **argv) try {
 	const std::string x265Profile =
 			image.format == codec_gui::PixelFormat::YUV420P10LE ? "main10" : "mainstillpicture";
 
-	codec_gui::EncodedImage encoded = codec_gui::encode_x265_still_image(
+	codec_gui::EncodedImage const encoded = codec_gui::encode_x265_still_image(
 			image, std::array{
-						   codec_gui::EncoderParam{"preset", std::string{"veryslow"}},
-						   codec_gui::EncoderParam{"profile", x265Profile},
-						   codec_gui::EncoderParam{"colorprim", std::string{"bt709"}},
-						   codec_gui::EncoderParam{"transfer", std::string{"iec61966-2-1"}},
-						   codec_gui::EncoderParam{"colormatrix", std::string{"bt709"}},
-						   codec_gui::EncoderParam{"range", std::string{"limited"}},
-						   codec_gui::EncoderParam{"qp", int64_t{50}},
-						   codec_gui::EncoderParam{"rd", int64_t{6}},
-						   codec_gui::EncoderParam{"rdoq-level", int64_t{2}},
-						   codec_gui::EncoderParam{"aq-mode", std::string{"3"}},
-						   codec_gui::EncoderParam{"psy-rd", double{2.0}},
-						   codec_gui::EncoderParam{"psy-rdoq", double{50.0}},
-						   codec_gui::EncoderParam{"deblock", std::string{"0:0"}},
+						   codec_gui::EncoderParam{.name="preset", .value=std::string{"veryslow"}},
+						   codec_gui::EncoderParam{.name="profile", .value=x265Profile},
+						   codec_gui::EncoderParam{.name="colorprim", .value=std::string{"bt709"}},
+						   codec_gui::EncoderParam{.name="transfer", .value=std::string{"iec61966-2-1"}},
+						   codec_gui::EncoderParam{.name="colormatrix", .value=std::string{"bt709"}},
+						   codec_gui::EncoderParam{.name="range", .value=std::string{"limited"}},
+						   codec_gui::EncoderParam{.name="qp", .value=int64_t{50}},
+						   codec_gui::EncoderParam{.name="rd", .value=int64_t{6}},
+						   codec_gui::EncoderParam{.name="rdoq-level", .value=int64_t{2}},
+						   codec_gui::EncoderParam{.name="aq-mode", .value=std::string{"3"}},
+						   codec_gui::EncoderParam{.name="psy-rd", .value=double{2.0}},
+						   codec_gui::EncoderParam{.name="psy-rdoq", .value=double{50.0}},
+						   codec_gui::EncoderParam{.name="deblock", .value=std::string{"0:0"}},
 				   });
 
 	dump_to_file("file.h265", encoded.hevcAnnexB);
 
-	codec_gui::EncodedImage encoded_h266 = codec_gui::encode_vvenc_still_image(
+	codec_gui::EncodedImage const encoded_h266 = codec_gui::encode_vvenc_still_image(
 			image, std::array{
-						   codec_gui::EncoderParam{"preset", std::string{"slower"}},
-						   codec_gui::EncoderParam{"qp", int64_t{60}},
+						   codec_gui::EncoderParam{.name="preset", .value=std::string{"slower"}},
+						   codec_gui::EncoderParam{.name="qp", .value=int64_t{60}},
 				   });
 
 	dump_to_file("file.h266", encoded_h266.hevcAnnexB);
 
-	codec_gui::EncodedImage encoded_av1 = codec_gui::encode_svt_av1_still_image(
+	codec_gui::EncodedImage const encoded_av1 = codec_gui::encode_svt_av1_still_image(
 			image, std::array{
-						   codec_gui::EncoderParam{"preset", int64_t{8}},
-						   codec_gui::EncoderParam{"crf", double{35.0}},
-						   codec_gui::EncoderParam{"tune", std::string{"3"}},
-						   codec_gui::EncoderParam{"enable-variance-boost", true},
-						   codec_gui::EncoderParam{"variance-boost-curve", std::string{"2"}},
-						   codec_gui::EncoderParam{"max-tx-size", int64_t{32}},
+						   codec_gui::EncoderParam{.name="preset", .value=int64_t{8}},
+						   codec_gui::EncoderParam{.name="crf", .value=double{35.0}},
+						   codec_gui::EncoderParam{.name="tune", .value=std::string{"3"}},
+						   codec_gui::EncoderParam{.name="enable-variance-boost", .value=true},
+						   codec_gui::EncoderParam{.name="variance-boost-curve", .value=std::string{"2"}},
+						   codec_gui::EncoderParam{.name="max-tx-size", .value=int64_t{32}},
 				   });
 
 	dump_to_file("file.av1", encoded_av1.hevcAnnexB);
 
-	codec_gui::EncodedImage encoded_vaapi_hevc = codec_gui::encode_vaapi_hevc_still_image(
+	codec_gui::EncodedImage const encoded_vaapi_hevc = codec_gui::encode_vaapi_hevc_still_image(
 			image, std::array{
-						   codec_gui::EncoderParam{"qpi", int64_t{35}},
-						   codec_gui::EncoderParam{"target-usage", int64_t{4}},
+						   codec_gui::EncoderParam{.name="qpi", .value=int64_t{35}},
+						   codec_gui::EncoderParam{.name="target-usage", .value=int64_t{4}},
 				   });
 
 	dump_to_file("file_vaapi.h265", encoded_vaapi_hevc.hevcAnnexB);
 
 	try {
-		codec_gui::EncodedImage encoded_vaapi_av1 = codec_gui::encode_vaapi_av1_still_image(
+		codec_gui::EncodedImage const encoded_vaapi_av1 = codec_gui::encode_vaapi_av1_still_image(
 				image, std::array{
-							   codec_gui::EncoderParam{"qindex", int64_t{35}},
-							   codec_gui::EncoderParam{"target-usage", int64_t{4}},
+							   codec_gui::EncoderParam{.name="qindex", .value=int64_t{35}},
+							   codec_gui::EncoderParam{.name="target-usage", .value=int64_t{4}},
 					   });
 
 		dump_to_file("file_vaapi.av1", encoded_vaapi_av1.hevcAnnexB);
@@ -786,28 +794,28 @@ int main(int argc, char **argv) try {
 		std::cerr << "skipping VA-API AV1: " << e.what() << '\n';
 	}
 
-	codec_gui::EncodedImage encoded_uvg266 = codec_gui::encode_uvg266_still_image(
+	codec_gui::EncodedImage const encoded_uvg266 = codec_gui::encode_uvg266_still_image(
 			image, std::array{
-						   codec_gui::EncoderParam{"qp", int64_t{48}},
-						   codec_gui::EncoderParam{"preset", std::string{"slower"}},
-						   codec_gui::EncoderParam{"rdo", int64_t{2}},
-						   codec_gui::EncoderParam{"sao", true},
-						   codec_gui::EncoderParam{"alf", true},
+						   codec_gui::EncoderParam{.name="qp", .value=int64_t{48}},
+						   codec_gui::EncoderParam{.name="preset", .value=std::string{"slower"}},
+						   codec_gui::EncoderParam{.name="rdo", .value=int64_t{2}},
+						   codec_gui::EncoderParam{.name="sao", .value=true},
+						   codec_gui::EncoderParam{.name="alf", .value=false},
 				   });
 
 	dump_to_file("file_uvg266.h266", encoded_uvg266.hevcAnnexB);
 
-		codec_gui::EncodedImage encoded_av2 = codec_gui::encode_av2_still_image(
+		codec_gui::EncodedImage const encoded_av2 = codec_gui::encode_av2_still_image(
 				image, std::array{
-							   codec_gui::EncoderParam{"cpu-used", int64_t{9}},
-							   codec_gui::EncoderParam{"qp", int64_t{128}},
-							   codec_gui::EncoderParam{"enable-cdef", true},
-							   codec_gui::EncoderParam{"enable-restoration", true},
-							   codec_gui::EncoderParam{"enable-intrabc", false},
-							   codec_gui::EncoderParam{"enable-rect-partitions", false},
-							   codec_gui::EncoderParam{"enable-1to4-partitions", false},
-							   codec_gui::EncoderParam{"min-partition-size", int64_t{64}},
-							   codec_gui::EncoderParam{"max-partition-size", int64_t{128}},
+							   codec_gui::EncoderParam{.name="cpu-used", .value=int64_t{9}},
+							   codec_gui::EncoderParam{.name="qp", .value=int64_t{128}},
+							   codec_gui::EncoderParam{.name="enable-cdef", .value=true},
+							   codec_gui::EncoderParam{.name="enable-restoration", .value=true},
+							   codec_gui::EncoderParam{.name="enable-intrabc", .value=false},
+							   codec_gui::EncoderParam{.name="enable-rect-partitions", .value=false},
+							   codec_gui::EncoderParam{.name="enable-1to4-partitions", .value=false},
+							   codec_gui::EncoderParam{.name="min-partition-size", .value=int64_t{64}},
+							   codec_gui::EncoderParam{.name="max-partition-size", .value=int64_t{128}},
 					   });
 
 	dump_to_file("file.av2", encoded_av2.hevcAnnexB);

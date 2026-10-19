@@ -8,6 +8,7 @@
 namespace codec_gui::gui {
 
 	[[nodiscard]] std::filesystem::path default_font_path();
+	[[nodiscard]] std::filesystem::path default_monospace_font_path();
 
 	struct ShapedGlyph {
 		uint32_t glyphIndex = 0;
@@ -16,6 +17,7 @@ namespace codec_gui::gui {
 		float advanceY = 0.0f;
 		float offsetX = 0.0f;
 		float offsetY = 0.0f;
+		uint32_t cluster = 0; // UTF-8 byte offset supplied by HarfBuzz.
 	};
 
 	struct GlyphBitmap {
@@ -60,6 +62,7 @@ namespace codec_gui::gui {
 		[[nodiscard]] GlyphBitmap rasterize_glyph(uint32_t glyphIndex) const;
 		[[nodiscard]] GlyphBitmap rasterize_glyph(const ShapedGlyph& glyph) const;
 		[[nodiscard]] RasterizedText rasterize(std::string_view utf8) const;
+		[[nodiscard]] uint64_t identity() const;
 
 	private:
 		struct Impl;

@@ -9,7 +9,7 @@
 namespace codec_gui::gui {
 
 inline ParamValue resolved_param_value(const AppState& state, BackendId backend, const EncoderParamInfo& info) {
-	const auto config = std::find_if(state.encoderConfigs.begin(), state.encoderConfigs.end(), [backend](const EncoderConfig& item) {
+	const auto config = std::ranges::find_if(state.encoderConfigs, [backend](const EncoderConfig& item) {
 		return item.backend == backend;
 	});
 	if (config != state.encoderConfigs.end()) {
@@ -17,6 +17,11 @@ inline ParamValue resolved_param_value(const AppState& state, BackendId backend,
 			return item.name == info.name;
 		});
 		if (value != config->params.end()) return value->value;
+		if (info.name == "target-size-kb") {
+			const auto old =
+					std::ranges::find_if(config->params, [](const auto &p) { return p.name == "bitrate-kbps"; });
+			if (old != config->params.end()) return double(std::get<int64_t>(old->value)) / 8.;
+		}
 	}
 	return std::visit([](const auto& value) -> ParamValue {
 		using T = std::decay_t<decltype(value)>;
@@ -37,23 +42,23 @@ inline std::string param_value_text(const ParamValue& value) {
 
 inline bool parameter_is_enabled(const AppState& state, const BackendInfo& backend, const EncoderParamInfo& info) {
 	for (const ParamCondition& condition : info.enabledWhen) {
-		const auto dependency = std::find_if(backend.params.begin(), backend.params.end(), [&](const EncoderParamInfo& candidate) {
+		const auto dependency = std::ranges::find_if(backend.params, [&](const EncoderParamInfo& candidate) {
 			return candidate.name == condition.parameter;
 		});
 		if (dependency == backend.params.end()) return false;
 		const std::string current = param_value_text(resolved_param_value(state, backend.id, *dependency));
-		if (std::find(condition.acceptedValues.begin(), condition.acceptedValues.end(), current) == condition.acceptedValues.end()) return false;
+		if (std::ranges::find(condition.acceptedValues, current) == condition.acceptedValues.end()) return false;
 	}
 	return true;
 }
 
 inline std::string parameter_disabled_reason(const AppState& state, const BackendInfo& backend, const EncoderParamInfo& info) {
 	for (const ParamCondition& condition : info.enabledWhen) {
-		const auto dependency = std::find_if(backend.params.begin(), backend.params.end(), [&](const EncoderParamInfo& candidate) {
+		const auto dependency = std::ranges::find_if(backend.params, [&](const EncoderParamInfo& candidate) {
 			return candidate.name == condition.parameter;
 		});
 		if (dependency == backend.params.end() ||
-		    std::find(condition.acceptedValues.begin(), condition.acceptedValues.end(),
+		    std::ranges::find(condition.acceptedValues,
 		              dependency == backend.params.end() ? std::string{} : param_value_text(resolved_param_value(state, backend.id, *dependency))) == condition.acceptedValues.end()) {
 			return condition.explanation.empty() ? "Unavailable in the selected mode." : condition.explanation;
 		}

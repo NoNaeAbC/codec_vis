@@ -9,13 +9,16 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
+#include <vvenc/vvencCfg.h>
 
 extern "C" {
 #include <vvenc/vvenc.h>
@@ -80,28 +83,28 @@ struct FormatInfo {
 [[nodiscard]] FormatInfo format_info(const PixelFormat format) {
     switch (format) {
         case PixelFormat::YUV420P8:
-            return { VVENC_CHROMA_420, 8, 3, { 1, 2, 2 }, { 1, 2, 2 } };
+            return { .chromaFormat=VVENC_CHROMA_420, .bitDepth=8, .planeCount=3, .widthDiv={ 1, 2, 2 }, .heightDiv={ 1, 2, 2 } };
 
         case PixelFormat::YUV420P10LE:
-            return { VVENC_CHROMA_420, 10, 3, { 1, 2, 2 }, { 1, 2, 2 } };
+            return { .chromaFormat=VVENC_CHROMA_420, .bitDepth=10, .planeCount=3, .widthDiv={ 1, 2, 2 }, .heightDiv={ 1, 2, 2 } };
 
         case PixelFormat::YUV422P8:
-            return { VVENC_CHROMA_422, 8, 3, { 1, 2, 2 }, { 1, 1, 1 } };
+            return { .chromaFormat=VVENC_CHROMA_422, .bitDepth=8, .planeCount=3, .widthDiv={ 1, 2, 2 }, .heightDiv={ 1, 1, 1 } };
 
         case PixelFormat::YUV422P10LE:
-            return { VVENC_CHROMA_422, 10, 3, { 1, 2, 2 }, { 1, 1, 1 } };
+            return { .chromaFormat=VVENC_CHROMA_422, .bitDepth=10, .planeCount=3, .widthDiv={ 1, 2, 2 }, .heightDiv={ 1, 1, 1 } };
 
         case PixelFormat::YUV444P8:
-            return { VVENC_CHROMA_444, 8, 3, { 1, 1, 1 }, { 1, 1, 1 } };
+            return { .chromaFormat=VVENC_CHROMA_444, .bitDepth=8, .planeCount=3, .widthDiv={ 1, 1, 1 }, .heightDiv={ 1, 1, 1 } };
 
         case PixelFormat::YUV444P10LE:
-            return { VVENC_CHROMA_444, 10, 3, { 1, 1, 1 }, { 1, 1, 1 } };
+            return { .chromaFormat=VVENC_CHROMA_444, .bitDepth=10, .planeCount=3, .widthDiv={ 1, 1, 1 }, .heightDiv={ 1, 1, 1 } };
 
         case PixelFormat::Gray8:
-            return { VVENC_CHROMA_400, 8, 1, { 1, 1, 1 }, { 1, 1, 1 } };
+            return { .chromaFormat=VVENC_CHROMA_400, .bitDepth=8, .planeCount=1, .widthDiv={ 1, 1, 1 }, .heightDiv={ 1, 1, 1 } };
 
         case PixelFormat::Gray10LE:
-            return { VVENC_CHROMA_400, 10, 1, { 1, 1, 1 }, { 1, 1, 1 } };
+            return { .chromaFormat=VVENC_CHROMA_400, .bitDepth=10, .planeCount=1, .widthDiv={ 1, 1, 1 }, .heightDiv={ 1, 1, 1 } };
 		case PixelFormat::YUV420P12LE: case PixelFormat::YUV420P14LE:
 		case PixelFormat::YUV422P12LE: case PixelFormat::YUV422P14LE:
 		case PixelFormat::YUV444P12LE: case PixelFormat::YUV444P14LE:
@@ -420,7 +423,7 @@ void copy_plane_u16le_to_vvenc(
     const int         sourceBitDepth,
     const int         bitDepthShift
 ) {
-    const uint16_t maxValue = static_cast<uint16_t>((1u << sourceBitDepth) - 1u);
+    const auto maxValue = static_cast<uint16_t>((1u << sourceBitDepth) - 1u);
 
     for (int y = 0; y < height; ++y) {
         const uint8_t* srcRow = src.bytes.data() + static_cast<std::size_t>(y) * src.strideBytes;
@@ -490,6 +493,8 @@ void force_still_image_config(vvenc_config& cfg, const RawImage& image, const Fo
 
     cfg.m_inputBitDepth[0]    = info.bitDepth;
     cfg.m_inputBitDepth[1]    = info.bitDepth;
+    cfg.m_internalBitDepth[0] = info.bitDepth;
+    cfg.m_internalBitDepth[1] = info.bitDepth;
     cfg.m_internChromaFormat = info.chromaFormat;
 
     cfg.m_IntraPeriod         = 1;
@@ -551,7 +556,7 @@ void force_still_image_config(vvenc_config& cfg, const RawImage& image, const Fo
     std::vector<std::string> values,
     std::string explanation
 ) {
-    param.enabledWhen.push_back({std::move(dependency), std::move(values), std::move(explanation)});
+    param.enabledWhen.push_back({.parameter=std::move(dependency), .acceptedValues=std::move(values), .explanation=std::move(explanation)});
     return param;
 }
 
@@ -628,14 +633,14 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "Speed / Quality",
             "medium",
             {
-                { "faster",              "Faster" },
-                { "fast",                "Fast" },
-                { "medium",              "Medium" },
-                { "slow",                "Slow" },
-                { "slower",              "Slower" },
-                { "medium_lowDecEnergy", "Medium, low decoder energy" },
+                { .value="faster",              .label="Faster" },
+                { .value="fast",                .label="Fast" },
+                { .value="medium",              .label="Medium" },
+                { .value="slow",                .label="Slow" },
+                { .value="slower",              .label="Slower" },
+                { .value="medium_lowDecEnergy", .label="Medium, low decoder energy" },
             },
-            "VVenC preset. This is applied before all other user parameters."
+			"Speed/quality preset applied before the controls below. Slower presets search more coding choices and usually compress better."
         ),
 
 		enum_param(
@@ -643,27 +648,28 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
 			"Rate-control mode",
 			"Rate Control",
 			"qp",
-			{{"qp", "Fixed QP"}, {"bitrate", "Target bitrate"}},
-			"Select exactly one VVenC rate-control strategy. The inactive value is not submitted."
+			{{.value="qp", .label="Fixed QP"}, {.value="bitrate", .label="Target bitrate"}},
+			"Video rate-control strategy. Still images always use an explicit QP.",
+			false
 		),
 
-		enabled_when(int_param(
+		int_param(
             "qp",
             "QP",
             "Rate Control",
             32,
-            { 0, 63, 1 },
-            "Fixed QP for the key picture. Lower values improve quality and increase size."
-		), "rate-control", {"qp"}, "QP is available only in Fixed QP mode."),
+            { .min=0, .max=63, .step=1 },
+			"Quantization parameter for the image. Lower values preserve more detail and produce a larger file."
+		),
 
 		enabled_when(int_param(
             "bitrate",
             "Target bitrate",
             "Rate Control",
             0,
-            { 0, 2'000'000'000, 1'000 },
-            "Target bitrate in bit/s.",
-			true,
+            { .min=0, .max=2'000'000'000, .step=1'000 },
+			"Video-only target bitrate; a single image uses an explicit QP.",
+			false,
 			true
 		), "rate-control", {"bitrate"}, "Bitrate is available only in Target bitrate mode."),
 
@@ -672,7 +678,7 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "Rate-control passes",
             "Rate Control",
             1,
-            { 1, 2, 1 },
+            { .min=1, .max=2, .step=1 },
             "Number of rate-control passes. For single-image encoding, 1 is normally the useful setting."
             ,
             false
@@ -683,7 +689,7 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "Perceptual QP adaptation",
             "Perceptual",
             true,
-            "Enable perceptually motivated input-adaptive QP modification."
+			"Redistribute quantization across the image according to visual activity, preserving more detail where VVenC predicts it matters."
         ),
 
         int_param(
@@ -691,8 +697,9 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "Intra QP offset",
             "Intra",
             0,
-            { -12, 12, 1 },
-            "QP offset for intra slices. For a still image, the only coded picture is intra."
+            { .min=-12, .max=12, .step=1 },
+			"Video-only offset between intra and inter pictures; redundant for the single intra picture encoded here.",
+			false
         ),
 
         bool_param(
@@ -700,7 +707,7 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "Matrix-based intra prediction",
             "Intra Tools",
             true,
-            "Enable matrix-based intra prediction."
+			"Allow matrix-based intra prediction, which predicts a block from its reconstructed top and left neighbors using trained linear models."
         ),
 
         bool_param(
@@ -708,7 +715,7 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "Intra sub-partitions",
             "Intra Tools",
             true,
-            "Enable intra sub-partitions."
+			"Allow an intra block to be split into horizontal or vertical strips whose prediction and residuals are coded separately."
         ),
 
         bool_param(
@@ -716,7 +723,7 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "Multiple reference lines",
             "Intra Tools",
             true,
-            "Enable multiple-reference-line intra prediction."
+			"Let intra prediction use reconstructed reference lines farther from the current block, not only the nearest line."
         ),
 
         bool_param(
@@ -724,7 +731,7 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "LFNST",
             "Intra Tools",
             true,
-            "Enable low-frequency non-separable transform."
+			"Apply an additional transform to low-frequency intra residual coefficients; this can compact directional texture more efficiently."
         ),
 
         int_param(
@@ -732,8 +739,8 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "Multiple transform selection",
             "Transform",
             1,
-            { 0, 3, 1 },
-            "Multiple transform selection mode."
+			{ .min=0, .max=1, .step=1 },
+			"Try additional VVC transform types for each intra block and signal the best one. 0 disables MTS; 1 enables the intra transform search. Video-only inter modes are not exposed."
         ),
 
         bool_param(
@@ -741,23 +748,23 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "Transform skip",
             "Transform",
             false,
-            "Enable transform skip. Often relevant for screen content and sharp synthetic material."
+			"Allow residual samples to bypass the frequency transform. This mainly helps sharp synthetic edges and screen content."
         ),
 
-        bool_param(
-            "BDPCM",
-            "BDPCM",
-            "Screen Content",
-            false,
-            "Enable block DPCM. Mostly useful for screen-content-like images."
-        ),
+		enabled_when(bool_param(
+			"BDPCM",
+			"BDPCM",
+			"Screen Content",
+			false,
+			"Predict transform-skipped residual samples horizontally or vertically. This is mainly useful for screen content and requires transform skip."
+		), "TS", {"true"}, "BDPCM requires transform skip to be enabled."),
 
         bool_param(
             "LMChroma",
             "LM chroma prediction",
             "Chroma",
             true,
-            "Enable cross-component linear-model chroma prediction."
+			"Predict chroma samples from reconstructed luma using a fitted linear model, exploiting correlation between brightness and color."
         ),
 
         int_param(
@@ -765,8 +772,8 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "Cb QP offset",
             "Chroma",
             0,
-            { -12, 12, 1 },
-            "Global Cb chroma QP offset."
+            { .min=-12, .max=12, .step=1 },
+			"Adjust blue-difference chroma quantization relative to luma. Positive values compress Cb more; negative values preserve it more."
         ),
 
         int_param(
@@ -774,8 +781,8 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "Cr QP offset",
             "Chroma",
             0,
-            { -12, 12, 1 },
-            "Global Cr chroma QP offset."
+            { .min=-12, .max=12, .step=1 },
+			"Adjust red-difference chroma quantization relative to luma. Positive values compress Cr more; negative values preserve it more."
         ),
 
         int_param(
@@ -783,8 +790,8 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "Cb QP offset, dual tree",
             "Chroma",
             0,
-            { -12, 12, 1 },
-            "Cb QP offset used when dual-tree coding is active."
+            { .min=-12, .max=12, .step=1 },
+			"Cb quantization offset when luma and chroma use separate coding-unit partition trees. Positive values compress Cb more."
         ),
 
         int_param(
@@ -792,8 +799,8 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "Cr QP offset, dual tree",
             "Chroma",
             0,
-            { -12, 12, 1 },
-            "Cr QP offset used when dual-tree coding is active."
+            { .min=-12, .max=12, .step=1 },
+			"Cr quantization offset when luma and chroma use separate coding-unit partition trees. Positive values compress Cr more."
         ),
 
         int_param(
@@ -801,8 +808,9 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "Intra slice Cb QP offset",
             "Chroma",
             0,
-            { -12, 12, 1 },
-            "Slice-level Cb QP offset for intra pictures."
+            { .min=-12, .max=12, .step=1 },
+			"Video-only Cb adjustment for intra or periodically selected pictures; redundant for this single-picture encode.",
+			false
         ),
 
         int_param(
@@ -810,8 +818,9 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "Intra slice Cr QP offset",
             "Chroma",
             0,
-            { -12, 12, 1 },
-            "Slice-level Cr QP offset for intra pictures."
+            { .min=-12, .max=12, .step=1 },
+			"Video-only Cr adjustment for intra or periodically selected pictures; redundant for this single-picture encode.",
+			false
         ),
 
         bool_param(
@@ -819,7 +828,7 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "SAO",
             "Filters",
             true,
-            "Enable sample adaptive offset."
+			"Apply sample-adaptive offset after deblocking to reduce systematic ringing and banding errors."
         ),
 
         bool_param(
@@ -827,7 +836,7 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "ALF",
             "Filters",
             true,
-            "Enable adaptive loop filter."
+			"Apply encoder-selected adaptive filters to reconstructed luma and chroma to reduce distortion."
         ),
 
         bool_param(
@@ -835,7 +844,7 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "CCALF",
             "Filters",
             true,
-            "Enable cross-component adaptive loop filter."
+			"Use filtered luma information to correct correlated chroma reconstruction errors after decoding."
         ),
 
         bool_param(
@@ -843,7 +852,7 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "Disable deblocking",
             "Filters",
             false,
-            "Disable the deblocking loop filter."
+			"Turn off filtering across block boundaries. Disabling it can retain hard edges but usually exposes block artifacts."
         ),
 
         int_param(
@@ -851,8 +860,8 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "Deblocking beta offset / 2",
             "Filters",
             0,
-            { -12, 12, 1 },
-            "Deblocking beta offset divided by two."
+            { .min=-12, .max=12, .step=1 },
+			"Shift the deblocking edge-detection threshold. Higher values make more boundaries eligible for filtering."
         ),
 
         int_param(
@@ -860,8 +869,8 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "Deblocking Tc offset / 2",
             "Filters",
             0,
-            { -12, 12, 1 },
-            "Deblocking Tc offset divided by two."
+            { .min=-12, .max=12, .step=1 },
+			"Shift the deblocking clipping strength. Higher values permit a stronger correction at filtered boundaries."
         ),
 
         enum_param(
@@ -870,14 +879,14 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "VUI / SEI",
             "off",
             {
-                { "off",       "Off" },
-                { "pq",        "PQ" },
-                { "hlg",       "HLG" },
-                { "pq_2020",   "PQ + BT.2020" },
-                { "hlg_2020",  "HLG + BT.2020" },
-                { "sdr_709",   "SDR BT.709" },
-                { "sdr_2020",  "SDR BT.2020" },
-                { "sdr_470bg", "SDR BT.470 B/G" },
+                { .value="off",       .label="Off" },
+                { .value="pq",        .label="PQ" },
+                { .value="hlg",       .label="HLG" },
+                { .value="pq_2020",   .label="PQ + BT.2020" },
+                { .value="hlg_2020",  .label="HLG + BT.2020" },
+                { .value="sdr_709",   .label="SDR BT.709" },
+                { .value="sdr_2020",  .label="SDR BT.2020" },
+                { .value="sdr_470bg", .label="SDR BT.470 B/G" },
             },
 			"HDR / transfer / colorimetry signaling mode.",
 			false
@@ -888,8 +897,8 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "Threads",
             "Execution",
             -1,
-            { -1, 256, 1 },
-            "Number of worker threads. -1 lets VVenC choose automatically."
+            { .min=-1, .max=256, .step=1 },
+			"Maximum encoder worker threads. -1 lets VVenC choose automatically; this changes speed and resource use, not coding tools."
         ),
 
         int_param(
@@ -897,7 +906,7 @@ std::vector<EncoderParamInfo> query_vvenc_parameters() {
             "Tiles",
             "Execution",
             0,
-            { 0, 4096, 1 },
+            { .min=0, .max=4096, .step=1 },
             "Use VVenC's tile option format through string parameters if multi-dimensional tile control is needed.",
             false
         ),
@@ -945,6 +954,8 @@ codec_gui::EncodedImage encode_vvenc_still_image(
             continue;
         }
 
+        if (param.name == "passes" && param_value_to_string(param.value) == "1") continue;
+        if (param.name == "tiles" && param_value_to_string(param.value) == "0") continue;
         if (is_structural_param(param.name) || param.name == "pass" || param.name == "passes") {
             throw std::runtime_error(
                 "parameter '" + param.name + "' is controlled by encode_vvenc_still_image"
@@ -956,7 +967,29 @@ codec_gui::EncodedImage encode_vvenc_still_image(
         }
     }
 
-    EncoderPtr encoder{ vvenc_encoder_create() };
+    // SDR presets rewrite sRGB transfer to BT.709 during config adaptation.
+    // Signal the actual transformed input; retain HDR tuning only for HDR input.
+    if (image.color.transfer != TransferCharacteristics::PQ && image.color.transfer != TransferCharacteristics::HLG)
+        cfg.m_HdrMode = VVENC_HDR_OFF;
+    cfg.m_vuiParametersPresent = 1;
+    cfg.m_colourDescriptionPresent = true;
+    cfg.m_colourPrimaries = static_cast<int>(image.color.primaries);
+    cfg.m_transferCharacteristics = static_cast<int>(image.color.transfer);
+    cfg.m_matrixCoefficients = static_cast<int>(image.color.matrix);
+    cfg.m_videoFullRangeFlag = image.color.range == ColorRange::Full;
+    if (image.color.chroma420Location) {
+        cfg.m_chromaLocInfoPresent = 1;
+        cfg.m_chromaSampleLocType = static_cast<int>(*image.color.chroma420Location);
+    }
+
+	// Presets (notably "slower") may enable BDPCM internally.  The GUI omits
+	// disabled parameters, so enforce the dependency on the final config rather
+	// than relying on an explicit BDPCM=false parameter being present.
+	if (cfg.m_TS == 0) {
+		cfg.m_useBDPCM = 0;
+	}
+
+    EncoderPtr const encoder{ vvenc_encoder_create() };
     if (encoder == nullptr) {
         throw std::runtime_error("vvenc_encoder_create failed");
     }

@@ -1,15 +1,26 @@
+#include "../codec_gui_x265.hpp"
+#include "app_state.hpp"
+#include "draw_list.hpp"
+#include "wayland_window.hpp"
+#include <cstdint>
+#include <ios>
+#include <span>
+#include <vulkan/vulkan_core.h>
 #define VK_USE_PLATFORM_WAYLAND_KHR
 #include "render_vulkan.hpp"
 #include "raw_image_conversion.hpp"
+#include "raw_image_utils.hpp"
 #include "text_atlas.hpp"
+#include "ui_render_frame.hpp"
 
-#include <vulkan/vulkan.h>
 #include <vulkan/vulkan_wayland.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <optional>
@@ -18,6 +29,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <unordered_set>
 
 namespace codec_gui::gui {
 namespace {
@@ -66,25 +78,32 @@ VkSurfaceKHR create_wayland_surface(VkInstance instance, const WaylandWindow& wi
 	return out;
 }
 
-std::vector<uint32_t> read_spirv(const char* path) {
+std::filesystem::path shader_path(const char* filename) {
+	if (const char* assetDir = std::getenv("CODEC_VIS_ASSET_DIR"); assetDir != nullptr && assetDir[0] != '\0') {
+		return std::filesystem::path{assetDir} / filename;
+	}
+	return std::filesystem::path{"build"} / filename;
+}
+
+std::vector<uint32_t> read_spirv(const std::filesystem::path& path) {
 	std::ifstream in(path, std::ios::binary | std::ios::ate);
 	if (!in) {
-		throw std::runtime_error(std::string("failed to open shader: ") + path);
+		throw std::runtime_error("failed to open shader: " + path.string());
 	}
 	const std::streamsize size = in.tellg();
 	if (size <= 0 || (size % 4) != 0) {
-		throw std::runtime_error(std::string("invalid shader size: ") + path);
+		throw std::runtime_error("invalid shader size: " + path.string());
 	}
 	in.seekg(0, std::ios::beg);
 	std::vector<uint32_t> words(static_cast<std::size_t>(size) / 4);
 	in.read(reinterpret_cast<char*>(words.data()), size);
 	if (!in) {
-		throw std::runtime_error(std::string("failed to read shader: ") + path);
+		throw std::runtime_error("failed to read shader: " + path.string());
 	}
 	return words;
 }
 
-VkShaderModule create_shader_module(VkDevice device, const char* path) {
+VkShaderModule create_shader_module(VkDevice device, const std::filesystem::path& path) {
 	const std::vector<uint32_t> code = read_spirv(path);
 	VkShaderModuleCreateInfo info{};
 	info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -96,24 +115,16 @@ VkShaderModule create_shader_module(VkDevice device, const char* path) {
 }
 
 VkSurfaceFormatKHR choose_surface_format(const std::vector<VkSurfaceFormatKHR>& formats) {
-	for (const VkSurfaceFormatKHR& format : formats) {
-		if (format.format == VK_FORMAT_B8G8R8A8_SRGB && format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
-			return format;
-		}
-	}
-	for (const VkSurfaceFormatKHR& format : formats) {
-		if (format.format == VK_FORMAT_B8G8R8A8_UNORM && format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
-			return format;
-		}
-	}
-	if (formats.empty()) {
-		throw std::runtime_error("surface has no supported formats");
-	}
-	return formats.front();
+    // Wayland color management is owned by WaylandWindow. Pass-through prevents
+    // WSI from replacing that description or applying a different interpretation.
+    for (const auto& f : formats)
+        if (f.format == VK_FORMAT_R16G16B16A16_SFLOAT && f.colorSpace == VK_COLOR_SPACE_PASS_THROUGH_EXT)
+            return f;
+    throw std::runtime_error("Linear BT.2020 presentation requires an FP16 pass-through Wayland swapchain");
 }
 
 VkPresentModeKHR choose_present_mode(const std::vector<VkPresentModeKHR>& modes) {
-	for (VkPresentModeKHR mode : modes) {
+	for (VkPresentModeKHR const mode : modes) {
 		if (mode == VK_PRESENT_MODE_MAILBOX_KHR) {
 			return mode;
 		}
@@ -126,26 +137,15 @@ VkExtent2D choose_extent(const VkSurfaceCapabilitiesKHR& caps, const WaylandWind
 		return caps.currentExtent;
 	}
 	VkExtent2D extent{
-		static_cast<uint32_t>(std::max(1, window.framebuffer_width())),
-		static_cast<uint32_t>(std::max(1, window.framebuffer_height())),
+		.width=static_cast<uint32_t>(std::max(1, window.framebuffer_width())),
+		.height=static_cast<uint32_t>(std::max(1, window.framebuffer_height())),
 	};
 	extent.width = std::clamp(extent.width, caps.minImageExtent.width, caps.maxImageExtent.width);
 	extent.height = std::clamp(extent.height, caps.minImageExtent.height, caps.maxImageExtent.height);
 	return extent;
 }
 
-struct RectPushConstants {
-	float rect[4];
-	float color[4];
-	float viewport[2];
-};
 
-struct TextPushConstants {
-	float rect[4];
-	float uv[4];
-	float color[4];
-	float viewport[2];
-};
 
 uint32_t find_memory_type(VkPhysicalDevice physicalDevice, uint32_t typeBits, VkMemoryPropertyFlags properties) {
 	VkPhysicalDeviceMemoryProperties memoryProperties{};
@@ -198,7 +198,7 @@ void create_image(
 	VkImageCreateInfo imageInfo{};
 	imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 	imageInfo.imageType = VK_IMAGE_TYPE_2D;
-	imageInfo.extent = {width, height, 1};
+	imageInfo.extent = {.width=width, .height=height, .depth=1};
 	imageInfo.mipLevels = 1;
 	imageInfo.arrayLayers = 1;
 	imageInfo.format = format;
@@ -251,54 +251,40 @@ VkRect2D clamp_scissor(Rect rect, VkExtent2D extent, float scale = 1.0f) {
 	const float y0f = std::clamp(rect.y * scale, 0.0f, static_cast<float>(extent.height));
 	const float x1f = std::clamp((rect.x + std::max(0.0f, rect.w)) * scale, 0.0f, static_cast<float>(extent.width));
 	const float y1f = std::clamp((rect.y + std::max(0.0f, rect.h)) * scale, 0.0f, static_cast<float>(extent.height));
-	const int32_t x0 = static_cast<int32_t>(std::floor(x0f));
-	const int32_t y0 = static_cast<int32_t>(std::floor(y0f));
-	const int32_t x1 = static_cast<int32_t>(std::ceil(x1f));
-	const int32_t y1 = static_cast<int32_t>(std::ceil(y1f));
-	return VkRect2D{{x0, y0}, {static_cast<uint32_t>(std::max(0, x1 - x0)), static_cast<uint32_t>(std::max(0, y1 - y0))}};
+	const auto x0 = static_cast<int32_t>(std::floor(x0f));
+	const auto y0 = static_cast<int32_t>(std::floor(y0f));
+	const auto x1 = static_cast<int32_t>(std::ceil(x1f));
+	const auto y1 = static_cast<int32_t>(std::ceil(y1f));
+	return VkRect2D{.offset={.x=x0, .y=y0}, .extent={.width=static_cast<uint32_t>(std::max(0, x1 - x0)), .height=static_cast<uint32_t>(std::max(0, y1 - y0))}};
 }
 
 Rect scaled_rect(Rect rect, float scale) {
-	return Rect{rect.x * scale, rect.y * scale, rect.w * scale, rect.h * scale};
+	return Rect{.x=rect.x * scale, .y=rect.y * scale, .w=rect.w * scale, .h=rect.h * scale};
 }
 
 std::size_t swapchain_bytes_per_pixel(VkFormat format) {
-	switch (format) {
-		case VK_FORMAT_B8G8R8A8_SRGB:
-		case VK_FORMAT_B8G8R8A8_UNORM:
-		case VK_FORMAT_R8G8B8A8_SRGB:
-		case VK_FORMAT_R8G8B8A8_UNORM:
-			return 4;
-		default:
-			throw std::runtime_error("pixel probe supports only 8-bit RGBA/BGRA swapchain formats");
-	}
+    if(format!=VK_FORMAT_R16G16B16A16_SFLOAT)throw std::runtime_error("Expected FP16 presentation");
+    return 8;
 }
-
-bool readback_has_non_background_pixels(
-	const std::vector<uint8_t>& bytes,
-	VkExtent2D extent,
-	VkFormat format,
-	Rect probeRect
-) {
-	const std::size_t bpp = swapchain_bytes_per_pixel(format);
-	if (bytes.size() < static_cast<std::size_t>(extent.width) * static_cast<std::size_t>(extent.height) * bpp) {
-		return false;
-	}
-	const VkRect2D probe = clamp_scissor(probeRect, extent);
-	const uint32_t xEnd = probe.offset.x < 0 ? 0u : static_cast<uint32_t>(probe.offset.x) + probe.extent.width;
-	const uint32_t yEnd = probe.offset.y < 0 ? 0u : static_cast<uint32_t>(probe.offset.y) + probe.extent.height;
-	for (uint32_t y = static_cast<uint32_t>(std::max(0, probe.offset.y)); y < yEnd; ++y) {
-		for (uint32_t x = static_cast<uint32_t>(std::max(0, probe.offset.x)); x < xEnd; ++x) {
-			const std::size_t offset = (static_cast<std::size_t>(y) * extent.width + x) * bpp;
-			const uint8_t c0 = bytes[offset + 0];
-			const uint8_t c1 = bytes[offset + 1];
-			const uint8_t c2 = bytes[offset + 2];
-			if (std::max({c0, c1, c2}) > 48 && (std::max({c0, c1, c2}) - std::min({c0, c1, c2}) > 8 || std::max({c0, c1, c2}) > 96)) {
-				return true;
-			}
-		}
-	}
-	return false;
+float decode_half(uint16_t value){
+    const int exponent=(value>>10)&31;
+    const float magnitude=exponent==0?std::ldexp(float(value&1023),-24):
+        exponent==31?std::numeric_limits<float>::infinity():std::ldexp(float(1024+(value&1023)),exponent-25);
+    return value&0x8000?-magnitude:magnitude;
+}
+std::array<float,4> read_linear_pixel(const std::vector<uint8_t>& bytes,std::size_t pixel){
+    std::array<uint16_t,4> half{};std::memcpy(half.data(),bytes.data()+pixel*8,8);
+    return {decode_half(half[0]),decode_half(half[1]),decode_half(half[2]),decode_half(half[3])};
+}
+bool readback_has_non_background_pixels(const std::vector<uint8_t>& bytes,VkExtent2D extent,VkFormat format,Rect rect){
+    if(bytes.size()<std::size_t(extent.width)*extent.height*swapchain_bytes_per_pixel(format))return false;
+    const auto clip=clamp_scissor(rect,extent);
+    for(uint32_t y=clip.offset.y;y<uint32_t(clip.offset.y)+clip.extent.height;++y)
+        for(uint32_t x=clip.offset.x;x<uint32_t(clip.offset.x)+clip.extent.width;++x){
+            auto p=read_linear_pixel(bytes,std::size_t(y)*extent.width+x);
+            if(std::max({p[0],p[1],p[2]})>.15f)return true;
+        }
+    return false;
 }
 
 } // namespace
@@ -313,7 +299,58 @@ struct TransientTextResources {
 	VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
 };
 
+struct LinearizeParameters {
+    std::array<uint32_t,4> geometry{},planes{},strides{};
+    std::array<float,4> chroma{},luma{},row0{},row1{},row2{};
+};
+static_assert(sizeof(LinearizeParameters)==128);
+LinearizeParameters linearize_parameters(const RawImage& raw) {
+    if(raw.width<=0 || raw.height<=0)throw std::invalid_argument("invalid preview dimensions");
+    for(int i=0;i<plane_count(raw.format);++i)if(!plane_available(raw,i))throw std::invalid_argument("incomplete preview plane");
+    switch(raw.color.transfer) {
+        case TransferCharacteristics::BT709:case TransferCharacteristics::BT601:
+        case TransferCharacteristics::BT2020_10:case TransferCharacteristics::BT2020_12:
+        case TransferCharacteristics::Linear:case TransferCharacteristics::SRGB:
+        case TransferCharacteristics::Gamma22:case TransferCharacteristics::Gamma28:
+        case TransferCharacteristics::PQ:case TransferCharacteristics::HLG:break;
+        default:throw std::invalid_argument("unsupported preview transfer");
+    }
+    LinearizeParameters p;
+    p.geometry={uint32_t(raw.width),uint32_t(raw.height),uint32_t(bytes_per_sample(raw.format)),uint32_t(bit_depth(raw.format))};
+    p.planes[3]=(is_rgb(raw.format)?1u:is_gray(raw.format)?2u:0u)|(raw.color.range==ColorRange::Full?4u:0u);
+    uint64_t offset=0;
+    for(int i=0;i<plane_count(raw.format);++i){
+        if(offset>UINT32_MAX)throw std::invalid_argument("preview exceeds Vulkan source addressing limit");
+        p.planes[i]=uint32_t(offset);p.strides[i]=raw.planes[i].strideBytes;
+        offset+=(raw.planes[i].bytes.size()+3)&~std::size_t(3);
+    }
+    p.strides[3]=uint32_t(raw.color.transfer);
+    p.chroma={is_420(raw.format)||is_422(raw.format)?2.f:1.f,is_420(raw.format)?2.f:1.f,0,is_420(raw.format)?.5f:0.f};
+    if(is_420(raw.format)){
+        const int loc=int(raw.color.chroma420Location.value_or(Chroma420SampleLocation::LeftCenter));
+        p.chroma[2]=loc%2?.5f:0.f;p.chroma[3]=loc>=4?1.f:loc>=2?0.f:.5f;
+    }
+    if(!is_rgb(raw.format)&&!is_gray(raw.format)){
+        if(raw.color.matrix==MatrixCoefficients::BT601){p.luma[0]=.299f;p.luma[1]=.114f;}
+        else if(raw.color.matrix==MatrixCoefficients::BT709){p.luma[0]=.2126f;p.luma[1]=.0722f;}
+        else if(raw.color.matrix==MatrixCoefficients::BT2020NonConstant){p.luma[0]=.2627f;p.luma[1]=.0593f;}
+        else throw std::invalid_argument("unsupported preview YUV matrix");
+    }
+    const auto matrix=linear_bt2020_matrix(raw.color.primaries);
+    for(int i=0;i<3;++i){p.row0[i]=float(matrix[i]);p.row1[i]=float(matrix[3+i]);p.row2[i]=float(matrix[6+i]);}
+    p.row0[3]=raw.color.primaries==ColorPrimaries::BT2020?.2627f:raw.color.primaries==ColorPrimaries::DisplayP3?.2289746f:.2126f;
+    p.row2[3]=raw.color.primaries==ColorPrimaries::BT2020?.0593f:raw.color.primaries==ColorPrimaries::DisplayP3?.0792869f:.0722f;
+    p.row1[3]=1-p.row0[3]-p.row2[3];
+    double peak=raw.nominalPeakNits.value_or(1000.);
+    p.luma[2]=float(peak/203.);p.luma[3]=float(std::clamp(1.2+.42*std::log10(std::max(peak,1.)/1000.),1.,1.5)-1.);
+    return p;
+}
+
 struct GpuImageResource {
+	uint64_t previewRevision=0;
+    std::weak_ptr<const RawImage> source;
+    uint64_t lastUsed=0;
+    std::size_t bytes=0;
 	ImageId id;
 	int width = 0;
 	int height = 0;
@@ -340,24 +377,45 @@ struct VulkanRenderer::Impl {
 	bool swapchainTransferSrc = false;
 	std::vector<VkImage> swapchainImages;
 	std::vector<VkImageView> swapchainImageViews;
-	VkRenderPass renderPass = VK_NULL_HANDLE;
-	std::vector<VkFramebuffer> framebuffers;
+	VkDescriptorSetLayout composeSetLayout=VK_NULL_HANDLE;
+    VkPipelineLayout composeLayout=VK_NULL_HANDLE;
+    VkPipeline composePipeline=VK_NULL_HANDLE;
+    VkDescriptorSet composeSet=VK_NULL_HANDLE;
+    VkBuffer tileBuffer=VK_NULL_HANDLE;
+    VkDeviceMemory tileMemory=VK_NULL_HANDLE;
+    void* tileMapped=nullptr;
+    VkDeviceSize tileCapacity=0;
 	VkCommandPool commandPool = VK_NULL_HANDLE;
 	VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
 	VkSemaphore imageAvailable = VK_NULL_HANDLE;
 	std::vector<VkSemaphore> renderFinishedByImage;
 	VkFence inFlight = VK_NULL_HANDLE;
-	VkPipelineLayout rectPipelineLayout = VK_NULL_HANDLE;
-	VkPipeline rectPipeline = VK_NULL_HANDLE;
 	VkDescriptorSetLayout textDescriptorSetLayout = VK_NULL_HANDLE;
 	VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
-	VkPipelineLayout textPipelineLayout = VK_NULL_HANDLE;
-	VkPipeline textPipeline = VK_NULL_HANDLE;
-	VkPipelineLayout imagePipelineLayout = VK_NULL_HANDLE;
-	VkPipeline imagePipeline = VK_NULL_HANDLE;
+	VkDescriptorSetLayout linearizeSetLayout = VK_NULL_HANDLE;
+	VkPipelineLayout linearizeLayout = VK_NULL_HANDLE;
+	VkPipeline linearizePipeline = VK_NULL_HANDLE;
+	VkBuffer linearSource=VK_NULL_HANDLE;
+	VkDeviceMemory linearMemory=VK_NULL_HANDLE;
+	void* linearMapped=nullptr;
+	VkDeviceSize linearCapacity=0;
+	VkBuffer linearStatus=VK_NULL_HANDLE;
+	VkDeviceMemory linearStatusMemory=VK_NULL_HANDLE;
+	uint32_t* linearInvalid=nullptr;
 	TransientTextResources text;
 	std::vector<uint8_t> textAlpha;
+    int textWidth=0,textHeight=0;
+    VkBuffer uiBuffer=VK_NULL_HANDLE;
+    VkDeviceMemory uiMemory=VK_NULL_HANDLE;
+    void* uiMapped=nullptr;
+    VkDeviceSize uiCapacity=0;
+    RendererStatistics statistics;
+    std::vector<Point> probePoints;
+    std::vector<RenderPixel> probeSamples;
+    std::vector<std::array<float,4>> linearProbeSamples;
 	std::vector<GpuImageResource> images;
+    std::optional<std::unordered_set<uint64_t>> requestedImages;
+    uint64_t imageTick=0;
 	std::optional<Rect> pendingProbeRect;
 	bool lastProbeNonblank = false;
 };
@@ -428,7 +486,7 @@ void destroy_gpu_image(VkDevice device, VkDescriptorPool descriptorPool, GpuImag
 }
 
 GpuImageResource* find_gpu_image(std::vector<GpuImageResource>& resources, ImageId id) {
-	const auto it = std::find_if(resources.begin(), resources.end(), [id](const GpuImageResource& resource) {
+	const auto it = std::ranges::find_if(resources, [id](const GpuImageResource& resource) {
 		return resource.id == id;
 	});
 	return it == resources.end() ? nullptr : &*it;
@@ -441,12 +499,12 @@ TransientTextResources create_transient_text(
 	VkDescriptorSetLayout descriptorSetLayout,
 	const TextAtlas& atlas
 ) {
-	if (atlas.width <= 0 || atlas.height <= 0 || atlas.alpha.empty() || atlas.quads.empty()) {
+	if (atlas.width <= 0 || atlas.height <= 0 || atlas.alpha.empty()) {
 		return {};
 	}
 
 	TransientTextResources text;
-	const VkDeviceSize size = static_cast<VkDeviceSize>(atlas.alpha.size());
+	const auto size = static_cast<VkDeviceSize>(atlas.alpha.size());
 	create_buffer(
 		device,
 		physicalDevice,
@@ -558,9 +616,12 @@ VulkanRenderer VulkanRenderer::create(const WaylandWindow& window) {
 			throw std::runtime_error("required Vulkan Wayland surface extensions are unavailable");
 		}
 
-		const char* instanceExts[] = {
+		if (!has_extension(extensions, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))
+            throw std::runtime_error("Vulkan swapchain color-space extension unavailable");
+        const char* const instanceExts[] = {
 			VK_KHR_SURFACE_EXTENSION_NAME,
 			VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME,
+            VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME,
 		};
 		VkApplicationInfo app{};
 		app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -573,7 +634,7 @@ VulkanRenderer VulkanRenderer::create(const WaylandWindow& window) {
 		VkInstanceCreateInfo instanceInfo{};
 		instanceInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
 		instanceInfo.pApplicationInfo = &app;
-		instanceInfo.enabledExtensionCount = 2;
+		instanceInfo.enabledExtensionCount = 3;
 		instanceInfo.ppEnabledExtensionNames = instanceExts;
 		vk_checked(vkCreateInstance(&instanceInfo, nullptr, &impl->instance), "vkCreateInstance");
 
@@ -598,7 +659,7 @@ VulkanRenderer VulkanRenderer::create(const WaylandWindow& window) {
 			for (uint32_t i = 0; i < familyCount; ++i) {
 				VkBool32 present = VK_FALSE;
 				vk_checked(vkGetPhysicalDeviceSurfaceSupportKHR(candidate, i, impl->surface, &present), "vkGetPhysicalDeviceSurfaceSupportKHR");
-				if ((families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0 && present == VK_TRUE) {
+				if ((families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0 && present == VK_TRUE) {
 					impl->physicalDevice = candidate;
 					impl->queueFamily = i;
 					break;
@@ -609,7 +670,7 @@ VulkanRenderer VulkanRenderer::create(const WaylandWindow& window) {
 			}
 		}
 		if (impl->physicalDevice == VK_NULL_HANDLE) {
-			throw std::runtime_error("no Vulkan queue family supports graphics and Wayland presentation");
+			throw std::runtime_error("no Vulkan queue family supports compute and Wayland presentation");
 		}
 
 		VkPhysicalDeviceProperties properties{};
@@ -623,7 +684,7 @@ VulkanRenderer VulkanRenderer::create(const WaylandWindow& window) {
 		queueInfo.queueCount = 1;
 		queueInfo.pQueuePriorities = &priority;
 
-		const char* deviceExts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+		const char* const deviceExts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
 		VkDeviceCreateInfo deviceInfo{};
 		deviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 		deviceInfo.queueCreateInfoCount = 1;
@@ -653,7 +714,7 @@ VulkanRenderer VulkanRenderer::create(const WaylandWindow& window) {
 		}
 		impl->swapchainFormat = surfaceFormat.format;
 		impl->swapchainExtent = choose_extent(surfaceCaps, window);
-		impl->logicalExtent = {static_cast<uint32_t>(std::max(1, window.width())), static_cast<uint32_t>(std::max(1, window.height()))};
+		impl->logicalExtent = {.width=static_cast<uint32_t>(std::max(1, window.width())), .height=static_cast<uint32_t>(std::max(1, window.height()))};
 		impl->outputScale = window.output_scale();
 		impl->swapchainTransferSrc = (surfaceCaps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
 
@@ -665,7 +726,10 @@ VulkanRenderer VulkanRenderer::create(const WaylandWindow& window) {
 		swapchainInfo.imageColorSpace = surfaceFormat.colorSpace;
 		swapchainInfo.imageExtent = impl->swapchainExtent;
 		swapchainInfo.imageArrayLayers = 1;
-		swapchainInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+		const VkImageUsageFlags requiredUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if ((surfaceCaps.supportedUsageFlags & requiredUsage) != requiredUsage)
+            throw std::runtime_error("Wayland swapchain does not support compute storage and clear operations");
+        swapchainInfo.imageUsage = requiredUsage;
 		if (impl->swapchainTransferSrc) {
 			swapchainInfo.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 		}
@@ -702,57 +766,6 @@ VulkanRenderer VulkanRenderer::create(const WaylandWindow& window) {
 			impl->swapchainImageViews.push_back(view);
 		}
 
-		VkAttachmentDescription colorAttachment{};
-		colorAttachment.format = impl->swapchainFormat;
-		colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
-		colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-		colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-		colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-		colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-		colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-		colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-
-		VkAttachmentReference colorRef{};
-		colorRef.attachment = 0;
-		colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-		VkSubpassDescription subpass{};
-		subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-		subpass.colorAttachmentCount = 1;
-		subpass.pColorAttachments = &colorRef;
-
-		VkSubpassDependency dependency{};
-		dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
-		dependency.dstSubpass = 0;
-		dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-		dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-		dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-
-		VkRenderPassCreateInfo renderPassInfo{};
-		renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-		renderPassInfo.attachmentCount = 1;
-		renderPassInfo.pAttachments = &colorAttachment;
-		renderPassInfo.subpassCount = 1;
-		renderPassInfo.pSubpasses = &subpass;
-		renderPassInfo.dependencyCount = 1;
-		renderPassInfo.pDependencies = &dependency;
-		vk_checked(vkCreateRenderPass(impl->device, &renderPassInfo, nullptr, &impl->renderPass), "vkCreateRenderPass");
-
-		impl->framebuffers.reserve(impl->swapchainImageViews.size());
-		for (VkImageView view : impl->swapchainImageViews) {
-			VkFramebufferCreateInfo framebufferInfo{};
-			framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-			framebufferInfo.renderPass = impl->renderPass;
-			framebufferInfo.attachmentCount = 1;
-			framebufferInfo.pAttachments = &view;
-			framebufferInfo.width = impl->swapchainExtent.width;
-			framebufferInfo.height = impl->swapchainExtent.height;
-			framebufferInfo.layers = 1;
-			VkFramebuffer framebuffer = VK_NULL_HANDLE;
-			vk_checked(vkCreateFramebuffer(impl->device, &framebufferInfo, nullptr, &framebuffer), "vkCreateFramebuffer");
-			impl->framebuffers.push_back(framebuffer);
-		}
-
 		VkCommandPoolCreateInfo poolInfo{};
 		poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
 		poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -776,160 +789,75 @@ VulkanRenderer VulkanRenderer::create(const WaylandWindow& window) {
 		fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 		vk_checked(vkCreateFence(impl->device, &fenceInfo, nullptr, &impl->inFlight), "vkCreateFence");
 
-		VkPushConstantRange pushRange{};
-		pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-		pushRange.offset = 0;
-		pushRange.size = sizeof(RectPushConstants);
-		VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
-		pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-		pipelineLayoutInfo.pushConstantRangeCount = 1;
-		pipelineLayoutInfo.pPushConstantRanges = &pushRange;
-		vk_checked(vkCreatePipelineLayout(impl->device, &pipelineLayoutInfo, nullptr, &impl->rectPipelineLayout), "vkCreatePipelineLayout");
-
-		VkShaderModule vert = create_shader_module(impl->device, "build/rect.vert.spv");
-		VkShaderModule frag = create_shader_module(impl->device, "build/rect.frag.spv");
-		VkPipelineShaderStageCreateInfo stages[2]{};
-		stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-		stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-		stages[0].module = vert;
-		stages[0].pName = "main";
-		stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-		stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-		stages[1].module = frag;
-		stages[1].pName = "main";
-
-		VkPipelineVertexInputStateCreateInfo vertexInput{};
-		vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-		VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
-		inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-		inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-		VkPipelineViewportStateCreateInfo viewportState{};
-		viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-		viewportState.viewportCount = 1;
-		viewportState.scissorCount = 1;
-		VkPipelineRasterizationStateCreateInfo rasterizer{};
-		rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-		rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
-		rasterizer.cullMode = VK_CULL_MODE_NONE;
-		rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-		rasterizer.lineWidth = 1.0f;
-		VkPipelineMultisampleStateCreateInfo multisample{};
-		multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-		multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-		VkPipelineColorBlendAttachmentState colorBlendAttachment{};
-		colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-		colorBlendAttachment.blendEnable = VK_TRUE;
-		colorBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-		colorBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-		colorBlendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
-		colorBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-		colorBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-		colorBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
-		VkPipelineColorBlendStateCreateInfo colorBlend{};
-		colorBlend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-		colorBlend.attachmentCount = 1;
-		colorBlend.pAttachments = &colorBlendAttachment;
-		VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
-		VkPipelineDynamicStateCreateInfo dynamicState{};
-		dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-		dynamicState.dynamicStateCount = 2;
-		dynamicState.pDynamicStates = dynamicStates;
-
-		VkGraphicsPipelineCreateInfo pipelineInfo{};
-		pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-		pipelineInfo.stageCount = 2;
-		pipelineInfo.pStages = stages;
-		pipelineInfo.pVertexInputState = &vertexInput;
-		pipelineInfo.pInputAssemblyState = &inputAssembly;
-		pipelineInfo.pViewportState = &viewportState;
-		pipelineInfo.pRasterizationState = &rasterizer;
-		pipelineInfo.pMultisampleState = &multisample;
-		pipelineInfo.pColorBlendState = &colorBlend;
-		pipelineInfo.pDynamicState = &dynamicState;
-		pipelineInfo.layout = impl->rectPipelineLayout;
-		pipelineInfo.renderPass = impl->renderPass;
-		pipelineInfo.subpass = 0;
-		vk_checked(vkCreateGraphicsPipelines(impl->device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &impl->rectPipeline), "vkCreateGraphicsPipelines");
-		vkDestroyShaderModule(impl->device, frag, nullptr);
-		vkDestroyShaderModule(impl->device, vert, nullptr);
-
 		VkDescriptorSetLayoutBinding atlasBinding{};
 		atlasBinding.binding = 0;
 		atlasBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 		atlasBinding.descriptorCount = 1;
-		atlasBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+		atlasBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 		VkDescriptorSetLayoutCreateInfo textSetLayoutInfo{};
 		textSetLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
 		textSetLayoutInfo.bindingCount = 1;
 		textSetLayoutInfo.pBindings = &atlasBinding;
 		vk_checked(vkCreateDescriptorSetLayout(impl->device, &textSetLayoutInfo, nullptr, &impl->textDescriptorSetLayout), "vkCreateDescriptorSetLayout");
 
-		VkDescriptorPoolSize poolSize{};
-		poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-		poolSize.descriptorCount = 64;
+		VkDescriptorPoolSize poolSizes[] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1024},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,8},{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,8}};
 		VkDescriptorPoolCreateInfo descriptorPoolInfo{};
 		descriptorPoolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
 		descriptorPoolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-		descriptorPoolInfo.maxSets = 64;
-		descriptorPoolInfo.poolSizeCount = 1;
-		descriptorPoolInfo.pPoolSizes = &poolSize;
+		descriptorPoolInfo.maxSets = 1024;
+		descriptorPoolInfo.poolSizeCount = 3;
+		descriptorPoolInfo.pPoolSizes = poolSizes;
 		vk_checked(vkCreateDescriptorPool(impl->device, &descriptorPoolInfo, nullptr, &impl->descriptorPool), "vkCreateDescriptorPool");
 
-		VkPushConstantRange textPushRange{};
-		textPushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-		textPushRange.offset = 0;
-		textPushRange.size = sizeof(TextPushConstants);
-		VkPipelineLayoutCreateInfo textPipelineLayoutInfo{};
-		textPipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-		textPipelineLayoutInfo.setLayoutCount = 1;
-		textPipelineLayoutInfo.pSetLayouts = &impl->textDescriptorSetLayout;
-		textPipelineLayoutInfo.pushConstantRangeCount = 1;
-		textPipelineLayoutInfo.pPushConstantRanges = &textPushRange;
-		vk_checked(vkCreatePipelineLayout(impl->device, &textPipelineLayoutInfo, nullptr, &impl->textPipelineLayout), "vkCreatePipelineLayout");
+        VkDescriptorSetLayoutBinding linearBindings[]={{0,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},
+            {1,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},
+            {2,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr}};
+        VkDescriptorSetLayoutCreateInfo linearSet{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        linearSet.bindingCount=3;linearSet.pBindings=linearBindings;
+        vk_checked(vkCreateDescriptorSetLayout(impl->device,&linearSet,nullptr,&impl->linearizeSetLayout),"create linear conversion descriptor layout");
+        VkPushConstantRange linearPush{VK_SHADER_STAGE_COMPUTE_BIT,0,128};
+        VkPipelineLayoutCreateInfo linearLayout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        linearLayout.setLayoutCount=1;linearLayout.pSetLayouts=&impl->linearizeSetLayout;
+        linearLayout.pushConstantRangeCount=1;linearLayout.pPushConstantRanges=&linearPush;
+        vk_checked(vkCreatePipelineLayout(impl->device,&linearLayout,nullptr,&impl->linearizeLayout),"create linear conversion layout");
+        auto linearShader=create_shader_module(impl->device,shader_path("linearize.comp.spv"));
+        VkComputePipelineCreateInfo linearPipeline{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        linearPipeline.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,nullptr,0,VK_SHADER_STAGE_COMPUTE_BIT,linearShader,"main",nullptr};
+        linearPipeline.layout=impl->linearizeLayout;
+        auto linearResult=vkCreateComputePipelines(impl->device,VK_NULL_HANDLE,1,&linearPipeline,nullptr,&impl->linearizePipeline);
+        vkDestroyShaderModule(impl->device,linearShader,nullptr);
+        vk_checked(linearResult,"create linear conversion pipeline");
+        create_buffer(impl->device,impl->physicalDevice,4,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,impl->linearStatus,impl->linearStatusMemory);
+        void* invalid=nullptr;
+        vk_checked(vkMapMemory(impl->device,impl->linearStatusMemory,0,4,0,&invalid),"map conversion status");
+        impl->linearInvalid=static_cast<uint32_t*>(invalid);
 
-		VkShaderModule textVert = create_shader_module(impl->device, "build/text.vert.spv");
-		VkShaderModule textFrag = create_shader_module(impl->device, "build/text.frag.spv");
-		VkPipelineShaderStageCreateInfo textStages[2]{};
-		textStages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-		textStages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-		textStages[0].module = textVert;
-		textStages[0].pName = "main";
-		textStages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-		textStages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-		textStages[1].module = textFrag;
-		textStages[1].pName = "main";
-		pipelineInfo.pStages = textStages;
-		pipelineInfo.layout = impl->textPipelineLayout;
-		vk_checked(vkCreateGraphicsPipelines(impl->device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &impl->textPipeline), "vkCreateGraphicsPipelines");
-		vkDestroyShaderModule(impl->device, textFrag, nullptr);
-		vkDestroyShaderModule(impl->device, textVert, nullptr);
+        VkDescriptorSetLayoutBinding bindings[] = {
+            {0,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},
+            {1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},
+            {2,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr}};
+        VkDescriptorSetLayoutCreateInfo setInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        setInfo.bindingCount=3;setInfo.pBindings=bindings;
+        vk_checked(vkCreateDescriptorSetLayout(impl->device,&setInfo,nullptr,&impl->composeSetLayout),"create compositor descriptor layout");
+        VkDescriptorSetLayout layouts[]={impl->composeSetLayout,impl->textDescriptorSetLayout,impl->textDescriptorSetLayout};
+        VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT,0,96};
+        VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layout.setLayoutCount=3;layout.pSetLayouts=layouts;layout.pushConstantRangeCount=1;layout.pPushConstantRanges=&push;
+        vk_checked(vkCreatePipelineLayout(impl->device,&layout,nullptr,&impl->composeLayout),"create compute compositor layout");
+        auto shader=create_shader_module(impl->device,shader_path("compose.comp.spv"));
+        VkComputePipelineCreateInfo pipeline{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipeline.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,nullptr,0,VK_SHADER_STAGE_COMPUTE_BIT,shader,"main",nullptr};
+        pipeline.layout=impl->composeLayout;
+        auto result=vkCreateComputePipelines(impl->device,VK_NULL_HANDLE,1,&pipeline,nullptr,&impl->composePipeline);
+        vkDestroyShaderModule(impl->device,shader,nullptr);vk_checked(result,"create compute compositor pipeline");
+        VkDescriptorSetAllocateInfo sets{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        sets.descriptorPool=impl->descriptorPool;sets.descriptorSetCount=1;sets.pSetLayouts=&impl->composeSetLayout;
+        vk_checked(vkAllocateDescriptorSets(impl->device,&sets,&impl->composeSet),"allocate compute compositor descriptors");
 
-		VkPipelineLayoutCreateInfo imagePipelineLayoutInfo{};
-		imagePipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-		imagePipelineLayoutInfo.setLayoutCount = 1;
-		imagePipelineLayoutInfo.pSetLayouts = &impl->textDescriptorSetLayout;
-		imagePipelineLayoutInfo.pushConstantRangeCount = 1;
-		imagePipelineLayoutInfo.pPushConstantRanges = &textPushRange;
-		vk_checked(vkCreatePipelineLayout(impl->device, &imagePipelineLayoutInfo, nullptr, &impl->imagePipelineLayout), "vkCreatePipelineLayout");
-
-		VkShaderModule imageVert = create_shader_module(impl->device, "build/text.vert.spv");
-		VkShaderModule imageFrag = create_shader_module(impl->device, "build/image.frag.spv");
-		VkPipelineShaderStageCreateInfo imageStages[2]{};
-		imageStages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-		imageStages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-		imageStages[0].module = imageVert;
-		imageStages[0].pName = "main";
-		imageStages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-		imageStages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-		imageStages[1].module = imageFrag;
-		imageStages[1].pName = "main";
-		pipelineInfo.pStages = imageStages;
-		pipelineInfo.layout = impl->imagePipelineLayout;
-		vk_checked(vkCreateGraphicsPipelines(impl->device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &impl->imagePipeline), "vkCreateGraphicsPipelines");
-		vkDestroyShaderModule(impl->device, imageFrag, nullptr);
-		vkDestroyShaderModule(impl->device, imageVert, nullptr);
 	} catch (...) {
-		VulkanRenderer cleanup(impl);
+		VulkanRenderer const cleanup(impl);
 		throw;
 	}
 	return VulkanRenderer(impl);
@@ -962,10 +890,6 @@ void VulkanRenderer::recreate_swapchain(const WaylandWindow& window) {
 	vk_checked(vkWaitForFences(impl_->device, 1, &impl_->inFlight, VK_TRUE, UINT64_MAX), "vkWaitForFences");
 	vk_checked(vkDeviceWaitIdle(impl_->device), "vkDeviceWaitIdle");
 
-	for (VkFramebuffer framebuffer : impl_->framebuffers) {
-		vkDestroyFramebuffer(impl_->device, framebuffer, nullptr);
-	}
-	impl_->framebuffers.clear();
 	destroy_render_finished_semaphores(impl_->device, impl_->renderFinishedByImage);
 	for (VkImageView view : impl_->swapchainImageViews) {
 		vkDestroyImageView(impl_->device, view, nullptr);
@@ -994,7 +918,7 @@ void VulkanRenderer::recreate_swapchain(const WaylandWindow& window) {
 		imageCount = std::min(imageCount, surfaceCaps.maxImageCount);
 	}
 	impl_->swapchainExtent = choose_extent(surfaceCaps, window);
-	impl_->logicalExtent = {static_cast<uint32_t>(std::max(1, window.width())), static_cast<uint32_t>(std::max(1, window.height()))};
+	impl_->logicalExtent = {.width=static_cast<uint32_t>(std::max(1, window.width())), .height=static_cast<uint32_t>(std::max(1, window.height()))};
 	impl_->outputScale = window.output_scale();
 	impl_->swapchainTransferSrc = (surfaceCaps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
 	VkSwapchainKHR oldSwapchain = impl_->swapchain;
@@ -1006,7 +930,10 @@ void VulkanRenderer::recreate_swapchain(const WaylandWindow& window) {
 	swapchainInfo.imageColorSpace = surfaceFormat.colorSpace;
 	swapchainInfo.imageExtent = impl_->swapchainExtent;
 	swapchainInfo.imageArrayLayers = 1;
-	swapchainInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+	const VkImageUsageFlags requiredUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if ((surfaceCaps.supportedUsageFlags & requiredUsage) != requiredUsage)
+            throw std::runtime_error("Wayland swapchain does not support compute storage and clear operations");
+        swapchainInfo.imageUsage = requiredUsage;
 	if (impl_->swapchainTransferSrc) {
 		swapchainInfo.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 	}
@@ -1043,21 +970,25 @@ void VulkanRenderer::recreate_swapchain(const WaylandWindow& window) {
 		impl_->swapchainImageViews.push_back(view);
 	}
 
-	impl_->framebuffers.reserve(impl_->swapchainImageViews.size());
-	for (VkImageView view : impl_->swapchainImageViews) {
-		VkFramebufferCreateInfo framebufferInfo{};
-		framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-		framebufferInfo.renderPass = impl_->renderPass;
-		framebufferInfo.attachmentCount = 1;
-		framebufferInfo.pAttachments = &view;
-		framebufferInfo.width = impl_->swapchainExtent.width;
-		framebufferInfo.height = impl_->swapchainExtent.height;
-		framebufferInfo.layers = 1;
-		VkFramebuffer framebuffer = VK_NULL_HANDLE;
-		vk_checked(vkCreateFramebuffer(impl_->device, &framebufferInfo, nullptr, &framebuffer), "vkCreateFramebuffer");
-		impl_->framebuffers.push_back(framebuffer);
-	}
 	create_render_finished_semaphores(impl_->device, impl_->swapchainImages.size(), impl_->renderFinishedByImage);
+}
+
+void VulkanRenderer::sync_images(std::span<const ImageObject> images,std::span<const DrawCommand> commands,std::span<const ImageId> keepResident) {
+    if(!valid())throw std::runtime_error("Renderer is not initialized");
+    std::unordered_set<uint64_t> requested;
+    for(const auto& item:compile_paint_scene(commands)) {
+        const auto& command=commands[item.commandIndex];
+        const Rect viewport{0,0,float(impl_->logicalExtent.width),float(impl_->logicalExtent.height)};
+        if(command.kind==DrawCommandKind::Image && ui::valid_rect(ui::intersect(command.rect,ui::intersect(item.clip,viewport)))){
+            requested.insert(command.image.value);if(codec_gui::gui::valid(command.comparisonImage))requested.insert(command.comparisonImage.value);
+        }
+    }
+    // Both members of a comparison must survive single-image blink/Space frames.
+    // Otherwise large A/B images evict and re-upload one another every flip.
+    for(auto id:keepResident)if(codec_gui::gui::valid(id))requested.insert(id.value);
+    impl_->requestedImages=std::move(requested);
+    try{sync_images(images);}catch(...){impl_->requestedImages.reset();throw;}
+    impl_->requestedImages.reset();
 }
 
 void VulkanRenderer::sync_images(std::span<const ImageObject> images) {
@@ -1065,57 +996,89 @@ void VulkanRenderer::sync_images(std::span<const ImageObject> images) {
 		throw std::runtime_error("renderer is not initialized");
 	}
 
-	impl_->images.erase(
-		std::remove_if(impl_->images.begin(), impl_->images.end(), [&](GpuImageResource& resource) {
-			const bool keep = std::any_of(images.begin(), images.end(), [&](const ImageObject& image) {
-				return image.id == resource.id && image.decoded != nullptr;
+    const bool replacing=std::ranges::any_of(impl_->images,[&](const auto& resource){
+        return std::ranges::none_of(images,[&](const auto& image){return image.id==resource.id && image.decoded && image.decoded->width==resource.width && image.decoded->height==resource.height;});
+    });
+    if(replacing)vk_checked(vkDeviceWaitIdle(impl_->device),"wait before replacing decoded preview");
+	std::erase_if(impl_->images, [&](GpuImageResource& resource) {
+			const bool keep = std::ranges::any_of(images, [&](const ImageObject& image) {
+				return image.id == resource.id && image.decoded != nullptr && image.decoded->width==resource.width && image.decoded->height==resource.height;
 			});
 			if (!keep) {
 				destroy_gpu_image(impl_->device, impl_->descriptorPool, resource);
 			}
 			return !keep;
-		}),
-		impl_->images.end()
-	);
+		});
 
+    ++impl_->imageTick;
+    auto wanted=[&](ImageId id){return !impl_->requestedImages || impl_->requestedImages->contains(id.value);};
+    std::size_t requiredBytes=0,requiredCount=0,residentBytes=0;
+    for(auto& resource:impl_->images){residentBytes+=resource.bytes;if(wanted(resource.id))resource.lastUsed=impl_->imageTick;}
+    for(const auto& image:images)if(wanted(image.id) && image.decoded && !find_gpu_image(impl_->images,image.id)) {
+        requiredBytes+=std::size_t(std::max(0,image.decoded->width))*std::size_t(std::max(0,image.decoded->height))*sizeof(float)*4;++requiredCount;
+    }
+    constexpr std::size_t cacheBudget=512ull*1024*1024;
+    while((residentBytes+requiredBytes>cacheBudget || impl_->images.size()+requiredCount>32) && !impl_->images.empty()) {
+        auto oldest=impl_->images.end();
+        for(auto it=impl_->images.begin();it!=impl_->images.end();++it)if(!wanted(it->id) && (oldest==impl_->images.end() || it->lastUsed<oldest->lastUsed))oldest=it;
+        if(oldest==impl_->images.end())break; // Active images are allowed to exceed the idle-cache budget.
+        vk_checked(vkWaitForFences(impl_->device,1,&impl_->inFlight,VK_TRUE,UINT64_MAX),"wait before evicting image");
+        residentBytes-=oldest->bytes;destroy_gpu_image(impl_->device,impl_->descriptorPool,*oldest);impl_->images.erase(oldest);
+    }
 	for (const ImageObject& imageObject : images) {
-		if (imageObject.decoded == nullptr || find_gpu_image(impl_->images, imageObject.id) != nullptr) {
+		auto* existing=find_gpu_image(impl_->images,imageObject.id);
+		if (!wanted(imageObject.id) || imageObject.decoded == nullptr || (existing && existing->source.lock()==imageObject.decoded && existing->previewRevision==imageObject.previewRevision)) {
 			continue;
 		}
 		const RawImage& raw = *imageObject.decoded;
-		const std::vector<uint8_t> rgba = raw_image_to_rgba8(raw);
-		if (rgba.empty()) {
-			continue;
-		}
+		const auto parameters=linearize_parameters(raw);
+        const std::size_t pixels=std::size_t(raw.width)*raw.height;
 
-		VkBuffer stagingBuffer = VK_NULL_HANDLE;
-		VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
-		const VkDeviceSize uploadSize = static_cast<VkDeviceSize>(rgba.size());
+		VkDeviceSize uploadSize=0;
+        for(int i=0;i<plane_count(raw.format);++i)uploadSize+=(raw.planes[i].bytes.size()+3)&~std::size_t(3);
+        VkPhysicalDeviceProperties limits{};vkGetPhysicalDeviceProperties(impl_->physicalDevice,&limits);
+        const bool gpuConversion=uploadSize<=limits.limits.maxStorageBufferRange;
+        std::vector<float> fallback;
+        if(!gpuConversion){
+            const auto linear=raw_image_to_linear_bt2020(raw);fallback.resize(pixels*4);
+            for(std::size_t i=0;i<pixels;++i){for(int p=0;p<3;++p)fallback[i*4+p]=linear.planes[p][i];fallback[i*4+3]=1;}
+            uploadSize=fallback.size()*sizeof(float);
+        }
+        if(impl_->linearCapacity<uploadSize){
+        if(impl_->linearMapped)vkUnmapMemory(impl_->device,impl_->linearMemory);
+        if(impl_->linearSource)vkDestroyBuffer(impl_->device,impl_->linearSource,nullptr);
+        if(impl_->linearMemory)vkFreeMemory(impl_->device,impl_->linearMemory,nullptr);
+        impl_->linearSource=VK_NULL_HANDLE;impl_->linearMemory=VK_NULL_HANDLE;impl_->linearMapped=nullptr;impl_->linearCapacity=0;
 		create_buffer(
 			impl_->device,
 			impl_->physicalDevice,
 			uploadSize,
-			VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+			VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
 			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-			stagingBuffer,
-			stagingMemory
+			impl_->linearSource,
+			impl_->linearMemory
 		);
-		void* mapped = nullptr;
-		vk_checked(vkMapMemory(impl_->device, stagingMemory, 0, uploadSize, 0, &mapped), "vkMapMemory");
-		std::memcpy(mapped, rgba.data(), rgba.size());
-		vkUnmapMemory(impl_->device, stagingMemory);
+        vk_checked(vkMapMemory(impl_->device,impl_->linearMemory,0,uploadSize,0,&impl_->linearMapped),"map conversion source");
+        impl_->linearCapacity=uploadSize;
+        }
+        void* mapped=impl_->linearMapped;
+		if(gpuConversion)for(int i=0;i<plane_count(raw.format);++i)std::memcpy(static_cast<uint8_t*>(mapped)+parameters.planes[i],raw.planes[i].bytes.data(),raw.planes[i].bytes.size());
+        else std::memcpy(mapped,fallback.data(),uploadSize);
 
 		GpuImageResource resource;
+        if(existing)resource=*existing;
 		resource.id = imageObject.id;
+		resource.previewRevision=imageObject.previewRevision;resource.source=imageObject.decoded;resource.lastUsed=impl_->imageTick;resource.bytes=pixels*4*sizeof(float);
 		resource.width = raw.width;
 		resource.height = raw.height;
+        if(!existing){
 		create_image(
 			impl_->device,
 			impl_->physicalDevice,
 			static_cast<uint32_t>(raw.width),
 			static_cast<uint32_t>(raw.height),
-			VK_FORMAT_R8G8B8A8_SRGB,
-			VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+			VK_FORMAT_R32G32B32A32_SFLOAT,
+			VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
 			resource.image,
 			resource.memory
 		);
@@ -1124,7 +1087,7 @@ void VulkanRenderer::sync_images(std::span<const ImageObject> images) {
 		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
 		viewInfo.image = resource.image;
 		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-		viewInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
+		viewInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
 		viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 		viewInfo.subresourceRange.baseMipLevel = 0;
 		viewInfo.subresourceRange.levelCount = 1;
@@ -1162,6 +1125,26 @@ void VulkanRenderer::sync_images(std::span<const ImageObject> images) {
 		write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 		write.pImageInfo = &imageInfo;
 		vkUpdateDescriptorSets(impl_->device, 1, &write, 0, nullptr);
+        }
+
+        VkDescriptorSet convertSet=VK_NULL_HANDLE;
+        *impl_->linearInvalid=0;
+        if(gpuConversion){
+        VkDescriptorSetAllocateInfo descriptorInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        descriptorInfo.descriptorPool=impl_->descriptorPool;descriptorInfo.descriptorSetCount=1;
+        descriptorInfo.pSetLayouts=&impl_->linearizeSetLayout;
+        vk_checked(vkAllocateDescriptorSets(impl_->device,&descriptorInfo,&convertSet),"allocate conversion descriptors");
+        VkDescriptorBufferInfo sourceBuffer{impl_->linearSource,0,uploadSize};
+        VkDescriptorImageInfo destination{VK_NULL_HANDLE,resource.view,VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorBufferInfo statusBuffer{impl_->linearStatus,0,4};
+        *impl_->linearInvalid=0;
+        VkWriteDescriptorSet conversionWrites[3]{};
+        for(auto& w:conversionWrites){w.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;w.dstSet=convertSet;w.descriptorCount=1;}
+        conversionWrites[0].dstBinding=0;conversionWrites[0].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;conversionWrites[0].pBufferInfo=&sourceBuffer;
+        conversionWrites[1].dstBinding=1;conversionWrites[1].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;conversionWrites[1].pImageInfo=&destination;
+        conversionWrites[2].dstBinding=2;conversionWrites[2].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;conversionWrites[2].pBufferInfo=&statusBuffer;
+        vkUpdateDescriptorSets(impl_->device,3,conversionWrites,0,nullptr);
+        }
 
 		vk_checked(vkWaitForFences(impl_->device, 1, &impl_->inFlight, VK_TRUE, UINT64_MAX), "vkWaitForFences");
 		vk_checked(vkResetCommandBuffer(impl_->commandBuffer, 0), "vkResetCommandBuffer");
@@ -1173,28 +1156,34 @@ void VulkanRenderer::sync_images(std::span<const ImageObject> images) {
 			impl_->commandBuffer,
 			resource.image,
 			VK_IMAGE_LAYOUT_UNDEFINED,
-			VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			gpuConversion?VK_IMAGE_LAYOUT_GENERAL:VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 			0,
-			VK_ACCESS_TRANSFER_WRITE_BIT,
+			gpuConversion?VK_ACCESS_SHADER_WRITE_BIT:VK_ACCESS_TRANSFER_WRITE_BIT,
 			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-			VK_PIPELINE_STAGE_TRANSFER_BIT
+			gpuConversion?VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT:VK_PIPELINE_STAGE_TRANSFER_BIT
 		);
-		VkBufferImageCopy copy{};
-		copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		copy.imageSubresource.mipLevel = 0;
-		copy.imageSubresource.baseArrayLayer = 0;
-		copy.imageSubresource.layerCount = 1;
-		copy.imageExtent = {static_cast<uint32_t>(raw.width), static_cast<uint32_t>(raw.height), 1};
-		vkCmdCopyBufferToImage(impl_->commandBuffer, stagingBuffer, resource.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        if(gpuConversion){
+        vkCmdBindPipeline(impl_->commandBuffer,VK_PIPELINE_BIND_POINT_COMPUTE,impl_->linearizePipeline);
+        vkCmdBindDescriptorSets(impl_->commandBuffer,VK_PIPELINE_BIND_POINT_COMPUTE,impl_->linearizeLayout,0,1,&convertSet,0,nullptr);
+        vkCmdPushConstants(impl_->commandBuffer,impl_->linearizeLayout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(parameters),&parameters);
+        vkCmdDispatch(impl_->commandBuffer,(raw.width+15)/16,(raw.height+15)/16,1);
+        VkMemoryBarrier statusBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        statusBarrier.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;statusBarrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(impl_->commandBuffer,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&statusBarrier,0,nullptr,0,nullptr);
+        }else {
+            VkBufferImageCopy copy{};copy.imageSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;copy.imageSubresource.layerCount=1;
+            copy.imageExtent={uint32_t(raw.width),uint32_t(raw.height),1};
+            vkCmdCopyBufferToImage(impl_->commandBuffer,impl_->linearSource,resource.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&copy);
+        }
 		image_barrier(
 			impl_->commandBuffer,
 			resource.image,
-			VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			gpuConversion?VK_IMAGE_LAYOUT_GENERAL:VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 			VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-			VK_ACCESS_TRANSFER_WRITE_BIT,
+			gpuConversion?VK_ACCESS_SHADER_WRITE_BIT:VK_ACCESS_TRANSFER_WRITE_BIT,
 			VK_ACCESS_SHADER_READ_BIT,
-			VK_PIPELINE_STAGE_TRANSFER_BIT,
-			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+			gpuConversion?VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT:VK_PIPELINE_STAGE_TRANSFER_BIT,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
 		);
 		vk_checked(vkEndCommandBuffer(impl_->commandBuffer), "vkEndCommandBuffer");
 		VkSubmitInfo submitInfo{};
@@ -1202,12 +1191,12 @@ void VulkanRenderer::sync_images(std::span<const ImageObject> images) {
 		submitInfo.commandBufferCount = 1;
 		submitInfo.pCommandBuffers = &impl_->commandBuffer;
 		vk_checked(vkResetFences(impl_->device, 1, &impl_->inFlight), "vkResetFences");
-		vk_checked(vkQueueSubmit(impl_->queue, 1, &submitInfo, impl_->inFlight), "vkQueueSubmit");
+	vk_checked(vkQueueSubmit(impl_->queue, 1, &submitInfo, impl_->inFlight), "vkQueueSubmit");
 		vk_checked(vkWaitForFences(impl_->device, 1, &impl_->inFlight, VK_TRUE, UINT64_MAX), "vkWaitForFences");
 
-		vkDestroyBuffer(impl_->device, stagingBuffer, nullptr);
-		vkFreeMemory(impl_->device, stagingMemory, nullptr);
-		impl_->images.push_back(resource);
+        if(convertSet)vkFreeDescriptorSets(impl_->device,impl_->descriptorPool,1,&convertSet);
+		if(*impl_->linearInvalid){if(!existing)destroy_gpu_image(impl_->device,impl_->descriptorPool,resource);throw std::invalid_argument("non-finite linear preview conversion (invalid EOTF domain)");}
+		if(existing)*existing=resource;else impl_->images.push_back(resource);
 	}
 }
 
@@ -1216,8 +1205,6 @@ void VulkanRenderer::render_clear_frame(float r, float g, float b, float a) {
 		throw std::runtime_error("renderer is not initialized");
 	}
 	vk_checked(vkWaitForFences(impl_->device, 1, &impl_->inFlight, VK_TRUE, UINT64_MAX), "vkWaitForFences");
-	vk_checked(vkResetFences(impl_->device, 1, &impl_->inFlight), "vkResetFences");
-
 	uint32_t imageIndex = 0;
 	const VkResult acquire = vkAcquireNextImageKHR(impl_->device, impl_->swapchain, UINT64_MAX, impl_->imageAvailable, VK_NULL_HANDLE, &imageIndex);
 	if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR) {
@@ -1230,21 +1217,17 @@ void VulkanRenderer::render_clear_frame(float r, float g, float b, float a) {
 	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
 	vk_checked(vkBeginCommandBuffer(impl_->commandBuffer, &beginInfo), "vkBeginCommandBuffer");
 
-	VkClearValue clear{};
-	clear.color = VkClearColorValue{{r, g, b, a}};
-	VkRenderPassBeginInfo passInfo{};
-	passInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-	passInfo.renderPass = impl_->renderPass;
-	passInfo.framebuffer = impl_->framebuffers.at(imageIndex);
-	passInfo.renderArea.offset = {0, 0};
-	passInfo.renderArea.extent = impl_->swapchainExtent;
-	passInfo.clearValueCount = 1;
-	passInfo.pClearValues = &clear;
-	vkCmdBeginRenderPass(impl_->commandBuffer, &passInfo, VK_SUBPASS_CONTENTS_INLINE);
-	vkCmdEndRenderPass(impl_->commandBuffer);
+    auto target=impl_->swapchainImages.at(imageIndex);
+    image_barrier(impl_->commandBuffer,target,VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        0,VK_ACCESS_TRANSFER_WRITE_BIT,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkClearColorValue clear{{r,g,b,a}};
+    VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+    vkCmdClearColorImage(impl_->commandBuffer,target,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&clear,1,&range);
+    image_barrier(impl_->commandBuffer,target,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        VK_ACCESS_TRANSFER_WRITE_BIT,0,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
 	vk_checked(vkEndCommandBuffer(impl_->commandBuffer), "vkEndCommandBuffer");
 
-	VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	VkPipelineStageFlags const waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 	VkSubmitInfo submitInfo{};
 	submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 	submitInfo.waitSemaphoreCount = 1;
@@ -1254,6 +1237,7 @@ void VulkanRenderer::render_clear_frame(float r, float g, float b, float a) {
 	submitInfo.pCommandBuffers = &impl_->commandBuffer;
 	submitInfo.signalSemaphoreCount = 1;
 	submitInfo.pSignalSemaphores = &renderFinished;
+	vk_checked(vkResetFences(impl_->device, 1, &impl_->inFlight), "vkResetFences");
 	vk_checked(vkQueueSubmit(impl_->queue, 1, &submitInfo, impl_->inFlight), "vkQueueSubmit");
 
 	VkPresentInfoKHR presentInfo{};
@@ -1278,8 +1262,6 @@ void VulkanRenderer::render_draw_list(const std::vector<DrawCommand>& commands, 
 		throw std::runtime_error("renderer is not initialized");
 	}
 	vk_checked(vkWaitForFences(impl_->device, 1, &impl_->inFlight, VK_TRUE, UINT64_MAX), "vkWaitForFences");
-	vk_checked(vkResetFences(impl_->device, 1, &impl_->inFlight), "vkResetFences");
-
 	uint32_t imageIndex = 0;
 	const VkResult acquire = vkAcquireNextImageKHR(impl_->device, impl_->swapchain, UINT64_MAX, impl_->imageAvailable, VK_NULL_HANDLE, &imageIndex);
 	if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR) {
@@ -1287,21 +1269,98 @@ void VulkanRenderer::render_draw_list(const std::vector<DrawCommand>& commands, 
 	}
 	VkSemaphore renderFinished = impl_->renderFinishedByImage.at(imageIndex);
 
-	bool uploadText = false;
-	if (textAtlas != nullptr && impl_->textPipeline != VK_NULL_HANDLE) {
-		if (impl_->text.image == VK_NULL_HANDLE || impl_->textAlpha != textAtlas->alpha) {
-			destroy_transient_text(impl_->device, impl_->descriptorPool, impl_->text);
-			impl_->text = create_transient_text(
-				impl_->device,
-				impl_->physicalDevice,
-				impl_->descriptorPool,
-				impl_->textDescriptorSetLayout,
-				*textAtlas
-			);
-			impl_->textAlpha = textAtlas->alpha;
-			uploadText = impl_->text.image != VK_NULL_HANDLE;
-		}
-	}
+    // Keep a one-pixel atlas bound even for a frame containing only geometry.
+    TextAtlas fallbackAtlas;
+    if(!textAtlas || textAtlas->alpha.empty()) {
+        fallbackAtlas.width=fallbackAtlas.height=1;fallbackAtlas.alpha={255};textAtlas=&fallbackAtlas;
+    }
+    const auto frame=compile_ui_frame(commands,textAtlas);
+    impl_->statistics={};
+    impl_->statistics.instances=frame.instances.size();
+    impl_->statistics.instanceUploadBytes=frame.instances.size()*sizeof(UiInstance);
+    const VkDeviceSize instanceBytes=std::max<VkDeviceSize>(sizeof(UiInstance),impl_->statistics.instanceUploadBytes);
+    if(instanceBytes>impl_->uiCapacity) {
+        if(impl_->uiMapped)vkUnmapMemory(impl_->device,impl_->uiMemory);
+        impl_->uiMapped=nullptr;
+        if(impl_->uiBuffer)vkDestroyBuffer(impl_->device,impl_->uiBuffer,nullptr);
+        if(impl_->uiMemory)vkFreeMemory(impl_->device,impl_->uiMemory,nullptr);
+        impl_->uiBuffer=VK_NULL_HANDLE;impl_->uiMemory=VK_NULL_HANDLE;
+        impl_->uiCapacity=std::max<VkDeviceSize>(65536,instanceBytes*2);
+        create_buffer(impl_->device,impl_->physicalDevice,impl_->uiCapacity,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,impl_->uiBuffer,impl_->uiMemory);
+        vk_checked(vkMapMemory(impl_->device,impl_->uiMemory,0,impl_->uiCapacity,0,&impl_->uiMapped),"vkMapMemory(UI instances)");
+    }
+    if(!frame.instances.empty())std::memcpy(impl_->uiMapped,frame.instances.data(),impl_->statistics.instanceUploadBytes);
+    const uint32_t gridW=(impl_->swapchainExtent.width+15)/16;
+    const uint32_t gridH=(impl_->swapchainExtent.height+15)/16;
+    std::vector<uint32_t> tiles;
+    std::vector<uint32_t> tileBases(frame.batches.size());
+    std::vector<VkRect2D> batchBounds(frame.batches.size());
+    for(std::size_t bi=0;bi<frame.batches.size();++bi){
+        const auto& batch=frame.batches[bi];
+        Rect bounds{};bool have=false;
+        if(batch.image())bounds=commands[batch.imageCommand].rect;
+        else for(uint32_t i=batch.first;i<batch.first+batch.count;++i){
+            const auto& v=frame.instances[i];
+            const float c=std::abs(std::cos(v.shape[3])),sn=std::abs(std::sin(v.shape[3]));
+            const float w=c*v.rect[2]+sn*v.rect[3],h=sn*v.rect[2]+c*v.rect[3];
+            Rect r{v.rect[0]+(v.rect[2]-w)*.5f,v.rect[1]+(v.rect[3]-h)*.5f,w,h};
+            if(!have){bounds=r;have=true;}else{float x=std::min(bounds.x,r.x),y=std::min(bounds.y,r.y);
+                bounds={x,y,std::max((bounds.x+bounds.w),(r.x+r.w))-x,std::max((bounds.y+bounds.h),(r.y+r.h))-y};}
+        }
+        bounds=ui::intersect(bounds,batch.clip);
+        batchBounds[bi]=clamp_scissor(bounds,impl_->swapchainExtent,impl_->outputScale);
+        if(batch.image())continue;
+        tileBases[bi]=uint32_t(tiles.size());
+        std::vector<std::vector<uint32_t>> bins(std::size_t(gridW)*gridH);
+        for(uint32_t i=batch.first;i<batch.first+batch.count;++i){
+            const auto& v=frame.instances[i];
+            const float c=std::abs(std::cos(v.shape[3])),sn=std::abs(std::sin(v.shape[3]));
+            const float w=c*v.rect[2]+sn*v.rect[3],h=sn*v.rect[2]+c*v.rect[3];
+            Rect r{v.rect[0]+(v.rect[2]-w)*.5f,v.rect[1]+(v.rect[3]-h)*.5f,w,h};
+            auto clip=clamp_scissor(ui::intersect(r,batch.clip),impl_->swapchainExtent,impl_->outputScale);
+            if(!clip.extent.width||!clip.extent.height)continue;
+            for(uint32_t y=uint32_t(clip.offset.y)/16;y<=(uint32_t(clip.offset.y)+clip.extent.height-1)/16;++y)
+                for(uint32_t x=uint32_t(clip.offset.x)/16;x<=(uint32_t(clip.offset.x)+clip.extent.width-1)/16;++x)
+                    bins[y*gridW+x].push_back(i);
+        }
+        tiles.resize(tiles.size()+std::size_t(gridW)*gridH*2);
+        for(std::size_t i=0;i<bins.size();++i){
+            tiles[tileBases[bi]+i*2]=uint32_t(tiles.size());
+            tiles[tileBases[bi]+i*2+1]=uint32_t(bins[i].size());
+            tiles.insert(tiles.end(),bins[i].begin(),bins[i].end());
+        }
+    }
+    const VkDeviceSize tileBytes=std::max<VkDeviceSize>(4,tiles.size()*sizeof(uint32_t));
+    if(tileBytes>impl_->tileCapacity){
+        if(impl_->tileMapped)vkUnmapMemory(impl_->device,impl_->tileMemory);
+        if(impl_->tileBuffer)vkDestroyBuffer(impl_->device,impl_->tileBuffer,nullptr);
+        if(impl_->tileMemory)vkFreeMemory(impl_->device,impl_->tileMemory,nullptr);
+        impl_->tileCapacity=tileBytes*2;
+        create_buffer(impl_->device,impl_->physicalDevice,impl_->tileCapacity,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,impl_->tileBuffer,impl_->tileMemory);
+        vk_checked(vkMapMemory(impl_->device,impl_->tileMemory,0,impl_->tileCapacity,0,&impl_->tileMapped),"map tile lists");
+    }
+    if(!tiles.empty())std::memcpy(impl_->tileMapped,tiles.data(),tiles.size()*sizeof(uint32_t));
+    VkDescriptorImageInfo output{VK_NULL_HANDLE,impl_->swapchainImageViews.at(imageIndex),VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorBufferInfo instances{impl_->uiBuffer,0,instanceBytes},tileInfo{impl_->tileBuffer,0,tileBytes};
+    VkWriteDescriptorSet writes[3]{};
+    for(uint32_t i=0;i<3;++i){writes[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;writes[i].dstSet=impl_->composeSet;
+        writes[i].dstBinding=i;writes[i].descriptorCount=1;writes[i].descriptorType=i?VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;}
+    writes[0].pImageInfo=&output;writes[1].pBufferInfo=&instances;writes[2].pBufferInfo=&tileInfo;
+    vkUpdateDescriptorSets(impl_->device,3,writes,0,nullptr);
+    bool newAtlas=impl_->text.image==VK_NULL_HANDLE || impl_->textWidth!=textAtlas->width || impl_->textHeight!=textAtlas->height;
+    bool uploadText=newAtlas || impl_->textAlpha!=textAtlas->alpha;
+    if(newAtlas) {
+        destroy_transient_text(impl_->device,impl_->descriptorPool,impl_->text);
+        impl_->text=create_transient_text(impl_->device,impl_->physicalDevice,impl_->descriptorPool,impl_->textDescriptorSetLayout,*textAtlas);
+        impl_->textWidth=textAtlas->width;impl_->textHeight=textAtlas->height;
+    } else if(uploadText) {
+        void* mapped=nullptr;
+        vk_checked(vkMapMemory(impl_->device,impl_->text.stagingMemory,0,textAtlas->alpha.size(),0,&mapped),"vkMapMemory(text update)");
+        std::memcpy(mapped,textAtlas->alpha.data(),textAtlas->alpha.size());vkUnmapMemory(impl_->device,impl_->text.stagingMemory);
+    }
+    if(uploadText){impl_->textAlpha=textAtlas->alpha;impl_->statistics.textUploadBytes=textAtlas->alpha.size();}
 	TransientTextResources& text = impl_->text;
 	const std::optional<Rect> probeRect = impl_->pendingProbeRect;
 	impl_->pendingProbeRect.reset();
@@ -1336,11 +1395,11 @@ void VulkanRenderer::render_draw_list(const std::vector<DrawCommand>& commands, 
 		image_barrier(
 			impl_->commandBuffer,
 			text.image,
-			VK_IMAGE_LAYOUT_UNDEFINED,
+			newAtlas ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 			VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-			0,
+			newAtlas ? VkAccessFlags(0) : VkAccessFlags(VK_ACCESS_SHADER_READ_BIT),
 			VK_ACCESS_TRANSFER_WRITE_BIT,
-			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+			newAtlas ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 			VK_PIPELINE_STAGE_TRANSFER_BIT
 		);
 		VkBufferImageCopy copy{};
@@ -1352,9 +1411,9 @@ void VulkanRenderer::render_draw_list(const std::vector<DrawCommand>& commands, 
 		copy.imageSubresource.baseArrayLayer = 0;
 		copy.imageSubresource.layerCount = 1;
 		copy.imageExtent = {
-			static_cast<uint32_t>(textAtlas->width),
-			static_cast<uint32_t>(textAtlas->height),
-			1
+			.width=static_cast<uint32_t>(textAtlas->width),
+			.height=static_cast<uint32_t>(textAtlas->height),
+			.depth=1
 		};
 		vkCmdCopyBufferToImage(impl_->commandBuffer, text.stagingBuffer, text.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 		image_barrier(
@@ -1365,138 +1424,63 @@ void VulkanRenderer::render_draw_list(const std::vector<DrawCommand>& commands, 
 			VK_ACCESS_TRANSFER_WRITE_BIT,
 			VK_ACCESS_SHADER_READ_BIT,
 			VK_PIPELINE_STAGE_TRANSFER_BIT,
-			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
 		);
 	}
 
-	VkClearValue clear{};
-	clear.color = VkClearColorValue{{0.015f, 0.017f, 0.02f, 1.0f}};
-	VkRenderPassBeginInfo passInfo{};
-	passInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-	passInfo.renderPass = impl_->renderPass;
-	passInfo.framebuffer = impl_->framebuffers.at(imageIndex);
-	passInfo.renderArea.offset = {0, 0};
-	passInfo.renderArea.extent = impl_->swapchainExtent;
-	passInfo.clearValueCount = 1;
-	passInfo.pClearValues = &clear;
-	vkCmdBeginRenderPass(impl_->commandBuffer, &passInfo, VK_SUBPASS_CONTENTS_INLINE);
+    auto target=impl_->swapchainImages.at(imageIndex);
+    image_barrier(impl_->commandBuffer,target,VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        0,VK_ACCESS_TRANSFER_WRITE_BIT,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkClearColorValue clear{{.015f,.017f,.02f,1.f}};
+    VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+    vkCmdClearColorImage(impl_->commandBuffer,target,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&clear,1,&range);
+    image_barrier(impl_->commandBuffer,target,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_GENERAL,
+        VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    vkCmdBindPipeline(impl_->commandBuffer,VK_PIPELINE_BIND_POINT_COMPUTE,impl_->composePipeline);
+    struct ComposePush {int32_t bounds[4];float rect[4],uv[4],color[4],params[4];uint32_t meta[4];};
+    static_assert(sizeof(ComposePush)==96);
+    for(std::size_t bi=0;bi<frame.batches.size();++bi){
+        const auto& batch=frame.batches[bi];const auto& clip=batchBounds[bi];
+        if(!clip.extent.width||!clip.extent.height)continue;
+        ComposePush push{};
+        push.bounds[0]=clip.offset.x;push.bounds[1]=clip.offset.y;
+        push.bounds[2]=clip.offset.x+clip.extent.width;push.bounds[3]=clip.offset.y+clip.extent.height;
+        push.params[0]=impl_->outputScale;
+        push.meta[0]=tileBases[bi];push.meta[1]=gridW;
+        VkDescriptorSet sampled=text.descriptorSet,reference=sampled;
+        if(batch.image()){
+            const auto& command=commands[batch.imageCommand];
+            const auto* image=find_gpu_image(impl_->images,command.image);
+            const auto* ref=codec_gui::gui::valid(command.comparisonImage)?find_gpu_image(impl_->images,command.comparisonImage):image;
+            if(!image||!ref)continue;
+            sampled=image->descriptorSet;reference=ref->descriptorSet;
+            push.rect[0]=command.rect.x;push.rect[1]=command.rect.y;push.rect[2]=command.rect.w;push.rect[3]=command.rect.h;
+            push.uv[0]=command.uvRect.x;push.uv[1]=command.uvRect.y;push.uv[2]=command.uvRect.w;push.uv[3]=command.uvRect.h;
+            push.color[0]=command.color.r;push.color[1]=command.color.g;push.color[2]=command.color.b;push.color[3]=command.opacity*command.color.a;
+            push.params[1]=command.differenceGain;push.meta[2]=codec_gui::gui::valid(command.comparisonImage)?2:1;
+        }
+        VkDescriptorSet sets[]={impl_->composeSet,sampled,reference};
+        vkCmdBindDescriptorSets(impl_->commandBuffer,VK_PIPELINE_BIND_POINT_COMPUTE,impl_->composeLayout,0,3,sets,0,nullptr);
+        vkCmdPushConstants(impl_->commandBuffer,impl_->composeLayout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(push),&push);
+        vkCmdDispatch(impl_->commandBuffer,(clip.extent.width+15)/16,(clip.extent.height+15)/16,1);
+        image_barrier(impl_->commandBuffer,target,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_GENERAL,
+            VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        ++impl_->statistics.dispatches;
+    }
+    image_barrier(impl_->commandBuffer,target,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        VK_ACCESS_SHADER_WRITE_BIT,0,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
 
-	VkViewport viewport{};
-	viewport.x = 0;
-	viewport.y = 0;
-	viewport.width = static_cast<float>(impl_->swapchainExtent.width);
-	viewport.height = static_cast<float>(impl_->swapchainExtent.height);
-	viewport.minDepth = 0.0f;
-	viewport.maxDepth = 1.0f;
-	vkCmdSetViewport(impl_->commandBuffer, 0, 1, &viewport);
-	VkRect2D fullScissor{{0, 0}, impl_->swapchainExtent};
-	vkCmdSetScissor(impl_->commandBuffer, 0, 1, &fullScissor);
-	vkCmdBindPipeline(impl_->commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, impl_->rectPipeline);
-
-	std::vector<VkRect2D> scissorStack{fullScissor};
-	auto draw_rect = [&](Rect rect, Color color) {
-		if (rect.w <= 0.0f || rect.h <= 0.0f || color.a <= 0.0f) {
-			return;
-		}
-		RectPushConstants push{
-			{rect.x, rect.y, rect.w, rect.h},
-			{color.r, color.g, color.b, color.a},
-			{static_cast<float>(impl_->logicalExtent.width), static_cast<float>(impl_->logicalExtent.height)}
-		};
-		vkCmdPushConstants(impl_->commandBuffer, impl_->rectPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
-		vkCmdDraw(impl_->commandBuffer, 6, 1, 0, 0);
-	};
-	auto draw_image = [&](const DrawCommand& command) {
-		GpuImageResource* image = find_gpu_image(impl_->images, command.image);
-		if (image == nullptr || image->descriptorSet == VK_NULL_HANDLE) {
-			draw_rect(command.rect, Color{0.035f, 0.04f, 0.046f, 1.0f});
-			return;
-		}
-		vkCmdBindPipeline(impl_->commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, impl_->imagePipeline);
-		vkCmdBindDescriptorSets(impl_->commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, impl_->imagePipelineLayout, 0, 1, &image->descriptorSet, 0, nullptr);
-		TextPushConstants push{
-			{command.rect.x, command.rect.y, command.rect.w, command.rect.h},
-			{command.uvRect.x, command.uvRect.y, command.uvRect.w, command.uvRect.h},
-			{command.color.r, command.color.g, command.color.b, command.opacity},
-			{static_cast<float>(impl_->logicalExtent.width), static_cast<float>(impl_->logicalExtent.height)}
-		};
-		vkCmdPushConstants(impl_->commandBuffer, impl_->imagePipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
-		vkCmdDraw(impl_->commandBuffer, 6, 1, 0, 0);
-		vkCmdBindPipeline(impl_->commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, impl_->rectPipeline);
-	};
-	auto draw_geometry_layer = [&](int layer) {
-		scissorStack.assign(1, fullScissor);
-		vkCmdSetScissor(impl_->commandBuffer, 0, 1, &fullScissor);
-		vkCmdBindPipeline(impl_->commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, impl_->rectPipeline);
-		for (const DrawCommand& command : commands) {
-			if (command.layer != layer) continue;
-			switch (command.kind) {
-			case DrawCommandKind::Rect:
-				draw_rect(command.rect, command.color);
-				break;
-			case DrawCommandKind::Border: {
-				const float t = 1.0f;
-				draw_rect(Rect{command.rect.x, command.rect.y, command.rect.w, t}, command.color);
-				draw_rect(Rect{command.rect.x, command.rect.y + command.rect.h - t, command.rect.w, t}, command.color);
-				draw_rect(Rect{command.rect.x, command.rect.y, t, command.rect.h}, command.color);
-				draw_rect(Rect{command.rect.x + command.rect.w - t, command.rect.y, t, command.rect.h}, command.color);
-				break;
-			}
-			case DrawCommandKind::Image:
-				draw_image(command);
-				break;
-			case DrawCommandKind::ScissorBegin: {
-				VkRect2D scissor = clamp_scissor(command.rect, impl_->swapchainExtent, impl_->outputScale);
-				scissorStack.push_back(scissor);
-				vkCmdSetScissor(impl_->commandBuffer, 0, 1, &scissor);
-				break;
-			}
-			case DrawCommandKind::ScissorEnd:
-				if (scissorStack.size() > 1) {
-					scissorStack.pop_back();
-				}
-				vkCmdSetScissor(impl_->commandBuffer, 0, 1, &scissorStack.back());
-				break;
-			case DrawCommandKind::Text:
-				break;
-			}
-		}
-	};
-	auto draw_text_layer = [&](int layer) {
-		if (text.image == VK_NULL_HANDLE || textAtlas == nullptr) return;
-		vkCmdBindPipeline(impl_->commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, impl_->textPipeline);
-		vkCmdBindDescriptorSets(impl_->commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, impl_->textPipelineLayout, 0, 1, &text.descriptorSet, 0, nullptr);
-		for (const GlyphQuad& quad : textAtlas->quads) {
-			if (quad.layer != layer || quad.rect.w <= 0.0f || quad.rect.h <= 0.0f || quad.color.a <= 0.0f) {
-				continue;
-			}
-			const VkRect2D clip = clamp_scissor(quad.clip, impl_->swapchainExtent, impl_->outputScale);
-			vkCmdSetScissor(impl_->commandBuffer, 0, 1, &clip);
-			TextPushConstants push{
-				{quad.rect.x, quad.rect.y, quad.rect.w, quad.rect.h},
-				{quad.uv.x, quad.uv.y, quad.uv.w, quad.uv.h},
-				{quad.color.r, quad.color.g, quad.color.b, quad.color.a},
-				{static_cast<float>(impl_->logicalExtent.width), static_cast<float>(impl_->logicalExtent.height)}
-			};
-			vkCmdPushConstants(impl_->commandBuffer, impl_->textPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
-			vkCmdDraw(impl_->commandBuffer, 6, 1, 0, 0);
-		}
-	};
-	draw_geometry_layer(0);
-	draw_text_layer(0);
-	draw_geometry_layer(1);
-	draw_text_layer(1);
-
-	vkCmdEndRenderPass(impl_->commandBuffer);
 	if (probeRect) {
 		image_barrier(
 			impl_->commandBuffer,
 			impl_->swapchainImages.at(imageIndex),
 			VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
 			VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-			VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			VK_ACCESS_SHADER_WRITE_BIT,
 			VK_ACCESS_TRANSFER_READ_BIT,
-			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
 			VK_PIPELINE_STAGE_TRANSFER_BIT
 		);
 		VkBufferImageCopy copy{};
@@ -1504,7 +1488,7 @@ void VulkanRenderer::render_draw_list(const std::vector<DrawCommand>& commands, 
 		copy.imageSubresource.mipLevel = 0;
 		copy.imageSubresource.baseArrayLayer = 0;
 		copy.imageSubresource.layerCount = 1;
-		copy.imageExtent = {impl_->swapchainExtent.width, impl_->swapchainExtent.height, 1};
+		copy.imageExtent = {.width=impl_->swapchainExtent.width, .height=impl_->swapchainExtent.height, .depth=1};
 		vkCmdCopyImageToBuffer(
 			impl_->commandBuffer,
 			impl_->swapchainImages.at(imageIndex),
@@ -1525,7 +1509,7 @@ void VulkanRenderer::render_draw_list(const std::vector<DrawCommand>& commands, 
 		);
 	}
 	vk_checked(vkEndCommandBuffer(impl_->commandBuffer), "vkEndCommandBuffer");
-	VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	VkPipelineStageFlags const waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 	VkSubmitInfo submitInfo{};
 	submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 	submitInfo.waitSemaphoreCount = 1;
@@ -1535,6 +1519,7 @@ void VulkanRenderer::render_draw_list(const std::vector<DrawCommand>& commands, 
 	submitInfo.pCommandBuffers = &impl_->commandBuffer;
 	submitInfo.signalSemaphoreCount = 1;
 	submitInfo.pSignalSemaphores = &renderFinished;
+	vk_checked(vkResetFences(impl_->device, 1, &impl_->inFlight), "vkResetFences");
 	vk_checked(vkQueueSubmit(impl_->queue, 1, &submitInfo, impl_->inFlight), "vkQueueSubmit");
 
 	VkPresentInfoKHR presentInfo{};
@@ -1555,6 +1540,20 @@ void VulkanRenderer::render_draw_list(const std::vector<DrawCommand>& commands, 
 		vk_checked(vkMapMemory(impl_->device, readbackMemory, 0, readbackSize, 0, &mapped), "vkMapMemory");
 		std::memcpy(pixels.data(), mapped, pixels.size());
 		vkUnmapMemory(impl_->device, readbackMemory);
+        impl_->probeSamples.clear();
+        impl_->linearProbeSamples.clear();
+        for(const auto& point:impl_->probePoints) {
+            if(!std::isfinite(point.x) || !std::isfinite(point.y) || point.x<0 || point.y<0 ||
+               point.x>=impl_->logicalExtent.width || point.y>=impl_->logicalExtent.height)
+                throw std::invalid_argument("Pixel probe is outside the window");
+            const auto x=std::min(impl_->swapchainExtent.width-1,uint32_t(point.x*impl_->outputScale));
+            const auto y=std::min(impl_->swapchainExtent.height-1,uint32_t(point.y*impl_->outputScale));
+            const auto value=read_linear_pixel(pixels,std::size_t(y)*impl_->swapchainExtent.width+x);
+            impl_->linearProbeSamples.push_back(value);
+            auto byte=[](float x){return uint8_t(std::lround(std::clamp(x,0.f,1.f)*255));};
+            impl_->probeSamples.push_back({byte(value[0]),byte(value[1]),byte(value[2]),byte(value[3])});
+        }
+        impl_->probePoints.clear();
 		impl_->lastProbeNonblank = readback_has_non_background_pixels(pixels, impl_->swapchainExtent, impl_->swapchainFormat, scaled_rect(*probeRect, impl_->outputScale));
 		vkDestroyBuffer(impl_->device, readbackBuffer, nullptr);
 		vkFreeMemory(impl_->device, readbackMemory, nullptr);
@@ -1574,6 +1573,66 @@ bool VulkanRenderer::render_draw_list_pixel_probe(
 	return impl_->lastProbeNonblank;
 }
 
+std::vector<std::array<float,4>> VulkanRenderer::read_image_samples(ImageId id,std::span<const Point> positions){
+    if(!valid())throw std::runtime_error("Renderer is not initialized");
+    const auto* image=find_gpu_image(impl_->images,id);
+    if(!image)throw std::invalid_argument("Image is not resident");
+    if(positions.empty())return {};
+    std::vector<VkBufferImageCopy> copies;
+    for(std::size_t i=0;i<positions.size();++i){
+        const auto p=positions[i];
+        if(!std::isfinite(p.x)||!std::isfinite(p.y)||p.x<0||p.y<0||p.x>=image->width||p.y>=image->height)throw std::invalid_argument("Image sample is outside the image");
+        VkBufferImageCopy copy{};copy.bufferOffset=i*sizeof(float)*4;
+        copy.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};copy.imageOffset={int(p.x),int(p.y),0};copy.imageExtent={1,1,1};copies.push_back(copy);
+    }
+    vk_checked(vkWaitForFences(impl_->device,1,&impl_->inFlight,VK_TRUE,UINT64_MAX),"wait for image samples");
+    VkBuffer buffer=VK_NULL_HANDLE;VkDeviceMemory memory=VK_NULL_HANDLE;
+    const VkDeviceSize bytes=positions.size()*sizeof(float)*4;
+    try {
+        create_buffer(impl_->device,impl_->physicalDevice,bytes,VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,buffer,memory);
+        vk_checked(vkResetCommandBuffer(impl_->commandBuffer,0),"reset for image samples");
+        VkCommandBufferBeginInfo begin{};begin.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        vk_checked(vkBeginCommandBuffer(impl_->commandBuffer,&begin),"begin image samples");
+        image_barrier(impl_->commandBuffer,image->image,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_ACCESS_SHADER_READ_BIT,VK_ACCESS_TRANSFER_READ_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT);
+        vkCmdCopyImageToBuffer(impl_->commandBuffer,image->image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,buffer,uint32_t(copies.size()),copies.data());
+        image_barrier(impl_->commandBuffer,image->image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_TRANSFER_READ_BIT,VK_ACCESS_SHADER_READ_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        vk_checked(vkEndCommandBuffer(impl_->commandBuffer),"end image samples");
+        VkSubmitInfo submit{};submit.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO;submit.commandBufferCount=1;submit.pCommandBuffers=&impl_->commandBuffer;
+        vk_checked(vkResetFences(impl_->device,1,&impl_->inFlight),"reset image sample fence");
+        vk_checked(vkQueueSubmit(impl_->queue,1,&submit,impl_->inFlight),"submit image samples");
+        vk_checked(vkWaitForFences(impl_->device,1,&impl_->inFlight,VK_TRUE,UINT64_MAX),"wait for image sample transfer");
+        std::vector<std::array<float,4>> result(positions.size());void* mapped=nullptr;
+        vk_checked(vkMapMemory(impl_->device,memory,0,bytes,0,&mapped),"map image samples");
+        std::memcpy(result.data(),mapped,bytes);vkUnmapMemory(impl_->device,memory);
+        vkDestroyBuffer(impl_->device,buffer,nullptr);vkFreeMemory(impl_->device,memory,nullptr);return result;
+    }catch(...){if(buffer)vkDestroyBuffer(impl_->device,buffer,nullptr);if(memory)vkFreeMemory(impl_->device,memory,nullptr);throw;}
+}
+
+RendererStatistics VulkanRenderer::statistics()const{
+    if(!impl_)return {};
+    auto result=impl_->statistics;result.residentImages=impl_->images.size();
+    for(const auto& image:impl_->images)result.residentImageBytes+=image.bytes;
+    return result;
+}
+std::vector<RenderPixel> VulkanRenderer::render_draw_list_samples(const std::vector<DrawCommand>& commands,const TextAtlas* atlas,std::span<const Point> points) {
+    if(!valid())throw std::runtime_error("Renderer is not initialized");
+    for(auto p:points)if(!std::isfinite(p.x)||!std::isfinite(p.y)||p.x<0||p.y<0||p.x>=impl_->logicalExtent.width||p.y>=impl_->logicalExtent.height)
+        throw std::invalid_argument("Pixel probe is outside the window");
+    impl_->probePoints.assign(points.begin(),points.end());
+    impl_->pendingProbeRect=Rect{0,0,float(impl_->logicalExtent.width),float(impl_->logicalExtent.height)};
+    render_draw_list(commands,atlas);
+    return impl_->probeSamples;
+}
+
+std::vector<std::array<float,4>> VulkanRenderer::render_draw_list_linear_samples(
+    const std::vector<DrawCommand>& commands,const TextAtlas* atlas,std::span<const Point> points){
+    (void)render_draw_list_samples(commands,atlas,points);
+    return impl_->linearProbeSamples;
+}
+
 void VulkanRenderer::reset() {
 	if (impl_ == nullptr) {
 		return;
@@ -1581,33 +1640,33 @@ void VulkanRenderer::reset() {
 	if (impl_->device != VK_NULL_HANDLE) {
 		vkDeviceWaitIdle(impl_->device);
 		destroy_transient_text(impl_->device, impl_->descriptorPool, impl_->text);
+        if(impl_->composePipeline)vkDestroyPipeline(impl_->device,impl_->composePipeline,nullptr);
+        if(impl_->composeLayout)vkDestroyPipelineLayout(impl_->device,impl_->composeLayout,nullptr);
+        if(impl_->composeSetLayout)vkDestroyDescriptorSetLayout(impl_->device,impl_->composeSetLayout,nullptr);
+        if(impl_->tileMapped)vkUnmapMemory(impl_->device,impl_->tileMemory);
+        if(impl_->tileBuffer)vkDestroyBuffer(impl_->device,impl_->tileBuffer,nullptr);
+        if(impl_->tileMemory)vkFreeMemory(impl_->device,impl_->tileMemory,nullptr);
+        if(impl_->uiMapped)vkUnmapMemory(impl_->device,impl_->uiMemory);
+        if(impl_->uiBuffer)vkDestroyBuffer(impl_->device,impl_->uiBuffer,nullptr);
+        if(impl_->uiMemory)vkFreeMemory(impl_->device,impl_->uiMemory,nullptr);
 		impl_->textAlpha.clear();
 		for (GpuImageResource& image : impl_->images) {
 			destroy_gpu_image(impl_->device, impl_->descriptorPool, image);
 		}
-		if (impl_->imagePipeline != VK_NULL_HANDLE) {
-			vkDestroyPipeline(impl_->device, impl_->imagePipeline, nullptr);
-		}
-		if (impl_->imagePipelineLayout != VK_NULL_HANDLE) {
-			vkDestroyPipelineLayout(impl_->device, impl_->imagePipelineLayout, nullptr);
-		}
-		if (impl_->textPipeline != VK_NULL_HANDLE) {
-			vkDestroyPipeline(impl_->device, impl_->textPipeline, nullptr);
-		}
-		if (impl_->textPipelineLayout != VK_NULL_HANDLE) {
-			vkDestroyPipelineLayout(impl_->device, impl_->textPipelineLayout, nullptr);
-		}
+        if(impl_->linearizePipeline)vkDestroyPipeline(impl_->device,impl_->linearizePipeline,nullptr);
+        if(impl_->linearizeLayout)vkDestroyPipelineLayout(impl_->device,impl_->linearizeLayout,nullptr);
+        if(impl_->linearizeSetLayout)vkDestroyDescriptorSetLayout(impl_->device,impl_->linearizeSetLayout,nullptr);
+        if(impl_->linearMapped)vkUnmapMemory(impl_->device,impl_->linearMemory);
+        if(impl_->linearSource)vkDestroyBuffer(impl_->device,impl_->linearSource,nullptr);
+        if(impl_->linearMemory)vkFreeMemory(impl_->device,impl_->linearMemory,nullptr);
+        if(impl_->linearInvalid)vkUnmapMemory(impl_->device,impl_->linearStatusMemory);
+        if(impl_->linearStatus)vkDestroyBuffer(impl_->device,impl_->linearStatus,nullptr);
+        if(impl_->linearStatusMemory)vkFreeMemory(impl_->device,impl_->linearStatusMemory,nullptr);
 		if (impl_->descriptorPool != VK_NULL_HANDLE) {
 			vkDestroyDescriptorPool(impl_->device, impl_->descriptorPool, nullptr);
 		}
 		if (impl_->textDescriptorSetLayout != VK_NULL_HANDLE) {
 			vkDestroyDescriptorSetLayout(impl_->device, impl_->textDescriptorSetLayout, nullptr);
-		}
-		if (impl_->rectPipeline != VK_NULL_HANDLE) {
-			vkDestroyPipeline(impl_->device, impl_->rectPipeline, nullptr);
-		}
-		if (impl_->rectPipelineLayout != VK_NULL_HANDLE) {
-			vkDestroyPipelineLayout(impl_->device, impl_->rectPipelineLayout, nullptr);
 		}
 		if (impl_->inFlight != VK_NULL_HANDLE) {
 			vkDestroyFence(impl_->device, impl_->inFlight, nullptr);
@@ -1618,12 +1677,6 @@ void VulkanRenderer::reset() {
 		}
 		if (impl_->commandPool != VK_NULL_HANDLE) {
 			vkDestroyCommandPool(impl_->device, impl_->commandPool, nullptr);
-		}
-		for (VkFramebuffer framebuffer : impl_->framebuffers) {
-			vkDestroyFramebuffer(impl_->device, framebuffer, nullptr);
-		}
-		if (impl_->renderPass != VK_NULL_HANDLE) {
-			vkDestroyRenderPass(impl_->device, impl_->renderPass, nullptr);
 		}
 		for (VkImageView view : impl_->swapchainImageViews) {
 			vkDestroyImageView(impl_->device, view, nullptr);

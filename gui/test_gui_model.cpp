@@ -1,3 +1,5 @@
+#include "test_check.hpp"
+#include "../codec_gui_x265.hpp"
 #include "app_state.hpp"
 #include "layout.hpp"
 #include "viewer_model.hpp"
@@ -7,7 +9,9 @@
 #include <cmath>
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace codec_gui;
@@ -41,18 +45,21 @@ AppState load_source(AppState state) {
 
 int main() {
 	{
-		AppState state = load_source({});
-		assert(state.images.size() == 1);
-		assert(state.images.front().type == ImageObjectType::Source);
-		assert(state.images.front().displayName == "source.jpg");
-		assert(state.panes.size() == 1);
-		assert(state.panes.front().image == state.images.front().id);
-		assert(state.selection.selectedImage == state.images.front().id);
-		assert(state.viewMode.kind == ViewModeKind::Single);
-		assert(state.viewMode.paneOrder.size() == 1);
-		assert(state.panes.front().transform.centerX == 320.0);
-		assert(state.panes.front().transform.centerY == 240.0);
-		assert(state.panes.front().transform.scale > 0.0);
+		AppState pendingImport;
+		pendingImport.interaction.importPending = true;
+		AppState state = load_source(std::move(pendingImport));
+		CODEC_VIS_CHECK(!state.interaction.importPending);
+		CODEC_VIS_CHECK(state.images.size() == 1);
+		CODEC_VIS_CHECK(state.images.front().type == ImageObjectType::Source);
+		CODEC_VIS_CHECK(state.images.front().displayName == "source.jpg");
+		CODEC_VIS_CHECK(state.panes.size() == 1);
+		CODEC_VIS_CHECK(state.panes.front().image == state.images.front().id);
+		CODEC_VIS_CHECK(state.selection.selectedImage == state.images.front().id);
+		CODEC_VIS_CHECK(state.viewMode.kind == ViewModeKind::Single);
+		CODEC_VIS_CHECK(state.viewMode.paneOrder.size() == 1);
+		CODEC_VIS_CHECK(state.panes.front().transform.centerX == 320.0);
+		CODEC_VIS_CHECK(state.panes.front().transform.centerY == 240.0);
+		CODEC_VIS_CHECK(state.panes.front().transform.scale > 0.0);
 	}
 
 	{
@@ -68,12 +75,12 @@ int main() {
 		stale.selection.activePane = staleB.id;
 
 		stale = load_source(std::move(stale));
-		assert(stale.panes.size() == 1);
-		assert(stale.viewMode.kind == ViewModeKind::Single);
-		assert(stale.viewMode.paneOrder.size() == 1);
-		assert(stale.viewMode.paneOrder.front() == stale.panes.front().id);
-		assert(stale.selection.activePane == stale.panes.front().id);
-		assert(stale.panes.front().image == stale.images.front().id);
+		CODEC_VIS_CHECK(stale.panes.size() == 1);
+		CODEC_VIS_CHECK(stale.viewMode.kind == ViewModeKind::Single);
+		CODEC_VIS_CHECK(stale.viewMode.paneOrder.size() == 1);
+		CODEC_VIS_CHECK(stale.viewMode.paneOrder.front() == stale.panes.front().id);
+		CODEC_VIS_CHECK(stale.selection.activePane == stale.panes.front().id);
+		CODEC_VIS_CHECK(stale.panes.front().image == stale.images.front().id);
 	}
 
 	{
@@ -101,14 +108,14 @@ int main() {
 		failed.kind = ActionKind::SourceLoadFailed;
 		failed.text = "decode failed";
 		state = update(std::move(state), failed).state;
-		assert(!state.interaction.importPending);
-		assert(state.images.size() == 2);
-		assert(state.images.front().id == sourceId);
-		assert(state.images.back().id == encoded.id);
-		assert(state.encodeRuns.size() == 1);
-		assert(state.encodeRuns.front().id == run.id);
-		assert(!state.errors.empty());
-		assert(state.errors.back().message == "decode failed");
+		CODEC_VIS_CHECK(!state.interaction.importPending);
+		CODEC_VIS_CHECK(state.images.size() == 2);
+		CODEC_VIS_CHECK(state.images.front().id == sourceId);
+		CODEC_VIS_CHECK(state.images.back().id == encoded.id);
+		CODEC_VIS_CHECK(state.encodeRuns.size() == 1);
+		CODEC_VIS_CHECK(state.encodeRuns.front().id == run.id);
+		CODEC_VIS_CHECK(!state.errors.empty());
+		CODEC_VIS_CHECK(state.errors.back().message == "decode failed");
 	}
 
 	{
@@ -127,17 +134,17 @@ int main() {
 		duplicate.kind = ActionKind::DuplicatePane;
 		duplicate.pane = state.panes.front().id;
 		state = update(std::move(state), duplicate).state;
-		assert(state.panes.size() == 2);
+		CODEC_VIS_CHECK(state.panes.size() == 2);
 
 		Action assign;
 		assign.kind = ActionKind::AssignImageToPane;
 		assign.pane = state.panes.back().id;
 		assign.image = encoded.id;
 		UpdateResult result = update(std::move(state), assign);
-		assert(result.state.panes.back().image == encoded.id);
-		assert(result.state.selection.selectedImage == encoded.id);
-		assert(result.state.panes.front().image == sourceId);
-		assert(!result.commands.empty());
+		CODEC_VIS_CHECK(result.state.panes.back().image == encoded.id);
+		CODEC_VIS_CHECK(result.state.selection.selectedImage == encoded.id);
+		CODEC_VIS_CHECK(result.state.panes.front().image == sourceId);
+		CODEC_VIS_CHECK(!result.commands.empty());
 	}
 
 	{
@@ -166,7 +173,7 @@ int main() {
 			assign.image = imageIds[static_cast<std::size_t>(i + 1)];
 			state = update(std::move(state), assign).state;
 		}
-		assert(state.panes.size() == 3);
+		CODEC_VIS_CHECK(state.panes.size() == 3);
 		const PaneId thirdPane = state.panes[2].id;
 		const ImageId thirdImage = *state.panes[2].image;
 
@@ -174,20 +181,20 @@ int main() {
 		single.kind = ActionKind::SetViewMode;
 		single.viewMode = ViewModeKind::Single;
 		state = update(std::move(state), single).state;
-		assert(state.panes.size() == 3);
-		assert(state.panes[2].id == thirdPane);
-		assert(state.panes[2].image == thirdImage);
-		assert(state.viewMode.paneOrder.size() == 3);
-		std::vector<PaneRect> singleRects = compute_pane_rects(state.viewMode, state.panes, Rect{0, 0, 600, 400});
-		assert(singleRects.size() == 1);
+		CODEC_VIS_CHECK(state.panes.size() == 3);
+		CODEC_VIS_CHECK(state.panes[2].id == thirdPane);
+		CODEC_VIS_CHECK(state.panes[2].image == thirdImage);
+		CODEC_VIS_CHECK(state.viewMode.paneOrder.size() == 3);
+		std::vector<PaneRect> const singleRects = compute_pane_rects(state.viewMode, state.panes, Rect{.x=0, .y=0, .w=600, .h=400});
+		CODEC_VIS_CHECK(singleRects.size() == 1);
 
 		Action grid;
 		grid.kind = ActionKind::SetViewMode;
 		grid.viewMode = ViewModeKind::Grid;
 		state = update(std::move(state), grid).state;
-		std::vector<PaneRect> gridRects = compute_pane_rects(state.viewMode, state.panes, Rect{0, 0, 600, 400});
-		assert(gridRects.size() == 3);
-		assert(state.panes[2].image == thirdImage);
+		std::vector<PaneRect> const gridRects = compute_pane_rects(state.viewMode, state.panes, Rect{.x=0, .y=0, .w=600, .h=400});
+		CODEC_VIS_CHECK(gridRects.size() == 3);
+		CODEC_VIS_CHECK(state.panes[2].image == thirdImage);
 	}
 
 	{
@@ -206,10 +213,10 @@ int main() {
 		create.image = state.images.front().id;
 		create.otherImage = encoded.id;
 		UpdateResult result = update(std::move(state), create);
-		assert(result.commands.size() == 1);
-		assert(result.commands.front().kind == CommandKind::ComputeDerivedImage);
-		assert(result.commands.front().image == create.image);
-		assert(result.commands.front().otherImage == encoded.id);
+		CODEC_VIS_CHECK(result.commands.size() == 1);
+		CODEC_VIS_CHECK(result.commands.front().kind == CommandKind::ComputeDerivedImage);
+		CODEC_VIS_CHECK(result.commands.front().image == create.image);
+		CODEC_VIS_CHECK(result.commands.front().otherImage == encoded.id);
 	}
 
 	{
@@ -219,27 +226,27 @@ int main() {
 		split.kind = ActionKind::SetViewMode;
 		split.viewMode = ViewModeKind::Split;
 		state = update(std::move(state), split).state;
-		assert(state.viewMode.kind == ViewModeKind::Split);
-		assert(state.panes.size() == 2);
-		assert(state.viewMode.paneOrder.size() == 2);
-		assert(std::fabs(state.panes.front().transform.scale - 1.0) < 0.001);
+		CODEC_VIS_CHECK(state.viewMode.kind == ViewModeKind::Split);
+		CODEC_VIS_CHECK(state.panes.size() == 2);
+		CODEC_VIS_CHECK(state.viewMode.paneOrder.size() == 2);
+		CODEC_VIS_CHECK(std::fabs(state.panes.front().transform.scale - 1.0) < 0.001);
 
-		const std::vector<PaneRect> rects = compute_pane_rects(state.viewMode, state.panes, Rect{10, 20, 1000, 500});
-		assert(rects.size() == 2);
-		assert(std::fabs(rects[0].rect.w - 500.0f) < 0.01f);
-		assert(std::fabs(rects[1].rect.x - 510.0f) < 0.01f);
+		const std::vector<PaneRect> rects = compute_pane_rects(state.viewMode, state.panes, Rect{.x=10, .y=20, .w=1000, .h=500});
+		CODEC_VIS_CHECK(rects.size() == 2);
+		CODEC_VIS_CHECK(std::fabs(rects[0].rect.w - 500.0f) < 0.01f);
+		CODEC_VIS_CHECK(std::fabs(rects[1].rect.x - 510.0f) < 0.01f);
 	}
 
 	{
-		LayoutState layout;
-		LayoutResult wide = compute_layout(layout, 1600, 900, 1.0f);
-		assert(!wide.imageListCollapsed);
-		assert(!wide.inspectorCollapsed);
-		assert(wide.viewer.w > 900.0f);
+		LayoutState const layout;
+		LayoutResult const wide = compute_layout(layout, 1600, 900, 1.0f);
+		CODEC_VIS_CHECK(!wide.imageListCollapsed);
+		CODEC_VIS_CHECK(!wide.inspectorCollapsed);
+		CODEC_VIS_CHECK(wide.viewer.w > 900.0f);
 
-		LayoutResult narrow = compute_layout(layout, 760, 540, 1.0f);
-		assert(narrow.inspectorCollapsed);
-		assert(narrow.viewer.w >= 480.0f);
+		LayoutResult const narrow = compute_layout(layout, 760, 540, 1.0f);
+		CODEC_VIS_CHECK(narrow.inspectorCollapsed);
+		CODEC_VIS_CHECK(narrow.viewer.w >= 480.0f);
 	}
 
 	{
@@ -247,12 +254,12 @@ int main() {
 		image.width = 400;
 		image.height = 200;
 		Pane pane;
-		pane.transform = fit_transform(image.width, image.height, Rect{0, 0, 800, 600}, 1.0f);
-		assert(std::fabs(pane.transform.scale - 2.0) < 0.01);
-		std::optional<ImagePixelCoord> coord = pane_to_image_coord(pane, image, Rect{0, 0, 800, 600}, Point{400, 300});
-		assert(coord);
-		assert(coord->x == 200);
-		assert(coord->y == 100);
+		pane.transform = fit_transform(image.width, image.height, Rect{.x=0, .y=0, .w=800, .h=600}, 1.0f);
+		CODEC_VIS_CHECK(std::fabs(pane.transform.scale - 2.0) < 0.01);
+		std::optional<ImagePixelCoord> coord = pane_to_image_coord(pane, image, Rect{.x=0, .y=0, .w=800, .h=600}, Point{.x=400, .y=300});
+		CODEC_VIS_CHECK(coord);
+		CODEC_VIS_CHECK(coord->x == 200);
+		CODEC_VIS_CHECK(coord->y == 100);
 	}
 
 	{
@@ -263,21 +270,21 @@ int main() {
 		fit.kind = ActionKind::FitPaneToImage;
 		fit.pane = state.panes.front().id;
 		state = update(std::move(state), fit).state;
-		assert(state.panes.front().transform.scale > 0.0);
+		CODEC_VIS_CHECK(state.panes.front().transform.scale > 0.0);
 
 		const double before = state.panes.front().transform.scale;
 		Action scroll;
 		scroll.kind = ActionKind::PointerScrolled;
-		scroll.point = Point{640, 360};
+		scroll.point = Point{.x=640, .y=360};
 		scroll.value = -120.0;
 		state = update(std::move(state), scroll).state;
-		assert(state.panes.front().transform.scale > before);
+		CODEC_VIS_CHECK(state.panes.front().transform.scale > before);
 
 		Action key;
 		key.kind = ActionKind::KeyPressed;
 		key.text = "100%";
 		state = update(std::move(state), key).state;
-		assert(std::fabs(state.panes.front().transform.scale - 1.0) < 0.001);
+		CODEC_VIS_CHECK(std::fabs(state.panes.front().transform.scale - 1.0) < 0.001);
 	}
 
 	{
@@ -293,15 +300,15 @@ int main() {
 
 		Action press;
 		press.kind = ActionKind::PointerPressed;
-		press.point = Point{splitX, 360};
+		press.point = Point{.x=splitX, .y=360};
 		state = update(std::move(state), press).state;
-		assert(state.interaction.activePointerCapture == "split-divider");
+		CODEC_VIS_CHECK(state.interaction.activePointerCapture == "split-divider");
 
 		Action move;
 		move.kind = ActionKind::PointerMoved;
-		move.point = Point{splitX + 120, 360};
+		move.point = Point{.x=splitX + 120, .y=360};
 		state = update(std::move(state), move).state;
-		assert(state.viewMode.splitPosition > 0.5);
+		CODEC_VIS_CHECK(state.viewMode.splitPosition > 0.5);
 	}
 
 	{
@@ -325,9 +332,9 @@ int main() {
 		transform.transform.centerX = 20.0;
 		transform.transform.centerY = 30.0;
 		state = update(std::move(state), transform).state;
-		assert(std::fabs(state.panes[1].transform.scale - 3.0) < 0.001);
-		assert(std::fabs(state.panes[1].transform.centerX - 20.0) < 0.001);
-		assert(std::fabs(state.panes[1].transform.centerY - 30.0) < 0.001);
+		CODEC_VIS_CHECK(std::fabs(state.panes[1].transform.scale - 3.0) < 0.001);
+		CODEC_VIS_CHECK(std::fabs(state.panes[1].transform.centerX - 20.0) < 0.001);
+		CODEC_VIS_CHECK(std::fabs(state.panes[1].transform.centerY - 30.0) < 0.001);
 	}
 
 	{
@@ -336,9 +343,9 @@ int main() {
 		debug.kind = ActionKind::KeyPressed;
 		debug.text = "debug";
 		UpdateResult debugResult = update(std::move(state), debug);
-		assert(debugResult.state.debug.enabled);
-		assert(!debugResult.state.debug.recent.empty());
-		assert(debugResult.state.debug.recent.back().message.find("KeyPressed") != std::string::npos);
+		CODEC_VIS_CHECK(debugResult.state.debug.enabled);
+		CODEC_VIS_CHECK(!debugResult.state.debug.recent.empty());
+		CODEC_VIS_CHECK(debugResult.state.debug.recent.back().message.find("KeyPressed") != std::string::npos);
 	}
 
 	{
@@ -347,8 +354,8 @@ int main() {
 		blink.kind = ActionKind::SetViewMode;
 		blink.viewMode = ViewModeKind::Blink;
 		state = update(std::move(state), blink).state;
-		assert(state.panes.size() == 2);
-		assert(compute_pane_rects(state.viewMode, state.panes, Rect{0, 0, 800, 600}).size() == 1);
+		CODEC_VIS_CHECK(state.panes.size() == 2);
+		CODEC_VIS_CHECK(compute_pane_rects(state.viewMode, state.panes, Rect{0, 0, 800, 600}).size() == 1);
 	}
 
 	{
@@ -370,9 +377,9 @@ int main() {
 		assign.pane = state.panes[1].id;
 		assign.image = encoded.id;
 		state = update(std::move(state), assign).state;
-		assert(std::fabs(state.panes[0].transform.scale - state.panes[1].transform.scale) < 0.001);
-		assert(std::fabs(state.panes[0].transform.centerX - state.panes[1].transform.centerX) < 0.001);
-		assert(std::fabs(state.panes[0].transform.centerY - state.panes[1].transform.centerY) < 0.001);
+		CODEC_VIS_CHECK(std::fabs(state.panes[0].transform.scale - state.panes[1].transform.scale) < 0.001);
+		CODEC_VIS_CHECK(std::fabs(state.panes[0].transform.centerX - state.panes[1].transform.centerX) < 0.001);
+		CODEC_VIS_CHECK(std::fabs(state.panes[0].transform.centerY - state.panes[1].transform.centerY) < 0.001);
 		Action transform;
 		transform.kind = ActionKind::SetPaneTransform;
 		transform.pane = state.panes[0].id;
@@ -380,9 +387,9 @@ int main() {
 		transform.transform.centerX = 123.0;
 		transform.transform.centerY = 234.0;
 		state = update(std::move(state), transform).state;
-		assert(std::fabs(state.panes[1].transform.scale - 3.0) < 0.001);
-		assert(std::fabs(state.panes[1].transform.centerX - 123.0) < 0.001);
-		assert(std::fabs(state.panes[1].transform.centerY - 234.0) < 0.001);
+		CODEC_VIS_CHECK(std::fabs(state.panes[1].transform.scale - 3.0) < 0.001);
+		CODEC_VIS_CHECK(std::fabs(state.panes[1].transform.centerX - 123.0) < 0.001);
+		CODEC_VIS_CHECK(std::fabs(state.panes[1].transform.centerY - 234.0) < 0.001);
 	}
 
 	{
@@ -397,11 +404,11 @@ int main() {
 		side.kind = ActionKind::SetViewMode;
 		side.viewMode = ViewModeKind::SideBySide;
 		state = update(std::move(state), side).state;
-		const std::vector<PaneRect> rects = compute_pane_rects(state.viewMode, state.panes, Rect{0, 0, 800, 600});
-		assert(rects.size() == 5);
-		assert(std::fabs(rects[0].rect.w - 200.0f) < 0.01f);
-		assert(std::fabs(rects[0].rect.h - 300.0f) < 0.01f);
-		assert(std::fabs(rects[4].rect.y - 300.0f) < 0.01f);
+		const std::vector<PaneRect> rects = compute_pane_rects(state.viewMode, state.panes, Rect{.x=0, .y=0, .w=800, .h=600});
+		CODEC_VIS_CHECK(rects.size() == 5);
+		CODEC_VIS_CHECK(std::fabs(rects[0].rect.w - 200.0f) < 0.01f);
+		CODEC_VIS_CHECK(std::fabs(rects[0].rect.h - 300.0f) < 0.01f);
+		CODEC_VIS_CHECK(std::fabs(rects[4].rect.y - 300.0f) < 0.01f);
 	}
 
 	{
@@ -427,9 +434,9 @@ int main() {
 		assign.pane = state.panes[1].id;
 		assign.image = encoded.id;
 		state = update(std::move(state), assign).state;
-		assert(std::fabs(state.panes[0].transform.scale - state.panes[1].transform.scale) < 0.001);
-		assert(std::fabs(state.panes[0].transform.centerX - state.panes[1].transform.centerX) < 0.001);
-		assert(std::fabs(state.panes[0].transform.centerY - state.panes[1].transform.centerY) < 0.001);
+		CODEC_VIS_CHECK(std::fabs(state.panes[0].transform.scale - state.panes[1].transform.scale) < 0.001);
+		CODEC_VIS_CHECK(std::fabs(state.panes[0].transform.centerX - state.panes[1].transform.centerX) < 0.001);
+		CODEC_VIS_CHECK(std::fabs(state.panes[0].transform.centerY - state.panes[1].transform.centerY) < 0.001);
 		Action transform;
 		transform.kind = ActionKind::SetPaneTransform;
 		transform.pane = state.panes[0].id;
@@ -437,9 +444,9 @@ int main() {
 		transform.transform.centerX = 111.0;
 		transform.transform.centerY = 222.0;
 		state = update(std::move(state), transform).state;
-		assert(std::fabs(state.panes[1].transform.scale - 2.5) < 0.001);
-		assert(std::fabs(state.panes[1].transform.centerX - 111.0) < 0.001);
-		assert(std::fabs(state.panes[1].transform.centerY - 222.0) < 0.001);
+		CODEC_VIS_CHECK(std::fabs(state.panes[1].transform.scale - 2.5) < 0.001);
+		CODEC_VIS_CHECK(std::fabs(state.panes[1].transform.centerX - 111.0) < 0.001);
+		CODEC_VIS_CHECK(std::fabs(state.panes[1].transform.centerY - 222.0) < 0.001);
 	}
 
 	{
@@ -450,14 +457,14 @@ int main() {
 		start.image = source;
 		start.backend = BackendId{1};
 		UpdateResult started = update(std::move(state), start);
-		assert(started.state.encodeRuns.size() == 1);
-		assert(started.state.selection.selectedRun == started.state.encodeRuns.front().id);
+		CODEC_VIS_CHECK(started.state.encodeRuns.size() == 1);
+		CODEC_VIS_CHECK(started.state.selection.selectedRun == started.state.encodeRuns.front().id);
 		Action running;
 		running.kind = ActionKind::EncodeRunStarted;
 		running.run = started.state.encodeRuns.front().id;
 		running.value = 10.0;
 		started = update(std::move(started.state), running);
-		assert(started.state.encodeRuns.front().startedSeconds == 10.0);
+		CODEC_VIS_CHECK(started.state.encodeRuns.front().startedSeconds == 10.0);
 		Action completed;
 		completed.kind = ActionKind::EncodeRunCompleted;
 		completed.encodeCompleted.run = started.state.encodeRuns.front().id;
@@ -467,33 +474,48 @@ int main() {
 		completed.encodeCompleted.metadata.bytes = {std::byte{0x00}, std::byte{0x01}};
 		completed.value = 12.5;
 		UpdateResult result = update(std::move(started.state), completed);
-		assert(result.state.encodeRuns.front().state == EncodeRunState::Completed);
-		assert(result.state.encodeRuns.front().finishedSeconds == 12.5);
-		assert(result.state.images.size() == 2);
-		assert(result.state.images.back().type == ImageObjectType::EncodedResult);
-		assert(!result.state.images.back().decoded);
-		assert(result.state.images.back().encoded->byteSize == 2);
+		CODEC_VIS_CHECK(result.state.encodeRuns.front().state == EncodeRunState::Completed);
+		CODEC_VIS_CHECK(result.state.encodeRuns.front().finishedSeconds == 12.5);
+		CODEC_VIS_CHECK(result.state.images.size() == 2);
+		CODEC_VIS_CHECK(result.state.images.back().type == ImageObjectType::EncodedResult);
+		CODEC_VIS_CHECK(!result.state.images.back().decoded);
+		CODEC_VIS_CHECK(result.state.images.back().encoded->byteSize == 2);
 
 		// Keeping comparison history is the safe default; scratch replacement is
 		// explicit application workflow state and is captured per run.
 		Action secondStart = start;
 		secondStart.image = source;
 		UpdateResult secondStarted = update(std::move(result.state), secondStart);
-		assert(!secondStarted.state.encodeRuns.back().replacePreviousResult);
+		CODEC_VIS_CHECK(!secondStarted.state.encodeRuns.back().replacePreviousResult);
 		Action secondCompleted = completed;
 		secondCompleted.encodeCompleted.run = secondStarted.state.encodeRuns.back().id;
 		UpdateResult kept = update(std::move(secondStarted.state), secondCompleted);
-		assert(kept.state.images.size() == 3);
+		CODEC_VIS_CHECK(kept.state.images.size() == 3);
 		Action scratch;
 		scratch.kind = ActionKind::ToggleScratchResults;
 		UpdateResult scratchEnabled = update(std::move(kept.state), scratch);
-		assert(scratchEnabled.state.scratchResults);
+		CODEC_VIS_CHECK(scratchEnabled.state.scratchResults);
 		UpdateResult scratchStarted = update(std::move(scratchEnabled.state), secondStart);
-		assert(scratchStarted.state.encodeRuns.back().replacePreviousResult);
+		CODEC_VIS_CHECK(scratchStarted.state.encodeRuns.back().replacePreviousResult);
 		Action scratchCompleted = completed;
 		scratchCompleted.encodeCompleted.run = scratchStarted.state.encodeRuns.back().id;
-		UpdateResult replaced = update(std::move(scratchStarted.state), scratchCompleted);
-		assert(replaced.state.images.size() == 2);
+		const ImageId oldResult = scratchStarted.state.images[1].id;
+		scratchStarted.state.panes.front().image = oldResult;
+		auto live = scratchStarted.state.images.back();
+		live.id = next_image_id(scratchStarted.state); live.type = ImageObjectType::LivePreview;
+		const ImageId liveId = live.id;
+		scratchStarted.state.images.push_back(live);
+		auto busy = scratchStarted.state;
+		find_image(busy, oldResult)->decoder.running = true;
+		auto preserved = update(std::move(busy), scratchCompleted);
+		CODEC_VIS_CHECK(find_image(preserved.state, oldResult));
+		CODEC_VIS_CHECK(!preserved.state.encodeRuns.front().replacedBy);
+		UpdateResult const replaced = update(std::move(scratchStarted.state), scratchCompleted);
+		CODEC_VIS_CHECK(replaced.state.images.size() == 3);
+		CODEC_VIS_CHECK(find_image(replaced.state, liveId));
+		CODEC_VIS_CHECK(!find_image(replaced.state, oldResult));
+		CODEC_VIS_CHECK(replaced.state.encodeRuns.front().replacedBy == scratchCompleted.encodeCompleted.run);
+		CODEC_VIS_CHECK(replaced.state.panes.front().image == replaced.state.encodeRuns.back().producedImage);
 	}
 
 	{
@@ -507,7 +529,7 @@ int main() {
 		select.kind = ActionKind::SelectEncodeRun;
 		select.run = run.id;
 		state = update(std::move(state), select).state;
-		assert(state.selection.selectedRun == run.id);
+		CODEC_VIS_CHECK(state.selection.selectedRun == run.id);
 	}
 
 	{
@@ -525,14 +547,14 @@ int main() {
 		mode.kind = ActionKind::SetViewMode;
 		mode.viewMode = ViewModeKind::Difference;
 		UpdateResult modeResult = update(std::move(state), mode);
-		assert(modeResult.state.panes.size() == 2);
+		CODEC_VIS_CHECK(modeResult.state.panes.size() == 2);
 
 		Action assign;
 		assign.kind = ActionKind::AssignImageToPane;
 		assign.pane = modeResult.state.panes.back().id;
 		assign.image = encoded.id;
 		UpdateResult assignResult = update(std::move(modeResult.state), assign);
-		assert(std::any_of(assignResult.commands.begin(), assignResult.commands.end(), [](const Command& command) {
+		CODEC_VIS_CHECK(std::ranges::any_of(assignResult.commands, [](const Command& command) {
 			return command.kind == CommandKind::ComputeDerivedImage;
 		}));
 
@@ -544,21 +566,21 @@ int main() {
 		derived.derivedImage.displayName = "Difference";
 		derived.derivedImage.image = make_image();
 		UpdateResult derivedResult = update(std::move(assignResult.state), derived);
-		assert(derivedResult.state.images.back().type == ImageObjectType::Derived);
-		assert(derivedResult.state.viewMode.generatedImage == derivedResult.state.images.back().id);
-		assert(derivedResult.state.images.back().parents.size() == 2);
-		assert(derivedResult.state.images.back().derived);
-		assert(std::fabs(derivedResult.state.images.back().derived->gain - 3.5) < 0.001);
-		assert(derivedResult.state.selection.selectedImage == encoded.id);
+		CODEC_VIS_CHECK(derivedResult.state.images.back().type == ImageObjectType::Derived);
+		CODEC_VIS_CHECK(derivedResult.state.viewMode.generatedImage == derivedResult.state.images.back().id);
+		CODEC_VIS_CHECK(derivedResult.state.images.back().parents.size() == 2);
+		CODEC_VIS_CHECK(derivedResult.state.images.back().derived);
+		CODEC_VIS_CHECK(std::fabs(derivedResult.state.images.back().derived->gain - 3.5) < 0.001);
+		CODEC_VIS_CHECK(derivedResult.state.selection.selectedImage == encoded.id);
 
 		const std::size_t imageCount = derivedResult.state.images.size();
 		const ImageId generated = *derivedResult.state.viewMode.generatedImage;
 		Action replacement = derived;
 		replacement.derivedImage.gain = 7.0;
 		replacement.derivedImage.image = make_image();
-		UpdateResult replacementResult = update(std::move(derivedResult.state), replacement);
-		assert(replacementResult.state.images.size() == imageCount);
-		assert(replacementResult.state.viewMode.generatedImage == generated);
+		UpdateResult const replacementResult = update(std::move(derivedResult.state), replacement);
+		CODEC_VIS_CHECK(replacementResult.state.images.size() == imageCount);
+		CODEC_VIS_CHECK(replacementResult.state.viewMode.generatedImage == generated);
 		const ImageObject* replaced = nullptr;
 		for (const ImageObject& image : replacementResult.state.images) {
 			if (image.id == generated) {
@@ -566,10 +588,41 @@ int main() {
 				break;
 			}
 		}
-		assert(replaced != nullptr);
-		assert(replaced->derived);
-		assert(std::fabs(replaced->derived->gain - 7.0) < 0.001);
+		CODEC_VIS_CHECK(replaced != nullptr);
+		CODEC_VIS_CHECK(replaced->derived);
+		CODEC_VIS_CHECK(std::fabs(replaced->derived->gain - 7.0) < 0.001);
 	}
 
+	{
+		AppState comparison;
+		comparison.interaction.framebufferWidth = 2880;
+		comparison.interaction.framebufferHeight = 1800;
+		Action loaded;
+		loaded.kind = ActionKind::SourceLoaded;
+		loaded.sourceLoaded.path = "source.jpg";
+		loaded.sourceLoaded.image = make_image();
+		comparison = update(std::move(comparison), loaded).state;
+		const ImageId source = comparison.images.front().id;
+		ImageObject encoded = comparison.images.front();
+		encoded.id = next_image_id(comparison);
+		encoded.type = ImageObjectType::EncodedResult;
+		encoded.parents = {source};
+		comparison.images.push_back(encoded);
+		comparison.selection.selectedImage = encoded.id;
+		comparison.panes.front().image = encoded.id;
+		comparison.panes.front().transform = {.scale=2.0, .centerX=100.0, .centerY=80.0};
+		Action mode;
+		mode.kind = ActionKind::SetViewMode;
+		mode.viewMode = ViewModeKind::SideBySide;
+		comparison = update(std::move(comparison), mode).state;
+		CODEC_VIS_CHECK(comparison.panes[0].image == source);
+		CODEC_VIS_CHECK(comparison.panes[1].image == encoded.id);
+		mode.viewMode = ViewModeKind::Split;
+		comparison = update(std::move(comparison), mode).state;
+		for (const auto& pane : comparison.panes) {
+			CODEC_VIS_CHECK(pane.transform.scale == 2.0);
+			CODEC_VIS_CHECK(pane.transform.centerX == 100.0 && pane.transform.centerY == 80.0);
+		}
+	}
 	return 0;
 }

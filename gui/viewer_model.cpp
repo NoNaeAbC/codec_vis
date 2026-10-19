@@ -1,14 +1,19 @@
 #include "viewer_model.hpp"
+#include "app_state.hpp"
 
 #include <algorithm>
 #include <cmath>
-#include <iterator>
+#include <cstddef>
+#include <functional>
+#include <optional>
+#include <span>
+#include <vector>
 
 namespace codec_gui::gui {
 namespace {
 
 [[nodiscard]] bool contains_pane(std::span<const Pane> panes, PaneId id) {
-	return std::any_of(panes.begin(), panes.end(), [id](const Pane& pane) {
+	return std::ranges::any_of(panes, [id](const Pane& pane) {
 		return pane.id == id;
 	});
 }
@@ -30,7 +35,7 @@ namespace {
 }
 
 [[nodiscard]] const Pane* pane_by_id(std::span<const Pane> panes, PaneId id) {
-	const auto it = std::find_if(panes.begin(), panes.end(), [id](const Pane& pane) {
+	const auto it = std::ranges::find_if(panes, [id](const Pane& pane) {
 		return pane.id == id;
 	});
 	return it == panes.end() ? nullptr : &*it;
@@ -53,14 +58,11 @@ ViewportTransform clamp_transform(ViewportTransform transform, const ImageObject
 } // namespace
 
 void apply_mode_transition(std::vector<Pane>& panes, ViewModeState& mode, const std::function<PaneId()>& createPane) {
-	mode.paneOrder.erase(
-		std::remove_if(mode.paneOrder.begin(), mode.paneOrder.end(), [&](PaneId id) {
+	std::erase_if(mode.paneOrder, [&](PaneId id) {
 			return !contains_pane(panes, id);
-		}),
-		mode.paneOrder.end()
-	);
+		});
 	for (const Pane& pane : panes) {
-		if (std::find(mode.paneOrder.begin(), mode.paneOrder.end(), pane.id) == mode.paneOrder.end()) {
+		if (std::ranges::find(mode.paneOrder, pane.id) == mode.paneOrder.end()) {
 			mode.paneOrder.push_back(pane.id);
 		}
 	}
@@ -71,7 +73,7 @@ void apply_mode_transition(std::vector<Pane>& panes, ViewModeState& mode, const 
 
 std::vector<PaneRect> compute_pane_rects(const ViewModeState& mode, std::span<const Pane> panes, Rect viewerRect) {
 	std::vector<PaneId> ids;
-	for (PaneId id : mode.paneOrder) {
+	for (PaneId const id : mode.paneOrder) {
 		if (pane_by_id(panes, id) != nullptr) {
 			ids.push_back(id);
 		}
@@ -85,16 +87,16 @@ std::vector<PaneRect> compute_pane_rects(const ViewModeState& mode, std::span<co
 		case ViewModeKind::Single:
 		case ViewModeKind::Blink:
 		case ViewModeKind::Difference:
-			out.push_back({ids.front(), viewerRect});
+			out.push_back({.pane=ids.front(), .rect=viewerRect});
 			break;
 		case ViewModeKind::Split: {
 			if (ids.size() < 2) {
-				out.push_back({ids.front(), viewerRect});
+				out.push_back({.pane=ids.front(), .rect=viewerRect});
 				break;
 			}
 			const float split = viewerRect.x + viewerRect.w * static_cast<float>(std::clamp(mode.splitPosition, 0.0, 1.0));
-			out.push_back({ids[0], {viewerRect.x, viewerRect.y, split - viewerRect.x, viewerRect.h}});
-			out.push_back({ids[1], {split, viewerRect.y, viewerRect.x + viewerRect.w - split, viewerRect.h}});
+			out.push_back({.pane=ids[0], .rect={.x=viewerRect.x, .y=viewerRect.y, .w=split - viewerRect.x, .h=viewerRect.h}});
+			out.push_back({.pane=ids[1], .rect={.x=split, .y=viewerRect.y, .w=viewerRect.x + viewerRect.w - split, .h=viewerRect.h}});
 			break;
 		}
 		case ViewModeKind::SideBySide: {
@@ -106,20 +108,20 @@ std::vector<PaneRect> compute_pane_rects(const ViewModeState& mode, std::span<co
 			for (std::size_t i = 0; i < visible; ++i) {
 				const std::size_t col = i % cols;
 				const std::size_t row = i / cols;
-				out.push_back({ids[i], {viewerRect.x + cellW * static_cast<float>(col), viewerRect.y + cellH * static_cast<float>(row), cellW, cellH}});
+				out.push_back({.pane=ids[i], .rect={.x=viewerRect.x + cellW * static_cast<float>(col), .y=viewerRect.y + cellH * static_cast<float>(row), .w=cellW, .h=cellH}});
 			}
 			break;
 		}
 		case ViewModeKind::Grid: {
 			const std::size_t n = ids.size();
-			const std::size_t cols = static_cast<std::size_t>(std::ceil(std::sqrt(static_cast<double>(n))));
+			const auto cols = static_cast<std::size_t>(std::ceil(std::sqrt(static_cast<double>(n))));
 			const std::size_t rows = (n + cols - 1) / cols;
 			const float cellW = viewerRect.w / static_cast<float>(cols);
 			const float cellH = viewerRect.h / static_cast<float>(rows);
 			for (std::size_t i = 0; i < n; ++i) {
 				const std::size_t col = i % cols;
 				const std::size_t row = i / cols;
-				out.push_back({ids[i], {viewerRect.x + cellW * col, viewerRect.y + cellH * row, cellW, cellH}});
+				out.push_back({.pane=ids[i], .rect={.x=viewerRect.x + cellW * static_cast<float>(col), .y=viewerRect.y + cellH * static_cast<float>(row), .w=cellW, .h=cellH}});
 			}
 			break;
 		}
@@ -158,8 +160,8 @@ ViewportTransform zoom_transform(
 	if (zoomFactor <= 0.0 || transform.scale <= 0.0) {
 		return transform;
 	}
-	const double localX = static_cast<double>(pointer.x - (paneRect.x + paneRect.w * 0.5f));
-	const double localY = static_cast<double>(pointer.y - (paneRect.y + paneRect.h * 0.5f));
+	const auto localX = static_cast<double>(pointer.x - (paneRect.x + paneRect.w * 0.5f));
+	const auto localY = static_cast<double>(pointer.y - (paneRect.y + paneRect.h * 0.5f));
 	const double imageX = transform.centerX + localX / transform.scale;
 	const double imageY = transform.centerY + localY / transform.scale;
 	transform.scale = std::clamp(transform.scale * zoomFactor, 0.01, 256.0);
@@ -187,25 +189,25 @@ Rect image_rect_in_pane(const Pane& pane, const ImageObject& image, Rect paneRec
 	if (image.width <= 0 || image.height <= 0 || pane.transform.scale <= 0.0) {
 		return paneRect;
 	}
-	const float w = static_cast<float>(static_cast<double>(image.width) * pane.transform.scale);
-	const float h = static_cast<float>(static_cast<double>(image.height) * pane.transform.scale);
+	const auto w = static_cast<float>(static_cast<double>(image.width) * pane.transform.scale);
+	const auto h = static_cast<float>(static_cast<double>(image.height) * pane.transform.scale);
 	const float cx = paneRect.x + paneRect.w * 0.5f + static_cast<float>((static_cast<double>(image.width) * 0.5 - pane.transform.centerX) * pane.transform.scale);
 	const float cy = paneRect.y + paneRect.h * 0.5f + static_cast<float>((static_cast<double>(image.height) * 0.5 - pane.transform.centerY) * pane.transform.scale);
-	return Rect{cx - w * 0.5f, cy - h * 0.5f, w, h};
+	return Rect{.x=cx - w * 0.5f, .y=cy - h * 0.5f, .w=w, .h=h};
 }
 
 std::optional<ImagePixelCoord> pane_to_image_coord(const Pane& pane, const ImageObject& image, Rect paneRect, Point pointer) {
 	if (image.width <= 0 || image.height <= 0 || pane.transform.scale <= 0.0) {
 		return std::nullopt;
 	}
-	const double localX = static_cast<double>(pointer.x - (paneRect.x + paneRect.w * 0.5f));
-	const double localY = static_cast<double>(pointer.y - (paneRect.y + paneRect.h * 0.5f));
+	const auto localX = static_cast<double>(pointer.x - (paneRect.x + paneRect.w * 0.5f));
+	const auto localY = static_cast<double>(pointer.y - (paneRect.y + paneRect.h * 0.5f));
 	const int imageX = static_cast<int>(std::floor(pane.transform.centerX + localX / pane.transform.scale));
 	const int imageY = static_cast<int>(std::floor(pane.transform.centerY + localY / pane.transform.scale));
 	if (imageX < 0 || imageY < 0 || imageX >= image.width || imageY >= image.height) {
 		return std::nullopt;
 	}
-	return ImagePixelCoord{imageX, imageY};
+	return ImagePixelCoord{.x=imageX, .y=imageY};
 }
 
 } // namespace codec_gui::gui

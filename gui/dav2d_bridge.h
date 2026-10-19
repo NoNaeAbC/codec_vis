@@ -7,11 +7,15 @@
 extern "C" {
 #endif
 
-typedef struct CodecVisDav2dPicture {
+typedef struct CodecVisDav2dPicture { // NOLINT(modernize-use-using): public C ABI
 	int width;
 	int height;
 	int layout;
 	int bit_depth;
+	int color_primaries;
+	int transfer;
+	int matrix;
+	int full_range;
 	uint8_t* planes[3];
 	int strides[3];
 } CodecVisDav2dPicture;

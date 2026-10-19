@@ -1,0 +1,62 @@
+#version 450
+// All rendering, including glyph coverage, geometry and image comparison, is
+// compute-only. The storage target and decoded images use linear BT.2020.
+layout(local_size_x=16,local_size_y=16) in;
+layout(set=0,binding=0,rgba16f) uniform image2D target;
+struct Instance {vec4 rect;vec4 uv;vec4 color;vec4 shape;};
+layout(set=0,binding=1,std430) readonly buffer Instances {Instance instances[];};
+layout(set=0,binding=2,std430) readonly buffer Tiles {uint tiles[];};
+layout(set=1,binding=0) uniform sampler2D sourceImage;
+layout(set=2,binding=0) uniform sampler2D referenceImage;
+layout(push_constant) uniform Push {ivec4 bounds;vec4 rect;vec4 uv;vec4 color;vec4 params;uvec4 meta;} pc;
+vec4 over(vec4 dst,vec4 src){return vec4(src.rgb*src.a+dst.rgb*(1-src.a),src.a+dst.a*(1-src.a));}
+// UI palette values were linear BT.709. Convert the palette into the surface
+// working space; decoded image pixels never pass through this transform.
+vec3 palette(vec3 c){return vec3(dot(c,vec3(.6274039,.3292830,.0433131)),
+    dot(c,vec3(.0690973,.9195404,.0113623)),dot(c,vec3(.0163914,.0880133,.8955953)));}
+float distanceToShape(vec2 local,vec2 halfSize,vec4 shape){
+    if(shape.x==3)return (length(local/max(halfSize,vec2(.001)))-1)*min(halfSize.x,halfSize.y);
+    float radius=min(shape.y,min(halfSize.x,halfSize.y));
+    vec2 q=abs(local)-halfSize+radius;
+    return length(max(q,0))+min(max(q.x,q.y),0)-radius;
+}
+void main(){
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy)+pc.bounds.xy;
+    if(any(greaterThanEqual(p,pc.bounds.zw)))return;
+    vec2 position=(vec2(p)+.5)/pc.params.x;
+    vec4 result=imageLoad(target,p);
+    if(pc.meta.z!=0){
+        if(any(lessThan(position,pc.rect.xy))||any(greaterThanEqual(position,pc.rect.xy+pc.rect.zw)))return;
+        vec2 uv=pc.uv.xy+(position-pc.rect.xy)/pc.rect.zw*pc.uv.zw;
+        vec4 value=textureLod(sourceImage,uv,0);
+        if(pc.meta.z==2){vec3 delta=abs(value.rgb-textureLod(referenceImage,uv,0).rgb);
+            value=vec4(vec3(max(delta.r,max(delta.g,delta.b))*pc.params.y),1);}
+        // No gamut conversion, tone map, transfer encoding, or RGB clamp.
+        result=over(result,value*pc.color);
+    }else{
+        uint tile=pc.meta.x+(uint(p.y)/16*pc.meta.y+uint(p.x)/16)*2;
+        uint first=tiles[tile],count=tiles[tile+1];
+        if(count==0)return;
+        for(uint j=0;j<count;++j){
+            Instance v=instances[tiles[first+j]];
+            vec2 local=position-v.rect.xy-v.rect.zw*.5;
+            float c=cos(v.shape.w),s=sin(v.shape.w);
+            local=mat2(c,-s,s,c)*local;
+            vec2 halfSize=v.rect.zw*.5;
+            if(any(greaterThanEqual(abs(local),halfSize)))continue;
+            float coverage=1;
+            if(v.shape.x==1){vec2 uv=v.uv.xy+(local/v.rect.zw+.5)*v.uv.zw;
+                coverage=textureLod(sourceImage,uv,0).r;
+            }else if(v.shape.x>=2){
+                float d=distanceToShape(local,halfSize,v.shape);
+                // Compute derivatives analytically by a one-pixel finite difference.
+                float aa=max(abs(distanceToShape(local+vec2(1/pc.params.x,0),halfSize,v.shape)-d)+
+                    abs(distanceToShape(local+vec2(0,1/pc.params.x),halfSize,v.shape)-d),.001);
+                coverage=1-smoothstep(-aa*.5,aa*.5,d);
+                if(v.shape.z>0)coverage*=smoothstep(-v.shape.z-aa*.5,-v.shape.z+aa*.5,d);
+            }
+            result=over(result,vec4(palette(v.color.rgb),v.color.a*coverage));
+        }
+    }
+    imageStore(target,p,result);
+}

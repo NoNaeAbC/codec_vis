@@ -1,0 +1,50 @@
+Native metric adapters used by codec_vis
+
+All production adapters consume planar FP32 linear BT.2020 D65 (FP16 working
+space semantics widened to FP32), 1.0 = 203 cd/m². No metric subprocesses,
+Python, CUDA, integer images, display RGB conversions, or gamut reduction.
+FP64 accumulation is used where appropriate. CPU implementations are linked
+normally into the executable. Their original license notices are retained.
+
+Butteraugli
+  Source: https://github.com/google/butteraugli
+  Files obtained 2026-10-16 from the standalone upstream master branch.
+  Apache-2.0, Google Inc. This is the standalone Google model, not libjxl's
+  different Butteraugli revision. The API's floating-point 255 unit scale
+  does not imply 8-bit quantization.
+  Changes: original photopsin matrix composed with BT.2020 -> XYZ -> BT.709;
+  no intermediate BT.709 RGB image. The calibrated rational response is
+  unchanged within its specified domain, with a continuous tangent extension
+  outside that domain. Edge replication handles images smaller than 8x8.
+  SDR parity tests compare unmodified upstream reference scores: error <=1e-4.
+  Unmodified source SHA-256:
+    butteraugli.cc a5f0ae1696955e33a2761395ef6df4ffa320812626324161bb8215d2d9b47c58
+    butteraugli.h  64d0c2838a307ef603cfe376976df4f2c246898c021dde5468cf63bcd1737231
+
+ColorVideoVDP
+  Source: fcvvdp v0.4.0, Halide Compression, LLC; copyright and license
+  notices are retained in third_party/fcvvdp.
+  Apache-2.0. Includes that project's planar-float API.
+  Changes: compose original RGB->XYZ matrix for direct BT.2020; remove the
+  SDR/HDR RGB clamp in display application. Only the audited scalar kernels
+  are dispatched. Planar FP32 input is passed directly; the upstream library
+  copies it into its mutable workspace. No byte/integer input API is used.
+  Display: standard 30-inch 4K, 200-nit SDR model. HDR is evaluated as an
+  unclipped extension; scores are not claimed calibrated for HDR.
+  SDR reference fixtures agree within 1e-5 JOD.
+  Unmodified cvvdp.c SHA-256:
+    2a2bcf8c4be2d9ab529d7dedb5bf89f3a3103e97cf1870581195aac98d16f2fb
+
+The previous PSNR-HVS/libvmaf adapter is removed: it accepted integer YUV
+pictures, not the required linear floating-point working space. No replacement
+is offered under that name.
+
+Admission policy
+  gui/metrics.cpp::metric_catalog is the sole offered list. Each admitted
+  descriptor has a typed linear-BT.2020 evaluator, direction, units and a
+  calibration note. Add adapters there only with SDR reference parity,
+  identity, HDR/wide-gamut/negative-value and sub-8-bit precision tests.
+  Reject or remove entries whose implementations clamp to an RGB gamut,
+  quantize image samples to integers, spawn processes, or use non-Vulkan GPU
+  APIs. Approximate HDR calibration is disclosed while scores are produced.
+  Lazy worker and UI consume the registry and need no metric-specific cases.

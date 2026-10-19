@@ -1,0 +1,13 @@
+Native video decoding support bundled with codec_vis.
+
+native/ contains the H.265 parser, Vulkan Video decoder, and required headers.
+The sources are built as C++23 objects. Include paths and namespaces are scoped
+under native_video, and runtime configuration uses CODEC_VIS environment names.
+native/SOURCE.json records repository-relative snapshot paths and SHA-256 hashes.
+No separate project checkout is needed to build this code.
+
+HEVC SCC uses the native parser and direct Vulkan Video submission, with
+same-device timeline synchronization and CPU image readback in gui/scc_decode.cpp.
+SCC does not use libavcodec for parsing, decoding, or surface download.
+Other video decoder integrations use in-process libraries for codec parsing,
+hardware submission, and synchronized CPU surface download.

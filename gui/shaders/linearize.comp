@@ -1,0 +1,65 @@
+#version 450
+// Original decoded integer samples -> FP32 linear BT.2020, no display clamp.
+layout(local_size_x=16,local_size_y=16) in;
+layout(set=0,binding=0,std430) readonly buffer Source { uint samples[]; } src;
+layout(set=0,binding=1,rgba32f) writeonly uniform image2D dst;
+layout(set=0,binding=2,std430) buffer Status { uint invalid; } status;
+layout(push_constant) uniform Parameters {
+    uvec4 geometry; // width, height, bytes/sample, depth
+    uvec4 planes;   // byte offsets for Y/R, U/G, V/B; format (YUV=0,RGB=1,gray=2)
+    uvec4 layoutInfo; // byte strides for three planes; transfer (H.273)
+    vec4 chroma; // x/y subsampling, x/y sample location
+    vec4 luma; // Kr, Kb, HLG peak/203, HLG gamma-1
+    vec4 row0; // linear source RGB -> BT.2020; HLG luma coefficients in w
+    vec4 row1;
+    vec4 row2;
+} p;
+float at(uint plane,ivec2 pos) {
+    ivec2 size=ivec2(p.geometry.xy);
+    if(plane>0 && (p.planes.w&3u)==0u)size=ivec2(ceil(vec2(size)/p.chroma.xy));
+    pos=clamp(pos,ivec2(0),size-1);
+    uint byteIndex=p.planes[plane]+uint(pos.y)*p.layoutInfo[plane]+uint(pos.x)*p.geometry.z;
+    uint word=src.samples[byteIndex/4u];
+    uint mask=p.geometry.z==1u?255u:65535u;
+    uint value=word>>((byteIndex%4u)*8u);
+    if(p.geometry.z==2u && byteIndex%4u==3u)value|=(src.samples[byteIndex/4u+1u]&255u)<<8u;
+    return float(value&mask);
+}
+float reconstructed(uint plane,ivec2 pos) {
+    vec2 f=(vec2(pos)-p.chroma.zw)/p.chroma.xy;
+    ivec2 base=ivec2(floor(f));vec2 t=fract(f);
+    return mix(mix(at(plane,base),at(plane,base+ivec2(1,0)),t.x),
+               mix(at(plane,base+ivec2(0,1)),at(plane,base+ivec2(1,1)),t.x),t.y);
+}
+vec3 eotf(vec3 v) {
+    vec3 a=abs(v),r;
+    uint tf=p.layoutInfo.w;
+    if(tf==8u)return v;
+    if(tf==13u)r=mix(pow((a+.055)/1.055,vec3(2.4)),a/12.92,lessThanEqual(a,vec3(.04045)));
+    else if(tf==4u)r=pow(a,vec3(2.2));
+    else if(tf==5u)r=pow(a,vec3(2.8));
+    else if(tf==16u){vec3 q=pow(a,vec3(1./78.84375));r=pow(max(q-.8359375,0.)/(18.8515625-18.6875*q),vec3(1./.1593017578125))*(10000./203.);}
+    else if(tf==18u)r=mix((exp((a-.55991073)/.17883277)+.28466892)/12.,a*a/3.,lessThanEqual(a,vec3(.5)));
+    else r=mix(pow((a+.099)/1.099,vec3(1./.45)),a/4.5,lessThan(a,vec3(.081)));
+    return sign(v)*r;
+}
+void main() {
+    ivec2 pos=ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(pos,ivec2(p.geometry.xy))))return;
+    float maximum=float((1u<<p.geometry.w)-1u), scale=float(1u<<(p.geometry.w-8u));
+    vec4 levels=(p.planes.w&4u)!=0u?vec4(0,maximum,float(1u<<(p.geometry.w-1u)),maximum):vec4(16,219,128,224)*scale;
+    float y=(at(0u,pos)-levels.x)/levels.y;
+    vec3 signal=vec3(y);
+    if((p.planes.w&3u)==1u)signal=vec3(y,(at(1u,pos)-levels.x)/levels.y,(at(2u,pos)-levels.x)/levels.y);
+    else if((p.planes.w&3u)==0u){
+        float cb=(reconstructed(1u,pos)-levels.z)/levels.w;
+        float cr=(reconstructed(2u,pos)-levels.z)/levels.w;
+        signal.r=y+2.*(1.-p.luma.x)*cr;signal.b=y+2.*(1.-p.luma.y)*cb;
+        signal.g=(y-p.luma.x*signal.r-p.luma.y*signal.b)/(1.-p.luma.x-p.luma.y);
+    }
+    vec3 linear=eotf(signal);
+    if(p.layoutInfo.w==18u)linear*=p.luma.z*pow(abs(dot(linear,vec3(p.row0.w,p.row1.w,p.row2.w))),p.luma.w);
+    vec3 converted=vec3(dot(p.row0.xyz,linear),dot(p.row1.xyz,linear),dot(p.row2.xyz,linear));
+    if(any(isnan(converted)) || any(isinf(converted)))atomicOr(status.invalid,1u);
+    imageStore(dst,pos,vec4(converted,1));
+}

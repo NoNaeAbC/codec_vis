@@ -1,18 +1,32 @@
 #include "codec_gui_x265.hpp"
+#include "pngconf.h"
 
 #include <algorithm>
+#include <charls/public_types.h>
 #include <cmath>
+#include <csetjmp>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <filesystem>
+#include <ios>
 #include <iterator>
+#include <jxl/codestream_header.h>
+#include <jxl/color_encoding.h>
+#include <jxl/types.h>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <sstream>
+#include <string_view>
 #include <type_traits>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #include <charls/charls_jpegls_encoder.h>
@@ -24,8 +38,8 @@
 
 extern "C" {
 #include <jpeglib.h>
-#include <jxrlib/JXRGlue.h>
-#include <jxrlib/windowsmediaphoto.h>
+#include <JXRGlue.h>
+#include <windowsmediaphoto.h>
 }
 
 #ifdef min
@@ -131,9 +145,9 @@ struct MatrixWeights {
 
 MatrixWeights matrix_weights(MatrixCoefficients matrix) {
 	switch (matrix) {
-		case MatrixCoefficients::BT709: return {0.2126, 0.0722};
-		case MatrixCoefficients::BT601: return {0.2990, 0.1140};
-		case MatrixCoefficients::BT2020NonConstant: return {0.2627, 0.0593};
+		case MatrixCoefficients::BT709: return {.kr=0.2126, .kb=0.0722};
+		case MatrixCoefficients::BT601: return {.kr=0.2990, .kb=0.1140};
+		case MatrixCoefficients::BT2020NonConstant: return {.kr=0.2627, .kb=0.0593};
 		default:
 			throw std::invalid_argument("JPEG XL RGB conversion does not support the selected YCbCr matrix; select BT.709, BT.601, or BT.2020 non-constant explicitly");
 	}
@@ -187,13 +201,13 @@ JxlInputPixels raw_to_jxl_pixels(const RawImage& image) {
 		validate_jxl_plane(image, 2, chromaWidth, chromaHeight, bytesPerSample);
 	}
 
-	const double maximum = static_cast<double>((1u << result.bitDepth) - 1u);
-	const double scale = static_cast<double>(1u << (result.bitDepth - 8));
+	const auto maximum = static_cast<double>((1u << result.bitDepth) - 1u);
+	const auto scale = static_cast<double>(1u << (result.bitDepth - 8));
 	const double yOffset = image.color.range == ColorRange::Full ? 0.0 : 16.0 * scale;
 	const double yScale = image.color.range == ColorRange::Full ? maximum : 219.0 * scale;
-	const double cOffset = static_cast<double>(1u << (result.bitDepth - 1));
+	const auto cOffset = static_cast<double>(1u << (result.bitDepth - 1));
 	const double cScale = image.color.range == ColorRange::Full ? maximum : 224.0 * scale;
-	const MatrixWeights weights = is_gray(image.format) ? MatrixWeights{0.2126, 0.0722} : matrix_weights(image.color.matrix);
+	const MatrixWeights weights = is_gray(image.format) ? MatrixWeights{.kr=0.2126, .kb=0.0722} : matrix_weights(image.color.matrix);
 	const double kg = 1.0 - weights.kr - weights.kb;
 	result.bytes.resize(static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height) * result.channels * bytesPerSample);
 
@@ -217,8 +231,8 @@ JxlInputPixels raw_to_jxl_pixels(const RawImage& image) {
 				continue;
 			}
 
-			double chromaX = static_cast<double>(x);
-			double chromaY = static_cast<double>(y);
+			auto chromaX = static_cast<double>(x);
+			auto chromaY = static_cast<double>(y);
 			if (is_420(image.format) || is_422(image.format)) {
 				const Chroma420SampleLocation location = image.color.chroma420Location.value_or(Chroma420SampleLocation::LeftCenter);
 				const bool horizontallyCentered = location == Chroma420SampleLocation::Center ||
@@ -307,12 +321,12 @@ struct X264InputFormat {
 
 X264InputFormat x264_input_format(PixelFormat format) {
 	switch (format) {
-		case PixelFormat::YUV420P8: return {X264_CSP_I420, 8};
-		case PixelFormat::YUV420P10LE: return {X264_CSP_I420 | X264_CSP_HIGH_DEPTH, 10};
-		case PixelFormat::YUV422P8: return {X264_CSP_I422, 8};
-		case PixelFormat::YUV422P10LE: return {X264_CSP_I422 | X264_CSP_HIGH_DEPTH, 10};
-		case PixelFormat::YUV444P8: return {X264_CSP_I444, 8};
-		case PixelFormat::YUV444P10LE: return {X264_CSP_I444 | X264_CSP_HIGH_DEPTH, 10};
+		case PixelFormat::YUV420P8: return {.csp=X264_CSP_I420, .bitDepth=8};
+		case PixelFormat::YUV420P10LE: return {.csp=X264_CSP_I420 | X264_CSP_HIGH_DEPTH, .bitDepth=10};
+		case PixelFormat::YUV422P8: return {.csp=X264_CSP_I422, .bitDepth=8};
+		case PixelFormat::YUV422P10LE: return {.csp=X264_CSP_I422 | X264_CSP_HIGH_DEPTH, .bitDepth=10};
+		case PixelFormat::YUV444P8: return {.csp=X264_CSP_I444, .bitDepth=8};
+		case PixelFormat::YUV444P10LE: return {.csp=X264_CSP_I444 | X264_CSP_HIGH_DEPTH, .bitDepth=10};
 		default: throw std::invalid_argument("x264 requires planar 8- or 10-bit YUV 4:2:0, 4:2:2, or 4:4:4 input");
 	}
 }
@@ -339,8 +353,8 @@ EncodedImage encode_jpeg_like(const RawImage& image, std::span<const EncoderPara
 	jpeg_mem_dest(&cinfo, &mem, &memSize);
 	cinfo.image_width = static_cast<JDIMENSION>(image.width);
 	cinfo.image_height = static_cast<JDIMENSION>(image.height);
-	cinfo.input_components = 3;
-	cinfo.in_color_space = JCS_RGB;
+	cinfo.input_components = rgb.channels;
+	cinfo.in_color_space = rgb.channels == 1 ? JCS_GRAYSCALE : JCS_RGB;
 	jpeg_set_defaults(&cinfo);
 	cinfo.data_precision = rgb.bitDepth;
 	jpeg_set_quality(&cinfo, std::clamp(quality, 1, 100), rgb.bitDepth == 8 ? TRUE : FALSE);
@@ -348,7 +362,7 @@ EncodedImage encode_jpeg_like(const RawImage& image, std::span<const EncoderPara
 	cinfo.arith_code = param_value<bool>(params, "arithmetic", false) ? TRUE : FALSE;
 	cinfo.smoothing_factor = static_cast<int>(param_value<int64_t>(params, "smoothing", 0));
 	cinfo.restart_in_rows = static_cast<int>(param_value<int64_t>(params, "restart-rows", 0));
-	const std::string dct = param_value<std::string>(params, "dct", "islow");
+	const auto dct = param_value<std::string>(params, "dct", "islow");
 	if (dct == "ifast") cinfo.dct_method = JDCT_IFAST;
 	else if (dct == "float") cinfo.dct_method = JDCT_FLOAT;
 	else cinfo.dct_method = JDCT_ISLOW;
@@ -358,14 +372,14 @@ EncodedImage encode_jpeg_like(const RawImage& image, std::span<const EncoderPara
 	jpeg_start_compress(&cinfo, TRUE);
 	while (cinfo.next_scanline < cinfo.image_height) {
 		if (rgb.bitDepth == 8) {
-			JSAMPROW row = const_cast<JSAMPROW>(
-				rgb.bytes.data() + static_cast<std::size_t>(cinfo.next_scanline) * image.width * 3
+			auto row = const_cast<JSAMPROW>(
+				rgb.bytes.data() + static_cast<std::size_t>(cinfo.next_scanline) * image.width * rgb.channels
 			);
 			jpeg_write_scanlines(&cinfo, &row, 1);
 		} else {
-			J12SAMPROW row = reinterpret_cast<J12SAMPROW>(
+			auto row = reinterpret_cast<J12SAMPROW>(
 				const_cast<uint8_t*>(rgb.bytes.data()) +
-				static_cast<std::size_t>(cinfo.next_scanline) * image.width * 3 * 2
+				static_cast<std::size_t>(cinfo.next_scanline) * image.width * rgb.channels * 2
 			);
 			jpeg12_write_scanlines(&cinfo, &row, 1);
 		}
@@ -391,8 +405,8 @@ void png_write_callback(png_structp png, png_bytep data, png_size_t length) {
 
 std::vector<EncoderParamInfo> query_jpegls_parameters() {
 	return {
-		{.name = "near", .label = "NEAR", .group = "Coding", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{0, 127, 1}, .help = "JPEG-LS near-lossless error tolerance. 0 is lossless; 127 is valid at every exposed precision."},
-		{.name = "color-transform", .label = "Color transform", .group = "Coding", .kind = ParamKind::Enum, .defaultValue = std::string{"none"}, .enumValues = {{"none", "None"}, {"hp1", "HP1"}, {"hp2", "HP2"}, {"hp3", "HP3"}}, .help = "Optional HP reversible color transform. Not part of baseline JPEG-LS interchange."},
+		{.name = "near", .label = "NEAR", .group = "Coding", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{.min=0, .max=127, .step=1}, .help = "JPEG-LS near-lossless error tolerance. 0 is lossless; 127 is valid at every exposed precision."},
+		{.name = "color-transform", .label = "Color transform", .group = "Coding", .kind = ParamKind::Enum, .defaultValue = std::string{"none"}, .enumValues = {{.value="none", .label="None"}, {.value="hp1", .label="HP1"}, {.value="hp2", .label="HP2"}, {.value="hp3", .label="HP3"}}, .help = "Optional HP reversible color transform. Requires RGB at 8 or 16 bits. Not part of baseline JPEG-LS interchange."},
 		{.name = "even-size", .label = "Even size", .group = "Bitstream", .kind = ParamKind::Bool, .defaultValue = false, .help = "Pad the destination to even byte size."},
 		{.name = "version-comment", .label = "Version comment", .group = "Bitstream", .kind = ParamKind::Bool, .defaultValue = false, .help = "Include CharLS version comment segment."},
 		{.name = "jai-pc-parameters", .label = "JAI PC params", .group = "Bitstream", .kind = ParamKind::Bool, .defaultValue = false, .help = "Include JAI-compatible preset coding parameters."},
@@ -402,10 +416,12 @@ std::vector<EncoderParamInfo> query_jpegls_parameters() {
 EncodedImage encode_jpegls_still_image(const RawImage& image, std::span<const EncoderParam> params) {
 	const JxlInputPixels rgb = raw_to_jxl_pixels(image);
 	charls::jpegls_encoder encoder;
-	encoder.frame_info({static_cast<uint32_t>(image.width), static_cast<uint32_t>(image.height), rgb.bitDepth, 3})
-		.interleave_mode(charls::interleave_mode::sample)
+	encoder.frame_info({.width=static_cast<uint32_t>(image.width), .height=static_cast<uint32_t>(image.height), .bits_per_sample=rgb.bitDepth, .component_count=rgb.channels})
+		.interleave_mode(rgb.channels == 1 ? charls::interleave_mode::none : charls::interleave_mode::sample)
 		.near_lossless(static_cast<int32_t>(param_value<int64_t>(params, "near", 0)));
-	const std::string transform = param_value<std::string>(params, "color-transform", "none");
+	const auto transform = param_value<std::string>(params, "color-transform", "none");
+	if (transform != "none" && (rgb.channels != 3 || (rgb.bitDepth != 8 && rgb.bitDepth != 16)))
+		throw std::invalid_argument("JPEG-LS HP transforms require three channels and 8- or 16-bit precision");
 	if (transform == "hp1") encoder.color_transformation(charls::color_transformation::hp1);
 	else if (transform == "hp2") encoder.color_transformation(charls::color_transformation::hp2);
 	else if (transform == "hp3") encoder.color_transformation(charls::color_transformation::hp3);
@@ -417,7 +433,7 @@ EncodedImage encode_jpegls_still_image(const RawImage& image, std::span<const En
 	std::vector<uint8_t> out(encoder.estimated_destination_size());
 	encoder.destination(out);
 	const std::size_t written = encoder.encode(
-		rgb.bytes, static_cast<uint32_t>(image.width * 3 * (rgb.bitDepth == 8 ? 1 : 2))
+		rgb.bytes, static_cast<uint32_t>(image.width * rgb.channels * (rgb.bitDepth == 8 ? 1 : 2))
 	);
 	out.resize(written);
 	EncodedImage encoded;
@@ -428,13 +444,13 @@ EncodedImage encode_jpegls_still_image(const RawImage& image, std::span<const En
 
 std::vector<EncoderParamInfo> query_jpeg_parameters() {
 	return {
-		{.name = "quality", .label = "Quality", .group = "Rate Control", .kind = ParamKind::Int, .defaultValue = int64_t{50}, .intRange = IntRange{1, 100, 1}, .help = "JPEG quantization quality."},
+		{.name = "quality", .label = "Quality", .group = "Rate Control", .kind = ParamKind::Int, .defaultValue = int64_t{50}, .intRange = IntRange{.min=1, .max=100, .step=1}, .help = "JPEG quantization quality."},
 		{.name = "optimize", .label = "Optimize Huffman", .group = "Entropy", .kind = ParamKind::Bool, .defaultValue = true, .help = "Optimize Huffman tables."},
 		{.name = "arithmetic", .label = "Arithmetic", .group = "Entropy", .kind = ParamKind::Bool, .defaultValue = false, .help = "Use arithmetic coding instead of Huffman if supported."},
 		{.name = "progressive", .label = "Progressive", .group = "Scan", .kind = ParamKind::Bool, .defaultValue = false, .help = "Emit progressive JPEG scans."},
-		{.name = "smoothing", .label = "Smoothing", .group = "Preprocess", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{0, 100, 1}, .help = "Input smoothing factor."},
-		{.name = "restart-rows", .label = "Restart rows", .group = "Bitstream", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{0, 1024, 1}, .help = "Restart interval in MCU rows. 0 disables restart markers."},
-		{.name = "dct", .label = "DCT", .group = "Transform", .kind = ParamKind::Enum, .defaultValue = std::string{"islow"}, .enumValues = {{"islow", "Integer accurate"}, {"ifast", "Integer fast"}, {"float", "Float"}}, .help = "Forward DCT implementation."},
+		{.name = "smoothing", .label = "Smoothing", .group = "Preprocess", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{.min=0, .max=100, .step=1}, .help = "Input smoothing factor."},
+		{.name = "restart-rows", .label = "Restart rows", .group = "Bitstream", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{.min=0, .max=1024, .step=1}, .help = "Restart interval in MCU rows. 0 disables restart markers."},
+		{.name = "dct", .label = "DCT", .group = "Transform", .kind = ParamKind::Enum, .defaultValue = std::string{"islow"}, .enumValues = {{.value="islow", .label="Integer accurate"}, {.value="ifast", .label="Integer fast"}, {.value="float", .label="Float"}}, .help = "Forward DCT implementation."},
 	};
 }
 
@@ -444,14 +460,14 @@ EncodedImage encode_jpeg_still_image(const RawImage& image, std::span<const Enco
 
 std::vector<EncoderParamInfo> query_jpeg2000_parameters() {
 	return {
-		{.name = "quality", .label = "Quality", .group = "Rate Control", .kind = ParamKind::Int, .defaultValue = int64_t{50}, .intRange = IntRange{1, 100, 1}, .help = "Approximate compression quality. Ignored when Lossless is enabled."},
+		{.name = "quality", .label = "Quality", .group = "Rate Control", .kind = ParamKind::Int, .defaultValue = int64_t{95}, .intRange = IntRange{.min=1, .max=100, .step=1}, .help = "OpenJPEG target compression ratio = 101 minus quality: default 95 targets 6:1, 50 targets 51:1, 100 targets 1:1. Not a perceptual score or a size guarantee. Ignored when Lossless is enabled."},
 		{.name = "lossless", .label = "Lossless", .group = "Rate Control", .kind = ParamKind::Bool, .defaultValue = false, .help = "Use reversible 5-3 wavelet and lossless final layer."},
-		{.name = "num-resolutions", .label = "Resolutions", .group = "Wavelet", .kind = ParamKind::Int, .defaultValue = int64_t{6}, .intRange = IntRange{1, 33, 1}, .help = "Number of DWT resolution levels."},
-		{.name = "codeblock-size", .label = "Codeblock size", .group = "Codeblocks", .kind = ParamKind::Enum, .defaultValue = std::string{"64"}, .enumValues = {{"4", "4×4"}, {"8", "8×8"}, {"16", "16×16"}, {"32", "32×32"}, {"64", "64×64"}}, .help = "Square JPEG 2000 codeblocks satisfying the power-of-two and 4096-sample limits."},
-		{.name = "progression", .label = "Progression", .group = "Ordering", .kind = ParamKind::Enum, .defaultValue = std::string{"LRCP"}, .enumValues = {{"LRCP", "LRCP"}, {"RLCP", "RLCP"}, {"RPCL", "RPCL"}, {"PCRL", "PCRL"}, {"CPRL", "CPRL"}}, .help = "JPEG 2000 progression order."},
+		{.name = "num-resolutions", .label = "Resolutions", .group = "Wavelet", .kind = ParamKind::Int, .defaultValue = int64_t{6}, .intRange = IntRange{.min=1, .max=33, .step=1}, .help = "Number of DWT resolution levels."},
+		{.name = "codeblock-size", .label = "Codeblock size", .group = "Codeblocks", .kind = ParamKind::Enum, .defaultValue = std::string{"64"}, .enumValues = {{.value="4", .label="4×4"}, {.value="8", .label="8×8"}, {.value="16", .label="16×16"}, {.value="32", .label="32×32"}, {.value="64", .label="64×64"}}, .help = "Square JPEG 2000 codeblocks satisfying the power-of-two and 4096-sample limits."},
+		{.name = "progression", .label = "Progression", .group = "Ordering", .kind = ParamKind::Enum, .defaultValue = std::string{"LRCP"}, .enumValues = {{.value="LRCP", .label="LRCP"}, {.value="RLCP", .label="RLCP"}, {.value="RPCL", .label="RPCL"}, {.value="PCRL", .label="PCRL"}, {.value="CPRL", .label="CPRL"}}, .help = "JPEG 2000 progression order."},
 		{.name = "mct", .label = "MCT", .group = "Color", .kind = ParamKind::Bool, .defaultValue = true, .help = "Multiple component transform for RGB."},
-		{.name = "tile-width", .label = "Tile W", .group = "Tiling", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{0, 65535, 1}, .help = "0 disables tiling; otherwise tile width."},
-		{.name = "tile-height", .label = "Tile H", .group = "Tiling", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{0, 65535, 1}, .help = "0 disables tiling; otherwise tile height."},
+		{.name = "tile-width", .label = "Tile W", .group = "Tiling", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{.min=0, .max=65535, .step=1}, .help = "0 disables tiling; otherwise tile width."},
+		{.name = "tile-height", .label = "Tile H", .group = "Tiling", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{.min=0, .max=65535, .step=1}, .help = "0 disables tiling; otherwise tile height."},
 	};
 }
 
@@ -461,7 +477,7 @@ EncodedImage encode_jpeg2000_still_image(const RawImage& image, std::span<const 
 	opj_set_default_encoder_parameters(&params);
 	params.tcp_numlayers = 1;
 	const bool lossless = param_value<bool>(encoderParams, "lossless", false);
-	const int quality = static_cast<int>(param_value<int64_t>(encoderParams, "quality", 50));
+	const int quality = static_cast<int>(param_value<int64_t>(encoderParams, "quality", 95));
 	const int clampedQuality = std::clamp(quality, 1, 100);
 	params.tcp_rates[0] = lossless ? 1.0f : static_cast<float>(101 - clampedQuality);
 	params.cp_disto_alloc = 1;
@@ -476,8 +492,8 @@ EncodedImage encode_jpeg2000_still_image(const RawImage& image, std::span<const 
 	const int codeblockSize = std::stoi(param_value<std::string>(encoderParams, "codeblock-size", "64"));
 	params.cblockw_init = codeblockSize;
 	params.cblockh_init = codeblockSize;
-	params.tcp_mct = param_value<bool>(encoderParams, "mct", true) ? 1 : 0;
-	const std::string progression = param_value<std::string>(encoderParams, "progression", "LRCP");
+	params.tcp_mct = rgb.channels == 3 && param_value<bool>(encoderParams, "mct", true) ? 1 : 0;
+	const auto progression = param_value<std::string>(encoderParams, "progression", "LRCP");
 	if (progression == "RLCP") params.prog_order = OPJ_RLCP;
 	else if (progression == "RPCL") params.prog_order = OPJ_RPCL;
 	else if (progression == "PCRL") params.prog_order = OPJ_PCRL;
@@ -499,28 +515,26 @@ EncodedImage encode_jpeg2000_still_image(const RawImage& image, std::span<const 
 		c.prec = static_cast<OPJ_UINT32>(rgb.bitDepth);
 		c.sgnd = 0;
 	}
-	std::unique_ptr<opj_image_t, decltype(&opj_image_destroy)> ojImage(opj_image_create(3, cmpt, OPJ_CLRSPC_SRGB), opj_image_destroy);
+	std::unique_ptr<opj_image_t, decltype(&opj_image_destroy)> ojImage(opj_image_create(rgb.channels, cmpt, rgb.channels == 1 ? OPJ_CLRSPC_GRAY : OPJ_CLRSPC_SRGB), opj_image_destroy);
 	if (!ojImage) throw std::runtime_error("OpenJPEG image allocation failed");
 	ojImage->x1 = static_cast<OPJ_UINT32>(image.width);
 	ojImage->y1 = static_cast<OPJ_UINT32>(image.height);
 	for (int y = 0; y < image.height; ++y) {
 		for (int x = 0; x < image.width; ++x) {
-			const std::size_t src = (static_cast<std::size_t>(y) * image.width + x) * 3;
+			const std::size_t src = (static_cast<std::size_t>(y) * image.width + x) * rgb.channels;
 			const std::size_t dst = static_cast<std::size_t>(y) * image.width + x;
 			auto sample = [&](std::size_t index) {
 				if (rgb.bitDepth == 8) return static_cast<int>(rgb.bytes[index]);
 				const std::size_t offset = index * 2;
 				return static_cast<int>(rgb.bytes[offset] | (static_cast<uint16_t>(rgb.bytes[offset + 1]) << 8u));
 			};
-			ojImage->comps[0].data[dst] = sample(src + 0);
-			ojImage->comps[1].data[dst] = sample(src + 1);
-			ojImage->comps[2].data[dst] = sample(src + 2);
+			for (int c = 0; c < rgb.channels; ++c) ojImage->comps[c].data[dst] = sample(src + c);
 		}
 	}
-	std::filesystem::path path = std::filesystem::temp_directory_path() / "codec_vis_tmp.jp2";
-	std::unique_ptr<opj_codec_t, decltype(&opj_destroy_codec)> codec(opj_create_compress(OPJ_CODEC_JP2), opj_destroy_codec);
+	std::filesystem::path const path = std::filesystem::temp_directory_path() / "codec_vis_tmp.jp2";
+	std::unique_ptr<opj_codec_t, decltype(&opj_destroy_codec)> const codec(opj_create_compress(OPJ_CODEC_JP2), opj_destroy_codec);
 	if (!codec || !opj_setup_encoder(codec.get(), &params, ojImage.get())) throw std::runtime_error("OpenJPEG encoder setup failed");
-	std::unique_ptr<opj_stream_t, decltype(&opj_stream_destroy)> stream(opj_stream_create_default_file_stream(path.c_str(), OPJ_FALSE), opj_stream_destroy);
+	std::unique_ptr<opj_stream_t, decltype(&opj_stream_destroy)> const stream(opj_stream_create_default_file_stream(path.c_str(), OPJ_FALSE), opj_stream_destroy);
 	if (!stream || !opj_start_compress(codec.get(), ojImage.get(), stream.get()) || !opj_encode(codec.get(), stream.get()) || !opj_end_compress(codec.get(), stream.get())) {
 		throw std::runtime_error("OpenJPEG encode failed");
 	}
@@ -534,45 +548,45 @@ EncodedImage encode_jpeg2000_still_image(const RawImage& image, std::span<const 
 
 std::vector<EncoderParamInfo> query_jpegxl_parameters() {
 	std::vector<EncoderParamInfo> result = {
-		{.name = "rate-control", .label = "Rate control", .group = "Coding", .kind = ParamKind::Enum, .defaultValue = std::string{"quality"}, .enumValues = {{"quality", "Quality"}, {"distance", "Butteraugli distance"}, {"lossless", "Lossless"}}, .help = "Select exactly one JPEG XL rate-control mode. The inactive controls are disabled and are not sent to libjxl."},
-		{.name = "quality", .label = "Quality", .group = "Coding", .kind = ParamKind::Int, .defaultValue = int64_t{90}, .intRange = IntRange{1, 100, 1}, .help = "JPEG-style quality mapped by libjxl to distance. Quality 90 corresponds to distance 1.0 (visually lossless); quality 100 is distance 0 but is still not mathematically lossless.", .enabledWhen = {{"rate-control", {"quality"}, "Quality is used only in Quality rate-control mode."}}},
-		{.name = "distance", .label = "Butteraugli distance", .group = "Coding", .kind = ParamKind::Float, .defaultValue = double{1.0}, .floatRange = FloatRange{0.0, 25.0, 0.1}, .help = "Direct libjxl distance target. Lower is higher quality; 1.0 is visually lossless and 0 alone is not true lossless.", .enabledWhen = {{"rate-control", {"distance"}, "Distance is used only in Butteraugli distance mode."}}},
-		{.name = "effort", .label = "Effort", .group = "Coding", .kind = ParamKind::Int, .defaultValue = int64_t{7}, .intRange = IntRange{1, 10, 1}, .help = "JPEG XL encoder effort."},
-		{.name = "decoding-speed", .label = "Decoding speed", .group = "Coding", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{0, 4, 1}, .help = "Decode speed tier. Higher can reduce density."},
-		{.name = "resampling", .label = "Resampling", .group = "Coding", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 8, 1}, .help = "-1 default, 1 none, 2/4/8 downsample before compression."},
-		{.name = "extra-channel-resampling", .label = "Extra resampling", .group = "Coding", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 8, 1}, .help = "Extra-channel resampling. Has no effect for RGB-only input."},
-		{.name = "already-downsampled", .label = "Already downsampled", .group = "Coding", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{0, 1, 1}, .help = "Tell libjxl that the provided frame is already downsampled by Resampling."},
-		{.name = "photon-noise", .label = "Photon noise", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{0, 3200, 1}, .help = "Adds synthetic photographic noise."},
-		{.name = "noise", .label = "Adaptive noise", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 1, 1}, .help = "Legacy adaptive noise generation toggle. Prefer Photon noise."},
-		{.name = "modular", .label = "Modular", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 1, 1}, .help = "-1 default, 0 VarDCT, 1 modular."},
-		{.name = "epf", .label = "EPF", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 3, 1}, .help = "Edge preserving filter level."},
-		{.name = "gaborish", .label = "Gaborish", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 1, 1}, .help = "Gaborish filter toggle."},
-		{.name = "dots", .label = "Dots", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 1, 1}, .help = "Dots generation toggle."},
-		{.name = "patches", .label = "Patches", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 1, 1}, .help = "Patch generation toggle."},
-		{.name = "keep-invisible", .label = "Keep invisible", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 1, 1}, .help = "Preserve invisible pixel color. Relevant only with alpha."},
-		{.name = "palette-colors", .label = "Palette colors", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 70913, 1}, .help = "Palette color limit. -1 default."},
-		{.name = "lossy-palette", .label = "Lossy palette", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 1, 1}, .help = "Palette quantization toggle."},
-		{.name = "color-transform", .label = "Color transform", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 2, 1}, .help = "Automatic uses libjxl's choice; 0 is XYB, 1 preserves RGB, and 2 marks losslessly represented YCbCr values."},
-		{.name = "channel-colors-global-percent", .label = "Global palette %", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 100, 1}, .help = "Global channel palette threshold for modular encoding."},
-		{.name = "channel-colors-group-percent", .label = "Group palette %", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 100, 1}, .help = "Per-group channel palette threshold for modular encoding."},
-		{.name = "modular-color-space", .label = "Modular RCT", .group = "Modular", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 41, 1}, .help = "Reversible color transform index for modular encoding."},
-		{.name = "modular-group-size", .label = "Modular group", .group = "Modular", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 3, 1}, .help = "-1 default, 0/1/2/3 = 128/256/512/1024."},
-		{.name = "modular-predictor", .label = "Modular predictor", .group = "Modular", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 15, 1}, .help = "Predictor for modular encoding."},
-		{.name = "modular-ma-tree-learning-percent", .label = "MA tree learn %", .group = "Modular", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 200, 1}, .help = "Percentage of pixels used for MA tree learning."},
-		{.name = "modular-nb-prev-channels", .label = "Prev channels", .group = "Modular", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 11, 1}, .help = "Previous-channel properties for modular MA trees."},
-		{.name = "progressive-ac", .label = "Progressive AC", .group = "Progressive", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 1, 1}, .help = "Progressive AC toggle."},
-		{.name = "qprogressive-ac", .label = "Q progressive AC", .group = "Progressive", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 1, 1}, .help = "Quantized progressive AC toggle."},
-		{.name = "progressive-dc", .label = "Progressive DC", .group = "Progressive", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 2, 1}, .help = "Progressive DC mode."},
-		{.name = "group-order", .label = "Group order", .group = "Progressive", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 1, 1}, .help = "-1 default, 0 scanline, 1 center-first."},
-		{.name = "group-order-center-x", .label = "Center X", .group = "Progressive", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 65535, 1}, .help = "Center-first group order X position."},
-		{.name = "group-order-center-y", .label = "Center Y", .group = "Progressive", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 65535, 1}, .help = "Center-first group order Y position."},
-		{.name = "responsive", .label = "Responsive", .group = "Progressive", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 1, 1}, .help = "Progressive encoding for modular mode."},
-		{.name = "jpeg-recon-cfl", .label = "JPEG recon CFL", .group = "JPEG", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 1, 1}, .help = "CFL toggle for lossless JPEG recompression. No effect for RGB input frames."},
-		{.name = "brotli-effort", .label = "Brotli effort", .group = "Container", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 11, 1}, .help = "Effort for compressed boxes. -1 default."},
-		{.name = "jpeg-compress-boxes", .label = "JPEG boxes", .group = "JPEG", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 1, 1}, .help = "Compress metadata boxes derived from JPEG input. No effect for RGB input frames."},
-		{.name = "buffering", .label = "Buffering", .group = "Container", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 3, 1}, .help = "Chunked frame buffering mode."},
-		{.name = "full-image-heuristics", .label = "Full image heuristics", .group = "Heuristics", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{-1, 1, 1}, .help = "Use full image heuristics toggle."},
-		{.name = "disable-perceptual-heuristics", .label = "Disable perceptual", .group = "Heuristics", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{0, 1, 1}, .help = "Disable perceptual heuristics."},
+		{.name = "rate-control", .label = "Rate control", .group = "Coding", .kind = ParamKind::Enum, .defaultValue = std::string{"quality"}, .enumValues = {{.value="quality", .label="Quality"}, {.value="distance", .label="Butteraugli distance"}, {.value="lossless", .label="Lossless"}}, .help = "Select exactly one JPEG XL rate-control mode. The inactive controls are disabled and are not sent to libjxl."},
+		{.name = "quality", .label = "Quality", .group = "Coding", .kind = ParamKind::Int, .defaultValue = int64_t{90}, .intRange = IntRange{.min=1, .max=100, .step=1}, .help = "JPEG-style quality mapped by libjxl to distance. Quality 90 corresponds to distance 1.0 (visually lossless); quality 100 is distance 0 but is still not mathematically lossless.", .enabledWhen = {{.parameter="rate-control", .acceptedValues={"quality"}, .explanation="Quality is used only in Quality rate-control mode."}}},
+		{.name = "distance", .label = "Butteraugli distance", .group = "Coding", .kind = ParamKind::Float, .defaultValue = double{1.0}, .floatRange = FloatRange{.min=0.0, .max=25.0, .step=0.1}, .help = "Direct libjxl distance target. Lower is higher quality; 1.0 is visually lossless and 0 alone is not true lossless.", .enabledWhen = {{.parameter="rate-control", .acceptedValues={"distance"}, .explanation="Distance is used only in Butteraugli distance mode."}}},
+		{.name = "effort", .label = "Effort", .group = "Coding", .kind = ParamKind::Int, .defaultValue = int64_t{7}, .intRange = IntRange{.min=1, .max=10, .step=1}, .help = "JPEG XL encoder effort."},
+		{.name = "decoding-speed", .label = "Decoding speed", .group = "Coding", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{.min=0, .max=4, .step=1}, .help = "Decode speed tier. Higher can reduce density."},
+		{.name = "resampling", .label = "Resampling", .group = "Coding", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=8, .step=1}, .help = "-1 default, 1 none, 2/4/8 downsample before compression."},
+		{.name = "extra-channel-resampling", .label = "Extra resampling", .group = "Coding", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=8, .step=1}, .help = "Extra-channel resampling. Has no effect for RGB-only input."},
+		{.name = "already-downsampled", .label = "Already downsampled", .group = "Coding", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{.min=0, .max=1, .step=1}, .help = "Tell libjxl that the provided frame is already downsampled by Resampling."},
+		{.name = "photon-noise", .label = "Photon noise", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{.min=0, .max=3200, .step=1}, .help = "Adds synthetic photographic noise."},
+		{.name = "noise", .label = "Adaptive noise", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=1, .step=1}, .help = "Legacy adaptive noise generation toggle. Prefer Photon noise."},
+		{.name = "modular", .label = "Modular", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=1, .step=1}, .help = "-1 default, 0 VarDCT, 1 modular."},
+		{.name = "epf", .label = "EPF", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=3, .step=1}, .help = "Edge preserving filter level."},
+		{.name = "gaborish", .label = "Gaborish", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=1, .step=1}, .help = "Gaborish filter toggle."},
+		{.name = "dots", .label = "Dots", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=1, .step=1}, .help = "Dots generation toggle."},
+		{.name = "patches", .label = "Patches", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=1, .step=1}, .help = "Patch generation toggle."},
+		{.name = "keep-invisible", .label = "Keep invisible", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=1, .step=1}, .help = "Preserve invisible pixel color. Relevant only with alpha."},
+		{.name = "palette-colors", .label = "Palette colors", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=70913, .step=1}, .help = "Palette color limit. -1 default."},
+		{.name = "lossy-palette", .label = "Lossy palette", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=1, .step=1}, .help = "Palette quantization toggle."},
+		{.name = "color-transform", .label = "Color transform", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=2, .step=1}, .help = "Automatic uses libjxl's choice; 0 is XYB, 1 preserves RGB, and 2 marks losslessly represented YCbCr values."},
+		{.name = "channel-colors-global-percent", .label = "Global palette %", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=100, .step=1}, .help = "Global channel palette threshold for modular encoding."},
+		{.name = "channel-colors-group-percent", .label = "Group palette %", .group = "Tools", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=100, .step=1}, .help = "Per-group channel palette threshold for modular encoding."},
+		{.name = "modular-color-space", .label = "Modular RCT", .group = "Modular", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=41, .step=1}, .help = "Reversible color transform index for modular encoding."},
+		{.name = "modular-group-size", .label = "Modular group", .group = "Modular", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=3, .step=1}, .help = "-1 default, 0/1/2/3 = 128/256/512/1024."},
+		{.name = "modular-predictor", .label = "Modular predictor", .group = "Modular", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=15, .step=1}, .help = "Predictor for modular encoding."},
+		{.name = "modular-ma-tree-learning-percent", .label = "MA tree learn %", .group = "Modular", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=200, .step=1}, .help = "Percentage of pixels used for MA tree learning."},
+		{.name = "modular-nb-prev-channels", .label = "Prev channels", .group = "Modular", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=11, .step=1}, .help = "Previous-channel properties for modular MA trees."},
+		{.name = "progressive-ac", .label = "Progressive AC", .group = "Progressive", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=1, .step=1}, .help = "Progressive AC toggle."},
+		{.name = "qprogressive-ac", .label = "Q progressive AC", .group = "Progressive", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=1, .step=1}, .help = "Quantized progressive AC toggle."},
+		{.name = "progressive-dc", .label = "Progressive DC", .group = "Progressive", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=2, .step=1}, .help = "Progressive DC mode."},
+		{.name = "group-order", .label = "Group order", .group = "Progressive", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=1, .step=1}, .help = "-1 default, 0 scanline, 1 center-first."},
+		{.name = "group-order-center-x", .label = "Center X", .group = "Progressive", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=65535, .step=1}, .help = "Center-first group order X position."},
+		{.name = "group-order-center-y", .label = "Center Y", .group = "Progressive", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=65535, .step=1}, .help = "Center-first group order Y position."},
+		{.name = "responsive", .label = "Responsive", .group = "Progressive", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=1, .step=1}, .help = "Progressive encoding for modular mode."},
+		{.name = "jpeg-recon-cfl", .label = "JPEG recon CFL", .group = "JPEG", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=1, .step=1}, .help = "CFL toggle for lossless JPEG recompression. No effect for RGB input frames."},
+		{.name = "brotli-effort", .label = "Brotli effort", .group = "Container", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=11, .step=1}, .help = "Effort for compressed boxes. -1 default."},
+		{.name = "jpeg-compress-boxes", .label = "JPEG boxes", .group = "JPEG", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=1, .step=1}, .help = "Compress metadata boxes derived from JPEG input. No effect for RGB input frames."},
+		{.name = "buffering", .label = "Buffering", .group = "Container", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=3, .step=1}, .help = "Chunked frame buffering mode."},
+		{.name = "full-image-heuristics", .label = "Full image heuristics", .group = "Heuristics", .kind = ParamKind::Int, .defaultValue = int64_t{-1}, .intRange = IntRange{.min=-1, .max=1, .step=1}, .help = "Use full image heuristics toggle."},
+		{.name = "disable-perceptual-heuristics", .label = "Disable perceptual", .group = "Heuristics", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{.min=0, .max=1, .step=1}, .help = "Disable perceptual heuristics."},
 	};
 	// These libjxl switches only affect alpha/extra channels, JPEG
 	// reconstruction, or box metadata. This backend supplies a plain RGB/gray
@@ -581,32 +595,32 @@ std::vector<EncoderParamInfo> query_jpegxl_parameters() {
 		     "extra-channel-resampling", "already-downsampled", "keep-invisible",
 		     "jpeg-recon-cfl", "brotli-effort", "jpeg-compress-boxes"
 	     }) {
-		result.erase(std::remove_if(result.begin(), result.end(), [&](const EncoderParamInfo& parameter) {
+		std::erase_if(result, [&](const EncoderParamInfo& parameter) {
 			return parameter.name == irrelevant;
-		}), result.end());
+		});
 	}
 	auto make_enum = [&](std::string_view name, std::string defaultValue, std::vector<EnumValue> values) {
-		auto parameter = std::find_if(result.begin(), result.end(), [&](const EncoderParamInfo& item) { return item.name == name; });
+		auto parameter = std::ranges::find_if(result, [&](const EncoderParamInfo& item) { return item.name == name; });
 		if (parameter == result.end()) return;
 		parameter->kind = ParamKind::Enum;
 		parameter->defaultValue = std::move(defaultValue);
 		parameter->intRange.reset();
 		parameter->enumValues = std::move(values);
 	};
-	make_enum("resampling", "-1", {{"-1", "Automatic"}, {"1", "None"}, {"2", "2×"}, {"4", "4×"}, {"8", "8×"}});
-	make_enum("noise", "-1", {{"-1", "Automatic"}, {"0", "Off"}, {"1", "On"}});
-	make_enum("modular", "-1", {{"-1", "Automatic"}, {"0", "VarDCT"}, {"1", "Modular"}});
-	make_enum("epf", "-1", {{"-1", "Automatic"}, {"0", "Off"}, {"1", "Level 1"}, {"2", "Level 2"}, {"3", "Level 3"}});
-	make_enum("gaborish", "-1", {{"-1", "Automatic"}, {"0", "Off"}, {"1", "On"}});
-	make_enum("dots", "-1", {{"-1", "Automatic"}, {"0", "Off"}, {"1", "On"}});
-	make_enum("patches", "-1", {{"-1", "Automatic"}, {"0", "Off"}, {"1", "On"}});
-	make_enum("lossy-palette", "-1", {{"-1", "Automatic"}, {"0", "Off"}, {"1", "On"}});
-	make_enum("color-transform", "-1", {{"-1", "Automatic"}, {"0", "XYB"}, {"1", "RGB"}});
-	make_enum("progressive-ac", "-1", {{"-1", "Automatic"}, {"0", "Off"}, {"1", "On"}});
-	make_enum("qprogressive-ac", "-1", {{"-1", "Automatic"}, {"0", "Off"}, {"1", "On"}});
-	make_enum("group-order", "-1", {{"-1", "Automatic"}, {"0", "Scanline"}, {"1", "Center first"}});
-	make_enum("responsive", "-1", {{"-1", "Automatic"}, {"0", "Off"}, {"1", "On"}});
-	make_enum("full-image-heuristics", "-1", {{"-1", "Automatic"}, {"0", "Off"}, {"1", "On"}});
+	make_enum("resampling", "-1", {{.value="-1", .label="Automatic"}, {.value="1", .label="None"}, {.value="2", .label="2×"}, {.value="4", .label="4×"}, {.value="8", .label="8×"}});
+	make_enum("noise", "-1", {{.value="-1", .label="Automatic"}, {.value="0", .label="Off"}, {.value="1", .label="On"}});
+	make_enum("modular", "-1", {{.value="-1", .label="Automatic"}, {.value="0", .label="VarDCT"}, {.value="1", .label="Modular"}});
+	make_enum("epf", "-1", {{.value="-1", .label="Automatic"}, {.value="0", .label="Off"}, {.value="1", .label="Level 1"}, {.value="2", .label="Level 2"}, {.value="3", .label="Level 3"}});
+	make_enum("gaborish", "-1", {{.value="-1", .label="Automatic"}, {.value="0", .label="Off"}, {.value="1", .label="On"}});
+	make_enum("dots", "-1", {{.value="-1", .label="Automatic"}, {.value="0", .label="Off"}, {.value="1", .label="On"}});
+	make_enum("patches", "-1", {{.value="-1", .label="Automatic"}, {.value="0", .label="Off"}, {.value="1", .label="On"}});
+	make_enum("lossy-palette", "-1", {{.value="-1", .label="Automatic"}, {.value="0", .label="Off"}, {.value="1", .label="On"}});
+	make_enum("color-transform", "-1", {{.value="-1", .label="Automatic"}, {.value="0", .label="XYB"}, {.value="1", .label="RGB"}});
+	make_enum("progressive-ac", "-1", {{.value="-1", .label="Automatic"}, {.value="0", .label="Off"}, {.value="1", .label="On"}});
+	make_enum("qprogressive-ac", "-1", {{.value="-1", .label="Automatic"}, {.value="0", .label="Off"}, {.value="1", .label="On"}});
+	make_enum("group-order", "-1", {{.value="-1", .label="Automatic"}, {.value="0", .label="Scanline"}, {.value="1", .label="Center first"}});
+	make_enum("responsive", "-1", {{.value="-1", .label="Automatic"}, {.value="0", .label="Off"}, {.value="1", .label="On"}});
+	make_enum("full-image-heuristics", "-1", {{.value="-1", .label="Automatic"}, {.value="0", .label="Off"}, {.value="1", .label="On"}});
 	for (EncoderParamInfo& parameter : result) {
 		if (parameter.name == "color-transform") {
 			parameter.help = "Internal libjxl color transform. Automatic lets libjxl choose; XYB is the perceptual transform and RGB preserves RGB channels. YCbCr is intentionally unavailable because this backend supplies RGB/gray samples.";
@@ -615,13 +629,13 @@ std::vector<EncoderParamInfo> query_jpegxl_parameters() {
 			parameter.help = "Optional whole-image downsampling inside libjxl. Only valid factors are offered; this is not chroma subsampling.";
 		}
 		if (parameter.name == "group-order-center-x" || parameter.name == "group-order-center-y") {
-			parameter.enabledWhen = {{"group-order", {"1"}, "Center coordinates apply only to Center-first group order."}};
+			parameter.enabledWhen = {{.parameter="group-order", .acceptedValues={"1"}, .explanation="Center coordinates apply only to Center-first group order."}};
 		}
 		if (parameter.group == "Modular") {
-			parameter.enabledWhen = {{"modular", {"1"}, "This option applies only when Modular encoding is selected explicitly."}};
+			parameter.enabledWhen = {{.parameter="modular", .acceptedValues={"1"}, .explanation="This option applies only when Modular encoding is selected explicitly."}};
 		}
 		if (parameter.name == "responsive") {
-			parameter.enabledWhen = {{"modular", {"1"}, "Responsive progression applies only to Modular encoding."}};
+			parameter.enabledWhen = {{.parameter="modular", .acceptedValues={"1"}, .explanation="Responsive progression applies only to Modular encoding."}};
 		}
 	}
 	for (EncoderParamInfo& parameter : result) {
@@ -636,7 +650,7 @@ std::vector<EncoderParamInfo> query_jpegxl_parameters() {
 
 EncodedImage encode_jpegxl_still_image(const RawImage& image, std::span<const EncoderParam> params) {
 	const JxlInputPixels pixels = raw_to_jxl_pixels(image);
-	const std::string rateControl = param_value<std::string>(params, "rate-control", "quality");
+	const auto rateControl = param_value<std::string>(params, "rate-control", "quality");
 	if (rateControl != "quality" && rateControl != "distance" && rateControl != "lossless") {
 		throw std::invalid_argument("unknown JPEG XL rate-control mode: " + rateControl);
 	}
@@ -738,14 +752,14 @@ EncodedImage encode_jpegxl_still_image(const RawImage& image, std::span<const En
 		}
 	}
 	if (pixels.bitDepth > 8) {
-		const JxlBitDepth inputDepth{JXL_BIT_DEPTH_FROM_CODESTREAM, 0, 0};
+		const JxlBitDepth inputDepth{.type=JXL_BIT_DEPTH_FROM_CODESTREAM, .bits_per_sample=0, .exponent_bits_per_sample=0};
 		if (JxlEncoderSetFrameBitDepth(frame, &inputDepth) != JXL_ENC_SUCCESS) throw encoder_error("JxlEncoderSetFrameBitDepth");
 	}
-	const JxlPixelFormat format{pixels.channels, pixels.dataType, JXL_LITTLE_ENDIAN, 0};
+	const JxlPixelFormat format{.num_channels=pixels.channels, .data_type=pixels.dataType, .endianness=JXL_LITTLE_ENDIAN, .align=0};
 	if (JxlEncoderAddImageFrame(frame, &format, pixels.bytes.data(), pixels.bytes.size()) != JXL_ENC_SUCCESS) throw encoder_error("JxlEncoderAddImageFrame");
 	JxlEncoderCloseInput(enc.get());
 	std::vector<std::byte> out(4096);
-	uint8_t* next = reinterpret_cast<uint8_t*>(out.data());
+	auto* next = reinterpret_cast<uint8_t*>(out.data());
 	size_t avail = out.size();
 	for (;;) {
 		const JxlEncoderStatus status = JxlEncoderProcessOutput(enc.get(), &next, &avail);
@@ -765,18 +779,18 @@ EncodedImage encode_jpegxl_still_image(const RawImage& image, std::span<const En
 
 std::vector<EncoderParamInfo> query_jpegxr_parameters() {
 	return {
-		{.name = "qp", .label = "QP", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{32}, .intRange = IntRange{1, 255, 1}, .help = "JPEG XR base quantizer index. Lower is higher quality."},
-		{.name = "qp-ylp", .label = "QP Y LP", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{0, 255, 1}, .help = "Luma low-pass quantizer. 0 lets the encoder derive it."},
-		{.name = "qp-yhp", .label = "QP Y HP", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{0, 255, 1}, .help = "Luma high-pass quantizer. 0 lets the encoder derive it."},
-		{.name = "qp-u", .label = "QP U", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{0, 255, 1}, .help = "U channel quantizer. 0 lets the encoder derive it."},
-		{.name = "qp-v", .label = "QP V", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{0, 255, 1}, .help = "V channel quantizer. 0 lets the encoder derive it."},
-		{.name = "overlap", .label = "Overlap", .group = "Transform", .kind = ParamKind::Enum, .defaultValue = std::string{"one"}, .enumValues = {{"none", "None"}, {"one", "One"}, {"two", "Two"}}, .help = "JPEG XR overlap filtering."},
-		{.name = "bitstream-order", .label = "Order", .group = "Bitstream", .kind = ParamKind::Enum, .defaultValue = std::string{"spatial"}, .enumValues = {{"spatial", "Spatial"}, {"frequency", "Frequency"}}, .help = "Spatial or frequency bitstream order."},
-		{.name = "subband", .label = "Subband", .group = "Bitstream", .kind = ParamKind::Enum, .defaultValue = std::string{"all"}, .enumValues = {{"all", "All"}, {"no-flexbits", "No flexbits"}, {"no-highpass", "No highpass"}, {"dc-only", "DC only"}}, .help = "Subbands retained in the codestream."},
-		{.name = "trim-flex-bits", .label = "Trim flexbits", .group = "Bitstream", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{0, 15, 1}, .help = "Number of flex bits to trim."},
+		{.name = "qp", .label = "QP", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{32}, .intRange = IntRange{.min=1, .max=255, .step=1}, .help = "JPEG XR base quantizer index. Lower is higher quality."},
+		{.name = "qp-ylp", .label = "QP Y LP", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{.min=0, .max=255, .step=1}, .help = "Luma low-pass quantizer. 0 lets the encoder derive it."},
+		{.name = "qp-yhp", .label = "QP Y HP", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{.min=0, .max=255, .step=1}, .help = "Luma high-pass quantizer. 0 lets the encoder derive it."},
+		{.name = "qp-u", .label = "QP U", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{.min=0, .max=255, .step=1}, .help = "U channel quantizer. 0 lets the encoder derive it."},
+		{.name = "qp-v", .label = "QP V", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{.min=0, .max=255, .step=1}, .help = "V channel quantizer. 0 lets the encoder derive it."},
+		{.name = "overlap", .label = "Overlap", .group = "Transform", .kind = ParamKind::Enum, .defaultValue = std::string{"one"}, .enumValues = {{.value="none", .label="None"}, {.value="one", .label="One"}, {.value="two", .label="Two"}}, .help = "JPEG XR overlap filtering."},
+		{.name = "bitstream-order", .label = "Order", .group = "Bitstream", .kind = ParamKind::Enum, .defaultValue = std::string{"spatial"}, .enumValues = {{.value="spatial", .label="Spatial"}, {.value="frequency", .label="Frequency"}}, .help = "Spatial or frequency bitstream order."},
+		{.name = "subband", .label = "Subband", .group = "Bitstream", .kind = ParamKind::Enum, .defaultValue = std::string{"all"}, .enumValues = {{.value="all", .label="All"}, {.value="no-flexbits", .label="No flexbits"}, {.value="no-highpass", .label="No highpass"}, {.value="dc-only", .label="DC only"}}, .help = "Subbands retained in the codestream."},
+		{.name = "trim-flex-bits", .label = "Trim flexbits", .group = "Bitstream", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{.min=0, .max=15, .step=1}, .help = "Number of flex bits to trim."},
 		{.name = "hard-tiles", .label = "Hard tiles", .group = "Tiling", .kind = ParamKind::Bool, .defaultValue = false, .help = "Use hard tile boundaries."},
-		{.name = "tiles-x", .label = "Tiles X", .group = "Tiling", .kind = ParamKind::Int, .defaultValue = int64_t{1}, .intRange = IntRange{1, 16, 1}, .help = "Number of horizontal tile slices."},
-		{.name = "tiles-y", .label = "Tiles Y", .group = "Tiling", .kind = ParamKind::Int, .defaultValue = int64_t{1}, .intRange = IntRange{1, 16, 1}, .help = "Number of vertical tile slices."},
+		{.name = "tiles-x", .label = "Tiles X", .group = "Tiling", .kind = ParamKind::Int, .defaultValue = int64_t{1}, .intRange = IntRange{.min=1, .max=16, .step=1}, .help = "Number of horizontal tile slices."},
+		{.name = "tiles-y", .label = "Tiles Y", .group = "Tiling", .kind = ParamKind::Int, .defaultValue = int64_t{1}, .intRange = IntRange{.min=1, .max=16, .step=1}, .help = "Number of vertical tile slices."},
 		{.name = "progressive", .label = "Progressive", .group = "Bitstream", .kind = ParamKind::Bool, .defaultValue = false, .help = "Emit progressive mode."},
 		{.name = "unscaled-arith", .label = "Unscaled arithmetic", .group = "Entropy", .kind = ParamKind::Bool, .defaultValue = false, .help = "Force unscaled arithmetic coding."},
 	};
@@ -787,7 +801,7 @@ EncodedImage encode_jpegxr_still_image(const RawImage& image, std::span<const En
 	if (rgb.bitDepth != 8 && rgb.bitDepth != 16) {
 		throw std::invalid_argument("JPEG XR supports 8-bit or 16-bit RGB input in this implementation");
 	}
-	std::filesystem::path path = std::filesystem::temp_directory_path() / "codec_vis_tmp.jxr";
+	std::filesystem::path const path = std::filesystem::temp_directory_path() / "codec_vis_tmp.jxr";
 	WMPStream* stream = nullptr;
 	if (CreateWS_File(&stream, path.c_str(), "wb") != 0) throw std::runtime_error("jxrlib CreateWS_File failed");
 	std::unique_ptr<WMPStream, void (*)(WMPStream*)> streamGuard(stream, [](WMPStream* s) {
@@ -806,11 +820,11 @@ EncodedImage encode_jpegxr_still_image(const RawImage& image, std::span<const En
 	scp.uiDefaultQPIndexYHP = static_cast<U8>(std::clamp<int64_t>(param_value<int64_t>(params, "qp-yhp", 0), 0, 255));
 	scp.uiDefaultQPIndexU = static_cast<U8>(std::clamp<int64_t>(param_value<int64_t>(params, "qp-u", 0), 0, 255));
 	scp.uiDefaultQPIndexV = static_cast<U8>(std::clamp<int64_t>(param_value<int64_t>(params, "qp-v", 0), 0, 255));
-	const std::string overlap = param_value<std::string>(params, "overlap", "one");
+	const auto overlap = param_value<std::string>(params, "overlap", "one");
 	scp.olOverlap = overlap == "none" ? OL_NONE : (overlap == "two" ? OL_TWO : OL_ONE);
-	const std::string order = param_value<std::string>(params, "bitstream-order", "spatial");
+	const auto order = param_value<std::string>(params, "bitstream-order", "spatial");
 	scp.bfBitstreamFormat = order == "frequency" ? FREQUENCY : SPATIAL;
-	const std::string subband = param_value<std::string>(params, "subband", "all");
+	const auto subband = param_value<std::string>(params, "subband", "all");
 	if (subband == "no-flexbits") scp.sbSubband = SB_NO_FLEXBITS;
 	else if (subband == "no-highpass") scp.sbSubband = SB_NO_HIGHPASS;
 	else if (subband == "dc-only") scp.sbSubband = SB_DC_ONLY;
@@ -826,19 +840,20 @@ EncodedImage encode_jpegxr_still_image(const RawImage& image, std::span<const En
 	for (int i = 0; i < tilesX; ++i) scp.uiTileX[i] = static_cast<U32>(std::max(1, (image.width + 15) / 16 / tilesX));
 	for (int i = 0; i < tilesY; ++i) scp.uiTileY[i] = static_cast<U32>(std::max(1, (image.height + 15) / 16 / tilesY));
 	const PKPixelFormatGUID pixelFormat =
-		rgb.bitDepth == 8 ? GUID_PKPixelFormat24bppRGB : GUID_PKPixelFormat48bppRGB;
+		rgb.channels == 1 ? GUID_PKPixelFormat8bppGray :
+		(rgb.bitDepth == 8 ? GUID_PKPixelFormat24bppRGB : GUID_PKPixelFormat48bppRGB);
 	if (enc->Initialize(enc, stream, &scp, sizeof(scp)) != 0 ||
 	    enc->SetPixelFormat(enc, pixelFormat) != 0 ||
 	    enc->SetSize(enc, image.width, image.height) != 0 ||
 	    enc->WritePixels(
 		    enc, static_cast<U32>(image.height), const_cast<U8*>(rgb.bytes.data()),
-		    static_cast<U32>(image.width * 3 * (rgb.bitDepth == 8 ? 1 : 2))
+		    static_cast<U32>(image.width * rgb.channels * (rgb.bitDepth == 8 ? 1 : 2))
 	    ) != 0 ||
 	    enc->Terminate(enc) != 0) {
 		throw std::runtime_error("jxrlib encode failed");
 	}
 	encGuard.reset();
-	streamGuard.release();
+	(void)streamGuard.release();
 	const std::vector<uint8_t> file = read_temp_file(path);
 	std::filesystem::remove(path);
 	EncodedImage encoded;
@@ -849,11 +864,11 @@ EncodedImage encode_jpegxr_still_image(const RawImage& image, std::span<const En
 
 std::vector<EncoderParamInfo> query_png_parameters() {
 	return {
-		{.name = "compression", .label = "Compression", .group = "Size / Time", .kind = ParamKind::Int, .defaultValue = int64_t{6}, .intRange = IntRange{0, 9, 1}, .help = "PNG zlib compression level. 0 is fastest/largest, 9 is slowest/smallest."},
-		{.name = "strategy", .label = "Strategy", .group = "Size / Time", .kind = ParamKind::Enum, .defaultValue = std::string{"default"}, .enumValues = {{"default", "Default"}, {"filtered", "Filtered"}, {"rle", "RLE"}, {"huffman", "Huffman only"}, {"fixed", "Fixed Huffman"}}, .help = "zlib strategy. RLE/Huffman can be faster; Default is usually smallest."},
-		{.name = "mem-level", .label = "Memory level", .group = "Size / Time", .kind = ParamKind::Int, .defaultValue = int64_t{8}, .intRange = IntRange{1, 9, 1}, .help = "zlib memory level. Higher can improve compression and speed at higher memory cost."},
-		{.name = "window-bits", .label = "Window bits", .group = "Size / Time", .kind = ParamKind::Int, .defaultValue = int64_t{15}, .intRange = IntRange{8, 15, 1}, .help = "zlib window size. Smaller can reduce memory and sometimes size for tiny images."},
-		{.name = "filters", .label = "Filters", .group = "Prediction", .kind = ParamKind::Enum, .defaultValue = std::string{"all"}, .enumValues = {{"none", "None"}, {"fast", "Fast"}, {"all", "All"}, {"sub", "Sub"}, {"up", "Up"}, {"avg", "Average"}, {"paeth", "Paeth"}}, .help = "PNG row filters to try. More filters can improve size at extra CPU cost."},
+		{.name = "compression", .label = "Compression", .group = "Size / Time", .kind = ParamKind::Int, .defaultValue = int64_t{6}, .intRange = IntRange{.min=0, .max=9, .step=1}, .help = "PNG zlib compression level. 0 is fastest/largest, 9 is slowest/smallest."},
+		{.name = "strategy", .label = "Strategy", .group = "Size / Time", .kind = ParamKind::Enum, .defaultValue = std::string{"default"}, .enumValues = {{.value="default", .label="Default"}, {.value="filtered", .label="Filtered"}, {.value="rle", .label="RLE"}, {.value="huffman", .label="Huffman only"}, {.value="fixed", .label="Fixed Huffman"}}, .help = "zlib strategy. RLE/Huffman can be faster; Default is usually smallest."},
+		{.name = "mem-level", .label = "Memory level", .group = "Size / Time", .kind = ParamKind::Int, .defaultValue = int64_t{8}, .intRange = IntRange{.min=1, .max=9, .step=1}, .help = "zlib memory level. Higher can improve compression and speed at higher memory cost."},
+		{.name = "window-bits", .label = "Window bits", .group = "Size / Time", .kind = ParamKind::Int, .defaultValue = int64_t{15}, .intRange = IntRange{.min=8, .max=15, .step=1}, .help = "zlib window size. Smaller can reduce memory and sometimes size for tiny images."},
+		{.name = "filters", .label = "Filters", .group = "Prediction", .kind = ParamKind::Enum, .defaultValue = std::string{"all"}, .enumValues = {{.value="none", .label="None"}, {.value="fast", .label="Fast"}, {.value="all", .label="All"}, {.value="sub", .label="Sub"}, {.value="up", .label="Up"}, {.value="avg", .label="Average"}, {.value="paeth", .label="Paeth"}}, .help = "PNG row filters to try. More filters can improve size at extra CPU cost."},
 	};
 }
 
@@ -878,13 +893,13 @@ EncodedImage encode_png_still_image(const RawImage& image, std::span<const Encod
 	png_set_compression_level(png, static_cast<int>(param_value<int64_t>(params, "compression", 6)));
 	png_set_compression_mem_level(png, static_cast<int>(param_value<int64_t>(params, "mem-level", 8)));
 	png_set_compression_window_bits(png, static_cast<int>(param_value<int64_t>(params, "window-bits", 15)));
-	const std::string strategy = param_value<std::string>(params, "strategy", "default");
+	const auto strategy = param_value<std::string>(params, "strategy", "default");
 	if (strategy == "filtered") png_set_compression_strategy(png, Z_FILTERED);
 	else if (strategy == "rle") png_set_compression_strategy(png, Z_RLE);
 	else if (strategy == "huffman") png_set_compression_strategy(png, Z_HUFFMAN_ONLY);
 	else if (strategy == "fixed") png_set_compression_strategy(png, Z_FIXED);
 	else png_set_compression_strategy(png, Z_DEFAULT_STRATEGY);
-	const std::string filters = param_value<std::string>(params, "filters", "all");
+	const auto filters = param_value<std::string>(params, "filters", "all");
 	if (filters == "none") png_set_filter(png, PNG_FILTER_TYPE_BASE, PNG_FILTER_NONE);
 	else if (filters == "fast") png_set_filter(png, PNG_FILTER_TYPE_BASE, PNG_FAST_FILTERS);
 	else if (filters == "sub") png_set_filter(png, PNG_FILTER_TYPE_BASE, PNG_FILTER_SUB);
@@ -892,7 +907,7 @@ EncodedImage encode_png_still_image(const RawImage& image, std::span<const Encod
 	else if (filters == "avg") png_set_filter(png, PNG_FILTER_TYPE_BASE, PNG_FILTER_AVG);
 	else if (filters == "paeth") png_set_filter(png, PNG_FILTER_TYPE_BASE, PNG_FILTER_PAETH);
 	else png_set_filter(png, PNG_FILTER_TYPE_BASE, PNG_ALL_FILTERS);
-	png_set_IHDR(png, info, image.width, image.height, rgb.bitDepth, PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+	png_set_IHDR(png, info, image.width, image.height, rgb.bitDepth, rgb.channels == 1 ? PNG_COLOR_TYPE_GRAY : PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
 #ifdef PNG_cICP_SUPPORTED
 	png_set_cICP(
 		png,
@@ -903,11 +918,11 @@ EncodedImage encode_png_still_image(const RawImage& image, std::span<const Encod
 		1
 	);
 #endif
-	if (rgb.bitDepth == 16) png_set_swap(png);
 	png_write_info(png, info);
+	if (rgb.bitDepth == 16) png_set_swap(png);
 	for (int y = 0; y < image.height; ++y) {
-		png_bytep row = const_cast<png_bytep>(
-			rgb.bytes.data() + static_cast<std::size_t>(y) * image.width * 3 * (rgb.bitDepth == 8 ? 1 : 2)
+		auto row = const_cast<png_bytep>(
+			rgb.bytes.data() + static_cast<std::size_t>(y) * image.width * rgb.channels * (rgb.bitDepth == 8 ? 1 : 2)
 		);
 		png_write_rows(png, &row, 1);
 	}
@@ -921,27 +936,27 @@ EncodedImage encode_png_still_image(const RawImage& image, std::span<const Encod
 
 std::vector<EncoderParamInfo> query_x264_parameters() {
 	return {
-		{.name = "preset", .label = "Preset", .group = "Speed / Search", .kind = ParamKind::Enum, .defaultValue = std::string{"medium"}, .enumValues = {{"ultrafast", "Ultrafast"}, {"superfast", "Superfast"}, {"veryfast", "Veryfast"}, {"faster", "Faster"}, {"fast", "Fast"}, {"medium", "Medium"}, {"slow", "Slow"}, {"slower", "Slower"}, {"veryslow", "Veryslow"}, {"placebo", "Placebo"}}, .help = "x264 preset."},
-		{.name = "tune", .label = "Tune", .group = "Speed / Search", .kind = ParamKind::Enum, .defaultValue = std::string{"stillimage"}, .enumValues = {{"stillimage", "Still image"}, {"psnr", "PSNR"}, {"ssim", "SSIM"}, {"grain", "Grain"}, {"film", "Film"}, {"animation", "Animation"}, {"fastdecode", "Fast decode"}, {"zerolatency", "Zero latency"}}, .help = "x264 tune."},
-		{.name = "rate-control", .label = "Mode", .group = "Rate Control", .kind = ParamKind::Enum, .defaultValue = std::string{"qp"}, .enumValues = {{"qp", "Constant QP"}, {"crf", "Constant quality (CRF)"}, {"lossless", "Lossless"}}, .help = "Still-image rate-control mode."},
-		{.name = "qp", .label = "QP", .group = "Rate Control", .kind = ParamKind::Int, .defaultValue = int64_t{22}, .intRange = IntRange{1, 51, 1}, .help = "Constant quantizer. Lossless is a separate mode so profile compatibility is explicit.", .enabledWhen = {{"rate-control", {"qp"}, "Constant QP mode only"}}},
-		{.name = "crf", .label = "CRF", .group = "Rate Control", .kind = ParamKind::Float, .defaultValue = double{23.0}, .floatRange = FloatRange{0.0, 51.0, 0.1}, .help = "Constant-rate-factor quality target.", .enabledWhen = {{"rate-control", {"crf"}, "CRF mode only"}}},
-		{.name = "profile", .label = "Compatibility profile", .group = "Bitstream", .kind = ParamKind::Enum, .defaultValue = std::string{"auto"}, .enumValues = {{"auto", "Auto"}, {"baseline", "Baseline"}, {"main", "Main"}, {"high", "High"}}, .help = "Explicit compatibility profiles apply only to lossy 8-bit 4:2:0. Other formats and lossless mode require the profile derived by x264.", .enabledWhen = {{"bit-depth", {"8"}, "8-bit output only"}, {"chroma-subsampling", {"420"}, "4:2:0 output only"}, {"rate-control", {"qp", "crf"}, "Lossy modes only"}}},
-		{.name = "cabac", .label = "CABAC", .group = "Entropy", .kind = ParamKind::Bool, .defaultValue = true, .help = "Enable CABAC entropy coding.", .enabledWhen = {{"profile", {"auto", "main", "high"}, "Baseline profile requires CAVLC"}}},
-		{.name = "8x8dct", .label = "8x8 DCT", .group = "Transform", .kind = ParamKind::Bool, .defaultValue = true, .help = "Enable 8x8 transform.", .enabledWhen = {{"profile", {"auto", "high"}, "8x8 transform requires a High-family profile"}, {"rate-control", {"qp", "crf"}, "Lossy modes only"}}},
-		{.name = "partitions", .label = "Partitions", .group = "Intra Analysis", .kind = ParamKind::Enum, .defaultValue = std::string{"i4x4,i8x8"}, .enumValues = {{"none", "None"}, {"i4x4", "I4x4"}, {"i8x8", "I8x8"}, {"i4x4,i8x8", "I4x4 + I8x8"}, {"all", "All"}}, .help = "Intra partition search modes.", .enabledWhen = {{"profile", {"auto", "high"}, "The exposed partition choices include High-profile I8x8"}}},
-		{.name = "subme", .label = "Subme", .group = "Intra Analysis", .kind = ParamKind::Int, .defaultValue = int64_t{7}, .intRange = IntRange{0, 11, 1}, .help = "Subpixel/refinement and mode decision quality."},
-		{.name = "trellis", .label = "Trellis", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{1}, .intRange = IntRange{0, 2, 1}, .help = "Trellis RD quantization.", .enabledWhen = {{"rate-control", {"qp", "crf"}, "Lossy modes only"}}},
-		{.name = "psy", .label = "Psy", .group = "Psychovisual", .kind = ParamKind::Bool, .defaultValue = true, .help = "Enable psychovisual optimizations.", .enabledWhen = {{"rate-control", {"qp", "crf"}, "Lossy modes only"}}},
-		{.name = "psy-rd", .label = "Psy RD", .group = "Psychovisual", .kind = ParamKind::String, .defaultValue = std::string{"1.0:0.0"}, .help = "x264 psy-rd string: psy-rd:psy-trellis.", .enabledWhen = {{"rate-control", {"qp", "crf"}, "Lossy modes only"}}},
-		{.name = "aq-mode", .label = "AQ mode", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{1}, .intRange = IntRange{0, 3, 1}, .help = "Adaptive quantization mode.", .enabledWhen = {{"rate-control", {"qp", "crf"}, "Lossy modes only"}}},
-		{.name = "aq-strength", .label = "AQ strength", .group = "Quantization", .kind = ParamKind::Float, .defaultValue = double{1.0}, .floatRange = FloatRange{0.0, 3.0, 0.05}, .help = "Adaptive quantization strength.", .enabledWhen = {{"rate-control", {"qp", "crf"}, "Lossy modes only"}}},
-		{.name = "chroma-qp-offset", .label = "Chroma QP offset", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{-12, 12, 1}, .help = "Chroma QP offset.", .enabledWhen = {{"rate-control", {"qp", "crf"}, "Lossy modes only"}}},
-		{.name = "deadzone-intra", .label = "Deadzone intra", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{11}, .intRange = IntRange{0, 32, 1}, .help = "Luma intra quantization deadzone.", .enabledWhen = {{"rate-control", {"qp", "crf"}, "Lossy modes only"}}},
-		{.name = "nr", .label = "Noise reduction", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{0, 100000, 1}, .help = "Adaptive pseudo-deadzone noise reduction.", .enabledWhen = {{"rate-control", {"qp", "crf"}, "Lossy modes only"}}},
-		{.name = "deblock", .label = "Deblock", .group = "Loop Filter", .kind = ParamKind::String, .defaultValue = std::string{"0:0"}, .help = "Deblocking filter alpha:beta offsets, or 0/false to disable.", .enabledWhen = {{"rate-control", {"qp", "crf"}, "Lossy modes only"}}},
+		{.name = "preset", .label = "Preset", .group = "Speed / Search", .kind = ParamKind::Enum, .defaultValue = std::string{"medium"}, .enumValues = {{.value="ultrafast", .label="Ultrafast"}, {.value="superfast", .label="Superfast"}, {.value="veryfast", .label="Veryfast"}, {.value="faster", .label="Faster"}, {.value="fast", .label="Fast"}, {.value="medium", .label="Medium"}, {.value="slow", .label="Slow"}, {.value="slower", .label="Slower"}, {.value="veryslow", .label="Veryslow"}, {.value="placebo", .label="Placebo"}}, .help = "x264 preset."},
+		{.name = "tune", .label = "Tune", .group = "Speed / Search", .kind = ParamKind::Enum, .defaultValue = std::string{"stillimage"}, .enumValues = {{.value="stillimage", .label="Still image"}, {.value="psnr", .label="PSNR"}, {.value="ssim", .label="SSIM"}, {.value="grain", .label="Grain"}, {.value="film", .label="Film"}, {.value="animation", .label="Animation"}, {.value="fastdecode", .label="Fast decode"}, {.value="zerolatency", .label="Zero latency"}}, .help = "x264 tune."},
+		{.name = "rate-control", .label = "Mode", .group = "Rate Control", .kind = ParamKind::Enum, .defaultValue = std::string{"qp"}, .enumValues = {{.value="qp", .label="Constant QP"}, {.value="crf", .label="Constant quality (CRF)"}, {.value="lossless", .label="Lossless"}}, .help = "Still-image rate-control mode."},
+		{.name = "qp", .label = "QP", .group = "Rate Control", .kind = ParamKind::Int, .defaultValue = int64_t{22}, .intRange = IntRange{.min=1, .max=51, .step=1}, .help = "Constant quantizer. Lossless is a separate mode so profile compatibility is explicit.", .enabledWhen = {{.parameter="rate-control", .acceptedValues={"qp"}, .explanation="Constant QP mode only"}}},
+		{.name = "crf", .label = "CRF", .group = "Rate Control", .kind = ParamKind::Float, .defaultValue = double{23.0}, .floatRange = FloatRange{.min=0.0, .max=51.0, .step=0.1}, .help = "Constant-rate-factor quality target.", .enabledWhen = {{.parameter="rate-control", .acceptedValues={"crf"}, .explanation="CRF mode only"}}},
+		{.name = "profile", .label = "Compatibility profile", .group = "Bitstream", .kind = ParamKind::Enum, .defaultValue = std::string{"auto"}, .enumValues = {{.value="auto", .label="Auto"}, {.value="baseline", .label="Baseline"}, {.value="main", .label="Main"}, {.value="high", .label="High"}}, .help = "Explicit compatibility profiles apply only to lossy 8-bit 4:2:0. Other formats and lossless mode require the profile derived by x264.", .enabledWhen = {{.parameter="bit-depth", .acceptedValues={"8"}, .explanation="8-bit output only"}, {.parameter="chroma-subsampling", .acceptedValues={"420"}, .explanation="4:2:0 output only"}, {.parameter="rate-control", .acceptedValues={"qp", "crf"}, .explanation="Lossy modes only"}}},
+		{.name = "cabac", .label = "CABAC", .group = "Entropy", .kind = ParamKind::Bool, .defaultValue = true, .help = "Enable CABAC entropy coding.", .enabledWhen = {{.parameter="profile", .acceptedValues={"auto", "main", "high"}, .explanation="Baseline profile requires CAVLC"}}},
+		{.name = "8x8dct", .label = "8x8 DCT", .group = "Transform", .kind = ParamKind::Bool, .defaultValue = true, .help = "Enable 8x8 transform.", .enabledWhen = {{.parameter="profile", .acceptedValues={"auto", "high"}, .explanation="8x8 transform requires a High-family profile"}, {.parameter="rate-control", .acceptedValues={"qp", "crf"}, .explanation="Lossy modes only"}}},
+		{.name = "partitions", .label = "Partitions", .group = "Intra Analysis", .kind = ParamKind::Enum, .defaultValue = std::string{"i4x4,i8x8"}, .enumValues = {{.value="none", .label="None"}, {.value="i4x4", .label="I4x4"}, {.value="i8x8", .label="I8x8"}, {.value="i4x4,i8x8", .label="I4x4 + I8x8"}, {.value="all", .label="All"}}, .help = "Intra partition search modes.", .enabledWhen = {{.parameter="profile", .acceptedValues={"auto", "high"}, .explanation="The exposed partition choices include High-profile I8x8"}}},
+		{.name = "subme", .label = "Subme", .group = "Intra Analysis", .kind = ParamKind::Int, .defaultValue = int64_t{7}, .intRange = IntRange{.min=0, .max=11, .step=1}, .help = "Subpixel/refinement and mode decision quality."},
+		{.name = "trellis", .label = "Trellis", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{1}, .intRange = IntRange{.min=0, .max=2, .step=1}, .help = "Trellis RD quantization.", .enabledWhen = {{.parameter="rate-control", .acceptedValues={"qp", "crf"}, .explanation="Lossy modes only"}}},
+		{.name = "psy", .label = "Psy", .group = "Psychovisual", .kind = ParamKind::Bool, .defaultValue = true, .help = "Enable psychovisual optimizations.", .enabledWhen = {{.parameter="rate-control", .acceptedValues={"qp", "crf"}, .explanation="Lossy modes only"}}},
+		{.name = "psy-rd", .label = "Psy RD", .group = "Psychovisual", .kind = ParamKind::String, .defaultValue = std::string{"1.0:0.0"}, .help = "x264 psy-rd string: psy-rd:psy-trellis.", .enabledWhen = {{.parameter="rate-control", .acceptedValues={"qp", "crf"}, .explanation="Lossy modes only"}}},
+		{.name = "aq-mode", .label = "AQ mode", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{1}, .intRange = IntRange{.min=0, .max=3, .step=1}, .help = "Adaptive quantization mode.", .enabledWhen = {{.parameter="rate-control", .acceptedValues={"qp", "crf"}, .explanation="Lossy modes only"}}},
+		{.name = "aq-strength", .label = "AQ strength", .group = "Quantization", .kind = ParamKind::Float, .defaultValue = double{1.0}, .floatRange = FloatRange{.min=0.0, .max=3.0, .step=0.05}, .help = "Adaptive quantization strength.", .enabledWhen = {{.parameter="rate-control", .acceptedValues={"qp", "crf"}, .explanation="Lossy modes only"}}},
+		{.name = "chroma-qp-offset", .label = "Chroma QP offset", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{.min=-12, .max=12, .step=1}, .help = "Chroma QP offset.", .enabledWhen = {{.parameter="rate-control", .acceptedValues={"qp", "crf"}, .explanation="Lossy modes only"}}},
+		{.name = "deadzone-intra", .label = "Deadzone intra", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{11}, .intRange = IntRange{.min=0, .max=32, .step=1}, .help = "Luma intra quantization deadzone.", .enabledWhen = {{.parameter="rate-control", .acceptedValues={"qp", "crf"}, .explanation="Lossy modes only"}}},
+		{.name = "nr", .label = "Noise reduction", .group = "Quantization", .kind = ParamKind::Int, .defaultValue = int64_t{0}, .intRange = IntRange{.min=0, .max=100000, .step=1}, .help = "Adaptive pseudo-deadzone noise reduction.", .enabledWhen = {{.parameter="rate-control", .acceptedValues={"qp", "crf"}, .explanation="Lossy modes only"}}},
+		{.name = "deblock", .label = "Deblock", .group = "Loop Filter", .kind = ParamKind::String, .defaultValue = std::string{"0:0"}, .help = "Deblocking filter alpha:beta offsets, or 0/false to disable.", .enabledWhen = {{.parameter="rate-control", .acceptedValues={"qp", "crf"}, .explanation="Lossy modes only"}}},
 		{.name = "constrained-intra", .label = "Constrained intra", .group = "Prediction", .kind = ParamKind::Bool, .defaultValue = false, .help = "Constrained intra prediction."},
-		{.name = "slices", .label = "Slices", .group = "Bitstream", .kind = ParamKind::Int, .defaultValue = int64_t{1}, .intRange = IntRange{1, 128, 1}, .help = "Number of slices."},
+		{.name = "slices", .label = "Slices", .group = "Bitstream", .kind = ParamKind::Int, .defaultValue = int64_t{1}, .intRange = IntRange{.min=1, .max=128, .step=1}, .help = "Number of slices."},
 		{.name = "aud", .label = "AUD", .group = "Bitstream", .kind = ParamKind::Bool, .defaultValue = false, .help = "Emit access unit delimiters."},
 		{.name = "level", .label = "Level", .group = "Bitstream", .kind = ParamKind::String, .defaultValue = std::string{""}, .help = "Optional H.264 level, e.g. 4.1. Empty lets x264 choose."},
 	};
@@ -949,8 +964,8 @@ std::vector<EncoderParamInfo> query_x264_parameters() {
 
 EncodedImage encode_x264_intra_still_image(const RawImage& image, std::span<const EncoderParam> params) {
 	x264_param_t p{};
-	const std::string preset = param_value<std::string>(params, "preset", "medium");
-	const std::string tune = param_value<std::string>(params, "tune", "stillimage");
+	const auto preset = param_value<std::string>(params, "preset", "medium");
+	const auto tune = param_value<std::string>(params, "tune", "stillimage");
 	if (x264_param_default_preset(&p, preset.c_str(), tune.empty() ? nullptr : tune.c_str()) < 0) throw std::runtime_error("x264 preset setup failed");
 	const X264InputFormat input = x264_input_format(image.format);
 	p.i_width = image.width;
@@ -971,7 +986,7 @@ EncodedImage encode_x264_intra_still_image(const RawImage& image, std::span<cons
 	p.vui.i_transfer = static_cast<int>(image.color.transfer);
 	p.vui.i_colmatrix = static_cast<int>(image.color.matrix);
 	p.vui.i_chroma_loc = static_cast<int>(image.color.chroma420Location.value_or(Chroma420SampleLocation::LeftCenter));
-	const std::string rateControl = param_value<std::string>(params, "rate-control", "qp");
+	const auto rateControl = param_value<std::string>(params, "rate-control", "qp");
 	const bool lossless = rateControl == "lossless";
 	if (rateControl == "qp") {
 		p.rc.i_rc_method = X264_RC_CQP;
@@ -1001,7 +1016,7 @@ EncodedImage encode_x264_intra_still_image(const RawImage& image, std::span<cons
 			throw std::invalid_argument("x264: invalid parameter '" + param.name + "' = " + value);
 		}
 	}
-	std::string profile = param_value<std::string>(params, "profile", "auto");
+	auto profile = param_value<std::string>(params, "profile", "auto");
 	if (profile != "auto" && (lossless || input.bitDepth != 8 || !is_420(image.format))) {
 		throw std::invalid_argument("x264: explicit baseline/main/high profiles require lossy 8-bit 4:2:0 output");
 	}
@@ -1009,7 +1024,7 @@ EncodedImage encode_x264_intra_still_image(const RawImage& image, std::span<cons
 	if (x264_param_apply_profile(&p, profile.c_str()) < 0) {
 		throw std::invalid_argument("x264: invalid profile " + profile);
 	}
-	std::unique_ptr<x264_t, decltype(&x264_encoder_close)> enc(x264_encoder_open(&p), x264_encoder_close);
+	std::unique_ptr<x264_t, decltype(&x264_encoder_close)> const enc(x264_encoder_open(&p), x264_encoder_close);
 	if (!enc) throw std::runtime_error("x264_encoder_open failed");
 	x264_picture_t picIn{};
 	x264_picture_init(&picIn);

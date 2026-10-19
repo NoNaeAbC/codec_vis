@@ -1,0 +1,54 @@
+[
+  {
+    "snapshot": "src/h265/independent_scc_slice.hpp",
+    "sha256": "119a7632da26d5ba7bd0b45682a4e580f70cdbb6cb40b2ee32fa99c2ab11e087"
+  },
+  {
+    "snapshot": "src/h265/decoder_internal.hpp",
+    "sha256": "025b75d754cb09b5ba4704eccfaf11df7577082fe19ea94d0a3d68b3b1e53035"
+  },
+  {
+    "snapshot": "include/native_video/h265/api.hpp",
+    "sha256": "1aea24ca6fa5fae432554837b36918e3a9de21dffbc2d9e1bc4603ee4617ac94"
+  },
+  {
+    "snapshot": "include/native_video/encode/api.hpp",
+    "sha256": "a65660ed17a765e956b018397944af1a0f328f6d4f46dd42ffbd54c7f26f0084"
+  },
+  {
+    "snapshot": "include/native_video/color/dynamic_hdr.hpp",
+    "sha256": "ebc3624382f9b4ebd1d2e23abd22c06038dc7680217fe974f77d8c554e8b3535"
+  },
+  {
+    "snapshot": "include/native_video/color/hdr10plus.hpp",
+    "sha256": "63fe60775a7a02debd1e5e99da1e804011a8744c68352c684af230af3faa648c"
+  },
+  {
+    "snapshot": "include/native_video/av1/api.hpp",
+    "sha256": "4171e0b90ce1b584a5c55da6fdc7d077422ef079f63000791606e6dfc2c92f54"
+  },
+  {
+    "snapshot": "src/h265/bitstream_parser.cpp",
+    "sha256": "9a37e2646acd34fb8dee6ce99479a9a9e9a0b798f56ddec91b70776ec2a1a8d5"
+  },
+  {
+    "snapshot": "include/native_video/color/hdr10plus_t35.hpp",
+    "sha256": "35c8eeb286ecffa465e5c766bf6959bcbb50151023d40d22054f4e5c5b570822"
+  },
+  {
+    "snapshot": "include/native_video/color/hdr10plus_author.hpp",
+    "sha256": "afe7ca74b9c6508c29b664805edf228671c24d34d6689fd95200876b058d4c91"
+  },
+  {
+    "snapshot": "include/native_video/math/polynomial_sign.hpp",
+    "sha256": "2e51478129897b820e1b3d2434c49ee187a957271e9e6b69964eaeaecfc2eb33"
+  },
+  {
+    "snapshot": "src/h265/vulkan_video_decode.hpp",
+    "sha256": "aeb94f400a5f64f44f1dc28ae792b3c00b07c9bc11e316e0880ac3bc9773a5b4"
+  },
+  {
+    "snapshot": "src/h265/vulkan_video_decode.cpp",
+    "sha256": "a04c7a2be9ecae0faeeb4a53059ed80a05c231c82c9f927fa8ee2c800ae3a84e"
+  }
+]

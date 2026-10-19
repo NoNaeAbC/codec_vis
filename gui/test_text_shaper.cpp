@@ -1,3 +1,4 @@
+#include "test_check.hpp"
 #include "text_shaper.hpp"
 
 #include <cassert>
@@ -8,23 +9,23 @@ using namespace codec_gui::gui;
 
 int main() {
 	const std::filesystem::path font = default_font_path();
-	assert(std::filesystem::exists(font));
-	TextShaper shaper(font, 16.0f);
+	CODEC_VIS_CHECK(std::filesystem::exists(font));
+	TextShaper const shaper(font, 16.0f);
 	const ShapedText text = shaper.shape("codec_vis");
-	assert(!text.glyphs.empty());
-	assert(text.width > 0.0f);
-	assert(text.height == 16.0f);
+	CODEC_VIS_CHECK(!text.glyphs.empty());
+	CODEC_VIS_CHECK(text.width > 0.0f);
+	CODEC_VIS_CHECK(text.height == 16.0f);
 	const GlyphBitmap glyph = shaper.rasterize_glyph(text.glyphs.front().glyphIndex);
-	assert(glyph.width > 0);
-	assert(glyph.height > 0);
-	assert(glyph.alpha.size() == static_cast<std::size_t>(glyph.width * glyph.height));
+	CODEC_VIS_CHECK(glyph.width > 0);
+	CODEC_VIS_CHECK(glyph.height > 0);
+	CODEC_VIS_CHECK(glyph.alpha.size() == static_cast<std::size_t>(glyph.width * glyph.height));
 	const RasterizedText rasterized = shaper.rasterize("codec_vis");
-	assert(rasterized.glyphs.size() == text.glyphs.size());
-	assert(rasterized.width == text.width);
-	assert(rasterized.glyphs.front().bitmap.width > 0);
+	CODEC_VIS_CHECK(rasterized.glyphs.size() == text.glyphs.size());
+	CODEC_VIS_CHECK(rasterized.width == text.width);
+	CODEC_VIS_CHECK(rasterized.glyphs.front().bitmap.width > 0);
 
-	TextShaper substitute(std::filesystem::temp_directory_path() / "codec-vis-missing-font.ttf", 16.0f);
+	TextShaper const substitute(std::filesystem::temp_directory_path() / "codec-vis-missing-font.ttf", 16.0f);
 	const ShapedText substituteText = substitute.shape("substitute");
-	assert(!substituteText.glyphs.empty());
+	CODEC_VIS_CHECK(!substituteText.glyphs.empty());
 	return 0;
 }

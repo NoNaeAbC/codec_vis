@@ -36,6 +36,10 @@ namespace codec_gui::gui {
 		[[nodiscard]] int framebuffer_width() const;
 		[[nodiscard]] int framebuffer_height() const;
 		[[nodiscard]] float output_scale() const;
+		// Start a compositor-managed move using the still-held left press serial.
+        bool begin_move(uint32_t pointerSerial);
+        bool set_clipboard_text(std::string text);
+		bool request_clipboard_text(); // Completion arrives as ClipboardText action.
 
 		void dispatch_pending();
 		[[nodiscard]] std::vector<Action> take_actions();

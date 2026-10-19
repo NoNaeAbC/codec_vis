@@ -1,0 +1,6 @@
+vvc32.vvic is copied byte-for-byte from libheif's fuzzing seed vvc32.heif.
+Upstream revision: 1a3583bcce77de6d3f8701c0758e3954863681ba
+Upstream project: https://github.com/strukturag/libheif
+SHA256: 4eacc2bb40fc837834dedd923c1fd45cdc98ea4e3ba91ea2edb0c310063a0349
+The extension changes to .vvic to exercise the VVC image-container import path.
+The source project's COPYING file is included as libheif-COPYING.

@@ -1,4 +1,6 @@
 #include "settings.hpp"
+#include "../codec_gui_x265.hpp"
+#include "app_state.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -10,6 +12,8 @@
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
+#include <variant>
 #include <vector>
 
 namespace codec_gui::gui {
@@ -17,7 +21,7 @@ namespace {
 
 std::string escape(std::string_view value) {
 	std::string out;
-	for (unsigned char c : value) {
+	for (unsigned char const c : value) {
 		if (c == '%' || c == '\t' || c == '\n' || c == '\r') {
 			const char* hex = "0123456789ABCDEF";
 			out.push_back('%');
@@ -142,7 +146,7 @@ double parse_double(std::string_view text, double defaultValue = 0.0) {
 }
 
 bool pane_exists(const AppState& state, PaneId id) {
-	return std::any_of(state.panes.begin(), state.panes.end(), [id](const Pane& pane) {
+	return std::ranges::any_of(state.panes, [id](const Pane& pane) {
 		return pane.id == id;
 	});
 }
@@ -171,7 +175,7 @@ std::string serialize_settings(const AppState& state) {
 		    << pane.transform.scale << '\t' << pane.transform.centerX << '\t' << pane.transform.centerY << '\t'
 		    << (pane.linkGroup ? *pane.linkGroup : 0) << '\n';
 	}
-	for (PaneId pane : state.viewMode.paneOrder) {
+	for (PaneId const pane : state.viewMode.paneOrder) {
 		out << "pane_order\t" << pane.value << '\n';
 	}
 	for (const EncoderConfig& config : state.encoderConfigs) {
@@ -234,7 +238,7 @@ AppState apply_serialized_settings(AppState state, std::string_view text) {
 			paneOrder.push_back(remapped == paneIdRemap.end() ? PaneId{storedPaneId} : remapped->second);
 		} else if (fields[0] == "param" && fields.size() >= 5) {
 			const BackendId backend{parse_u64(fields[1])};
-			auto config = std::find_if(state.encoderConfigs.begin(), state.encoderConfigs.end(), [&](const EncoderConfig& existing) {
+			auto config = std::ranges::find_if(state.encoderConfigs, [&](const EncoderConfig& existing) {
 				return existing.backend == backend;
 			});
 			if (config == state.encoderConfigs.end()) {

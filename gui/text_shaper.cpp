@@ -1,18 +1,24 @@
 #include "text_shaper.hpp"
+#include "freetype/config/ftheader.h"
+#include "freetype/fttypes.h"
 
-#include <ft2build.h>
+#include <cstdint>
+#include <atomic>
+#include <unordered_map>
+#include <memory>
+#include <string_view>
 #include FT_FREETYPE_H
 #include <fontconfig/fontconfig.h>
 #include <hb-ft.h>
 #include <hb.h>
 
+#include <algorithm>
 #include <array>
 #include <algorithm>
 #include <filesystem>
 #include <stdexcept>
 #include <cstring>
 #include <cmath>
-#include <string>
 #include <utility>
 #include <vector>
 
@@ -44,6 +50,10 @@ std::filesystem::path match_font_file(const char* patternName) {
 		FcChar8* file = nullptr;
 		if (FcPatternGetString(match, FC_FILE, 0, &file) == FcResultMatch && file != nullptr) {
 			path = reinterpret_cast<const char*>(file);
+			const FcChar8* sysroot = FcConfigGetSysRoot(config);
+			if (sysroot != nullptr && sysroot[0] != '\0' && path.is_absolute()) {
+				path = std::filesystem::path{reinterpret_cast<const char*>(sysroot)} / path.relative_path();
+			}
 		}
 		FcPatternDestroy(match);
 	}
@@ -63,7 +73,7 @@ std::vector<std::filesystem::path> secondary_font_candidates() {
 	std::vector<std::filesystem::path> out;
 	for (const char* candidate : Candidates) {
 		const std::filesystem::path path = match_font_file(candidate);
-		if (!path.empty() && std::filesystem::exists(path) && std::find(out.begin(), out.end(), path) == out.end()) {
+		if (!path.empty() && std::filesystem::exists(path) && std::ranges::find(out, path) == out.end()) {
 			out.emplace_back(path);
 		}
 	}
@@ -84,23 +94,37 @@ std::filesystem::path resolve_font_path(const std::filesystem::path& requested) 
 } // namespace
 
 std::filesystem::path default_font_path() {
-	return resolve_font_path({});
+    static const auto path = resolve_font_path({});
+    return path;
 }
+std::filesystem::path default_monospace_font_path() {
+    static const auto path = resolve_font_path(match_font_file("monospace"));
+    return path;
+}
+static std::atomic_uint64_t nextFontIdentity{1};
 
 struct TextShaper::Impl {
 	FT_Library ft = nullptr;
 	std::vector<FT_Face> faces;
 	std::vector<hb_font_t*> fonts;
 	float pixelSize = 0.0f;
+    uint64_t identity = nextFontIdentity++;
+    mutable std::unordered_map<std::string, ShapedText> shapes;
+    ~Impl(){for(auto* font:fonts)hb_font_destroy(font);for(auto face:faces)FT_Done_Face(face);if(ft)FT_Done_FreeType(ft);}
 };
 
-TextShaper::TextShaper(const std::filesystem::path& fontPath, float pixelSize) : impl_(new Impl) {
+TextShaper::TextShaper(const std::filesystem::path& fontPath, float pixelSize) : impl_(nullptr) {
+    auto owner=std::make_unique<Impl>();impl_=owner.get();
+    if (!std::isfinite(pixelSize) || pixelSize <= 0 || pixelSize > 512) {
+        throw std::invalid_argument("UI font size must be in (0, 512]");
+    }
 	impl_->pixelSize = pixelSize;
 	checked_ft(FT_Init_FreeType(&impl_->ft), "FT_Init_FreeType failed");
 
 	std::vector<std::filesystem::path> paths{resolve_font_path(fontPath)};
-	for (const std::filesystem::path& candidate : secondary_font_candidates()) {
-		if (std::find(paths.begin(), paths.end(), candidate) == paths.end()) {
+	static const auto fallbackPaths = secondary_font_candidates();
+	for (const std::filesystem::path& candidate : fallbackPaths) {
+		if (std::ranges::find(paths, candidate) == paths.end()) {
 			paths.push_back(candidate);
 		}
 	}
@@ -124,38 +148,26 @@ TextShaper::TextShaper(const std::filesystem::path& fontPath, float pixelSize) :
 	if (impl_->fonts.empty()) {
 		throw std::runtime_error("no usable UI font found");
 	}
+    owner.release();
 }
 
 TextShaper::TextShaper(TextShaper&& other) noexcept : impl_(std::exchange(other.impl_, nullptr)) {}
 
 TextShaper& TextShaper::operator=(TextShaper&& other) noexcept {
 	if (this != &other) {
-		this->~TextShaper();
-		impl_ = std::exchange(other.impl_, nullptr);
+		TextShaper temporary(std::move(other));
+		std::swap(impl_, temporary.impl_);
 	}
 	return *this;
 }
 
-TextShaper::~TextShaper() {
-	if (impl_ == nullptr) {
-		return;
-	}
-	for (hb_font_t* font : impl_->fonts) {
-		hb_font_destroy(font);
-	}
-	for (FT_Face face : impl_->faces) {
-		FT_Done_Face(face);
-	}
-	if (impl_->ft != nullptr) {
-		FT_Done_FreeType(impl_->ft);
-	}
-	delete impl_;
-}
+TextShaper::~TextShaper() { delete impl_; }
 
 ShapedText TextShaper::shape(std::string_view utf8) const {
 	if (impl_ == nullptr || impl_->fonts.empty()) {
 		throw std::runtime_error("TextShaper is not initialized");
 	}
+    if (auto it=impl_->shapes.find(std::string(utf8));it!=impl_->shapes.end()) return it->second;
 	auto shape_with_font = [](hb_font_t* font, std::string_view text, uint32_t fontIndex) {
 		ShapedText out;
 		hb_buffer_t* buffer = hb_buffer_create();
@@ -170,6 +182,7 @@ ShapedText TextShaper::shape(std::string_view utf8) const {
 		for (unsigned int i = 0; i < count; ++i) {
 			ShapedGlyph glyph;
 			glyph.glyphIndex = infos[i].codepoint;
+            glyph.cluster = infos[i].cluster;
 			glyph.fontIndex = fontIndex;
 			glyph.advanceX = static_cast<float>(positions[i].x_advance) / 64.0f;
 			glyph.advanceY = static_cast<float>(positions[i].y_advance) / 64.0f;
@@ -197,7 +210,7 @@ ShapedText TextShaper::shape(std::string_view utf8) const {
 		bool usedSecondaryFont = false;
 		if (infos[i].codepoint == 0 && impl_->fonts.size() > 1) {
 			const unsigned int begin = infos[i].cluster;
-			unsigned int end = static_cast<unsigned int>(utf8.size());
+			auto end = static_cast<unsigned int>(utf8.size());
 			for (unsigned int j = 0; j < count; ++j) {
 				if (infos[j].cluster > begin) {
 					end = std::min(end, infos[j].cluster);
@@ -206,11 +219,12 @@ ShapedText TextShaper::shape(std::string_view utf8) const {
 			const std::string_view cluster = utf8.substr(begin, end - begin);
 			for (uint32_t fontIndex = 1; fontIndex < impl_->fonts.size(); ++fontIndex) {
 				ShapedText replacement = shape_with_font(impl_->fonts[fontIndex], cluster, fontIndex);
-				const bool usable = std::any_of(replacement.glyphs.begin(), replacement.glyphs.end(), [](const ShapedGlyph& glyph) {
+				const bool usable = std::ranges::any_of(replacement.glyphs, [](const ShapedGlyph& glyph) {
 					return glyph.glyphIndex != 0;
 				});
 					if (usable) {
 						out.width += replacement.width;
+						for(auto& glyph:replacement.glyphs)glyph.cluster+=begin;
 						out.glyphs.insert(out.glyphs.end(), replacement.glyphs.begin(), replacement.glyphs.end());
 						usedSecondaryFont = true;
 						break;
@@ -222,6 +236,7 @@ ShapedText TextShaper::shape(std::string_view utf8) const {
 		}
 			ShapedGlyph glyph;
 		glyph.glyphIndex = infos[i].codepoint;
+            glyph.cluster = infos[i].cluster;
 		glyph.fontIndex = 0;
 		glyph.advanceX = static_cast<float>(positions[i].x_advance) / 64.0f;
 		glyph.advanceY = static_cast<float>(positions[i].y_advance) / 64.0f;
@@ -232,8 +247,12 @@ ShapedText TextShaper::shape(std::string_view utf8) const {
 	}
 	out.height = impl_->pixelSize;
 	hb_buffer_destroy(buffer);
+    if(impl_->shapes.size()>=2048)impl_->shapes.clear();
+    if(utf8.size()<=4096)impl_->shapes.emplace(std::string(utf8),out);
 	return out;
 }
+
+uint64_t TextShaper::identity() const { return impl_ ? impl_->identity : 0; }
 
 GlyphBitmap TextShaper::rasterize_glyph(uint32_t glyphIndex) const {
 	ShapedGlyph glyph;
@@ -249,7 +268,7 @@ GlyphBitmap TextShaper::rasterize_glyph(const ShapedGlyph& glyph) const {
 	FT_Face face = impl_->faces[glyph.fontIndex];
 	checked_ft(FT_Load_Glyph(face, glyph.glyphIndex, FT_LOAD_DEFAULT), "FT_Load_Glyph failed");
 	checked_ft(FT_Render_Glyph(face->glyph, FT_RENDER_MODE_NORMAL), "FT_Render_Glyph failed");
-	const FT_GlyphSlot slot = face->glyph;
+	FT_GlyphSlot slot = face->glyph;
 	GlyphBitmap out;
 	out.glyphIndex = glyph.glyphIndex;
 	out.fontIndex = glyph.fontIndex;
@@ -267,7 +286,7 @@ GlyphBitmap TextShaper::rasterize_glyph(const ShapedGlyph& glyph) const {
 }
 
 RasterizedText TextShaper::rasterize(std::string_view utf8) const {
-	ShapedText shaped = shape(utf8);
+	ShapedText const shaped = shape(utf8);
 	RasterizedText out;
 	out.width = shaped.width;
 	out.height = shaped.height;

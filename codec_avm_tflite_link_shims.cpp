@@ -1,10 +1,15 @@
 // codec_avm_tflite_link_shims.cpp
-// AVM was built with optional TFLite pruning code. The still-image AV2 path here
-// does not enable those tools, but the static archive still has references to
-// TFLite/XNNPACK entry points. These no-op definitions satisfy the unused
-// references without loading TensorFlow into the process.
+// Link compatibility only, never a TFLite runtime. The AV2 backend rejects AVM
+// builds that pull partition inference into the binary: those builds can reach
+// these definitions even when their public ML speed options are disabled.
+// These declarations intentionally provide externally visible ABI-compatible
+// symbols referenced by libavm; internalizing or changing their signatures
+// breaks the final link.
+// NOLINTBEGIN(misc-use-internal-linkage,misc-use-anonymous-namespace,modernize-avoid-variadic-functions,performance-enum-size,performance-trivially-destructible)
 #include <cstddef>
 #include <memory>
+
+extern "C" bool codec_vis_avm_tflite_shims_active() { return true; }
 
 struct TfLiteDelegate;
 struct TfLiteRegistration;
@@ -53,9 +58,9 @@ class MutableOpResolver : public OpResolver {
 public:
 	~MutableOpResolver() override;
 
-	virtual const TfLiteRegistration* FindOp(BuiltinOperator, int) const;
+	[[nodiscard]] virtual const TfLiteRegistration* FindOp(BuiltinOperator, int) const;
 	virtual const TfLiteRegistration* FindOp(const char*, int) const;
-	virtual bool MayContainUserDefinedOps() const;
+	[[nodiscard]] virtual bool MayContainUserDefinedOps() const;
 
 	void AddBuiltin(BuiltinOperator, const TfLiteRegistration*, int);
 };
@@ -208,3 +213,4 @@ const TfLiteRegistration* Register_LOGISTIC() {
 }
 } // namespace ops::builtin
 } // namespace tflite
+// NOLINTEND(misc-use-internal-linkage,misc-use-anonymous-namespace,modernize-avoid-variadic-functions,performance-enum-size,performance-trivially-destructible)

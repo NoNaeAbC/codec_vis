@@ -15,6 +15,10 @@ result = ['-Wl,--start-group']
 for flag in flags:
     if flag in {'-lstdc++', '-lgcc', '-lgcc_s'}:
         continue  # The compiler supplies it via -static-libstdc++.
+    if flag == '-lnsl':
+        # GStreamer probes Solaris networking libraries even on Linux, where
+        # its socketpair/getifaddrs calls are supplied by libc.
+        continue
     if flag == '-fopenmp':
         flag = '-l:libgomp.a'
     if flag == '-latomic_asneeded':

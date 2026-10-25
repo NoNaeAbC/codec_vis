@@ -21,6 +21,7 @@ jobs:
     container: archlinux@sha256:dfb01267da058e5d08ffdc543bf484c9b404655b0bac1d0201d972bf950cdfd0
     env:
       ARCH_SNAPSHOT: 2026/10/24
+      JOBS: 4
     timeout-minutes: 180
     steps:
       - name: Bootstrap checkout tools

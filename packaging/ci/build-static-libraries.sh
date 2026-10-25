@@ -91,7 +91,7 @@ meson_mode=()
 meson setup "${meson_mode[@]}" "$SOURCES/arch/systemd/build-static" "$SOURCES/arch/systemd" \
   --prefix="$PREFIX" --libdir=lib --buildtype=release -Dauto_features=disabled \
   -Dstatic-libsystemd=true -Dtests=false -Dman=false -Dhtml=false
-meson compile -C "$SOURCES/arch/systemd/build-static" -j "$JOBS" libsystemd.a
+ninja -C "$SOURCES/arch/systemd/build-static" -j "$JOBS" libsystemd.a
 install -m644 "$SOURCES/arch/systemd/build-static/libsystemd.a" "$PREFIX/lib/"
 # systemd's installed public .pc omits the private dependencies of its archive.
 # Supply the static library's enabled capability dependency explicitly.

@@ -42,7 +42,9 @@ jobs:
             /opt/codec-vis
             /opt/codec-vis-sources
           key: linux-static-${{ steps.toolchain.outputs.key }}-${{ hashFiles('packaging/ci/dependencies.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: linux-static-${{ steps.toolchain.outputs.key }}-${{ hashFiles('packaging/ci/dependencies.json') }}-
+          restore-keys: |
+            linux-static-${{ steps.toolchain.outputs.key }}-${{ hashFiles('packaging/ci/dependencies.json') }}-
+            linux-static-${{ steps.toolchain.outputs.key }}-
       - name: Build pinned codec libraries
         run: bash packaging/ci/build-dependencies.sh
       - name: Save incremental SDK, including partial builds

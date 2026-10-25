@@ -77,7 +77,7 @@ find "$SOURCES/debian/jxr" -name 'libjxrglue.a' -exec install -m644 '{}' "$PREFI
 source_package gstreamer libgstreamer1.0-dev
 meson_static gstreamer -Dauto_features=disabled -Dtests=disabled -Dexamples=disabled -Dbenchmarks=disabled -Dintrospection=disabled
 source_package gst-parsers libgstreamer-plugins-bad1.0-dev
-meson_static gst-parsers -Dauto_features=disabled -Dcodecparsers=enabled -Dtests=disabled -Dexamples=disabled -Dintrospection=disabled
+meson_static gst-parsers -Dauto_features=disabled -Dtests=disabled -Dexamples=disabled -Dintrospection=disabled
 source_package heif libheif-dev
 cmake_static heif -DWITH_EXAMPLES=OFF -DENABLE_PLUGIN_LOADING=OFF \
   -DWITH_LIBDE265=ON -DWITH_LIBDE265_PLUGIN=OFF -DWITH_DAV1D=ON -DWITH_DAV1D_PLUGIN=OFF \

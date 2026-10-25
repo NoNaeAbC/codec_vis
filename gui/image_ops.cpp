@@ -38,6 +38,7 @@ namespace codec_gui::gui {
 			auto           out         = std::make_shared<RawImage>();
 			out->width                 = a.width;
 			out->height                = a.height;
+			out->pixelAspectRatio = a.pixelAspectRatio;
 			out->format                = gray_format(targetDepth);
 			// A neutral diagnostic heatmap has an explicit linear working-space interpretation.
 			out->color.primaries       = ColorPrimaries::BT2020;
@@ -99,6 +100,7 @@ namespace codec_gui::gui {
 			auto out    = std::make_shared<RawImage>();
 			out->width  = a.width;
 			out->height = a.height;
+			out->pixelAspectRatio = a.pixelAspectRatio;
 			out->format = PixelFormat::RGBP16LE;
 			out->color  = {.primaries = ColorPrimaries::BT2020,
 						   .transfer  = TransferCharacteristics::Linear,

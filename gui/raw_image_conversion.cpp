@@ -592,6 +592,7 @@ RawImage convert_raw_image_format(const RawImage& image, PixelFormat targetForma
 	out.height = image.height;
 	out.format = targetFormat;
 	out.color = image.color;
+	out.pixelAspectRatio = image.pixelAspectRatio;
 	out.nominalPeakNits = image.nominalPeakNits;
 	const int sourceDepth = bit_depth(image.format);
 	const int targetDepth = bit_depth(targetFormat);
@@ -684,6 +685,7 @@ RawImage transform_raw_image(const RawImage& image, PixelFormat targetFormat, co
 	out.height = image.height;
 	out.format = targetFormat;
 	out.color = options.target;
+	out.pixelAspectRatio = image.pixelAspectRatio;
 	const bool sameLightEncoding =
 		image.color.primaries == options.target.primaries &&
 		image.color.transfer == options.target.transfer &&

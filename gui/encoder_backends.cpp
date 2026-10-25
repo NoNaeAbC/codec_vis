@@ -59,6 +59,7 @@ RawImage pad_subsampled_input(RawImage image) {
 	padded.height = paddedHeight;
 	padded.format = image.format;
 	padded.color = image.color;
+	padded.pixelAspectRatio = image.pixelAspectRatio;
 	padded.nominalPeakNits = image.nominalPeakNits;
 	const int sampleBytes = bytes_per_sample(image.format);
 	for (int plane = 0; plane < plane_count(image.format); ++plane) {
@@ -610,6 +611,7 @@ static EncodeResult run_backend_encode_impl(const EncoderBackend& backend, const
 		transformed.color={.primaries=ColorPrimaries::BT709,.transfer=TransferCharacteristics::SRGB,
 			.matrix=MatrixCoefficients::Identity,.range=ColorRange::Full};
 	}
+	transformed.pixelAspectRatio = image.pixelAspectRatio;
 	if (backend.inputGeometry == InputGeometryPolicy::PadToChromaAlignment) {
 		transformed = pad_subsampled_input(std::move(transformed));
 	}
@@ -646,7 +648,9 @@ static EncodeResult run_backend_encode_impl(const EncoderBackend& backend, const
     if(!result.encoded.codedColor)result.encoded.codedColor=result.comparisonReference->color;
 	const auto finish = std::chrono::steady_clock::now();
 	result.metadata = metadata_for_backend(backend, result.encoded, params);
-	result.metadata.encoderInput = result.comparisonReference;
+	if (!image.pixelAspectRatio.square() && !backend_supports_pixel_aspect_ratio(backend.id))
+        result.metadata.keyParams.push_back({"Warning", "Pixel aspect ratio not preserved by this encoder; output uses square pixels"});
+    result.metadata.encoderInput = result.comparisonReference;
 	result.metadata.codedPixelFormat = result.comparisonReference->format;
 	result.metadata.codedColor = result.comparisonReference->color;
 	result.metadata.encodeSeconds = std::chrono::duration<double>(finish - start).count();

@@ -57,7 +57,13 @@ std::vector<Action> execute_command(const Command& command, const AppState& stat
 				Action action;
 				action.kind = ActionKind::SourceLoaded;
 				action.sourceLoaded.path = command.path;
-				action.sourceLoaded.image = std::make_shared<RawImage>(load_input_image(command.path));
+				auto loaded = std::make_shared<RawImage>(load_input_image(command.path));
+				if (command.importPixelAspectRatio) {
+					loaded->intrinsicPixelAspectRatio = loaded->pixelAspectRatio;
+					loaded->pixelAspectRatio = *command.importPixelAspectRatio;
+					loaded->importNote += " External pixel aspect ratio " + std::to_string(loaded->pixelAspectRatio.width) + ":" + std::to_string(loaded->pixelAspectRatio.height) + "; original samples retained.";
+				}
+				action.sourceLoaded.image = std::move(loaded);
 				std::error_code sizeError;
 				const uintmax_t fileSize = std::filesystem::file_size(command.path, sizeError);
 				if (!sizeError && fileSize <= std::numeric_limits<uint64_t>::max()) {

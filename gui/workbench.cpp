@@ -1,5 +1,6 @@
 #include "workbench.hpp"
 #include "encoder_param_state.hpp"
+#include "encoder_backends.hpp"
 #include "image_size_target.hpp"
 #include "metrics.hpp"
 #include "raw_image_utils.hpp"
@@ -297,7 +298,7 @@ namespace codec_gui::gui {
 			r.w /= float(cols);
 			r.h /= float(std::max(1., rows));
 		}
-		transform_          = fit_transform(image->width, image->height, r, 1);
+		transform_          = fit_transform(image->width, image->height, r, 1, pixel_aspect_ratio(*image));
 		referenceTransform_ = transform_;
 		extraTransforms_.fill(transform_);
 	}
@@ -425,6 +426,18 @@ namespace codec_gui::gui {
 		rebuild_     = false;
 		deviceScale_ = deviceScale;
 		reconcile(s);
+		if (aspectSource_ != source_) {
+			aspectSource_ = source_;
+			if (const auto* source = find_image(s, source_); source && source->decoded) {
+				const auto& image = *source->decoded;
+				importPixelAspect_ = image.intrinsicPixelAspectRatio
+					? std::to_string(image.pixelAspectRatio.width) + ":" + std::to_string(image.pixelAspectRatio.height) : "auto";
+				if (s.importPixelAspectRatio != parse_pixel_aspect_ratio(importPixelAspect_)) {
+					Action a; a.kind = ActionKind::SetImportPixelAspectRatio; a.text = importPixelAspect_;
+					actions_.push_back(a);
+				}
+			}
+		}
 		auto visibleSizes = sizes_;
 		if (!sourcesVisible_) visibleSizes.left = 0;
 		if (!toolsVisible_) visibleSizes.right = 0;
@@ -439,8 +452,20 @@ namespace codec_gui::gui {
 		if (ui_.button("import", s.interaction.importPending ? "Importing…" : "Import image…", {14, 10, 155, 32},
 					   !s.interaction.importPending))
 			emit(ActionKind::RequestOpenSource);
+		ui_.label({178, 10, 68, 32}, "Pixel AR", ui_.theme.muted, 13);
+		const auto aspectEdit = ui_.text_input("import.pixel-aspect", {246, 10, 92, 32}, importPixelAspect_, !s.interaction.importPending);
+		if (aspectEdit.changed || aspectEdit.committed) {
+			bool valid = true;
+			try { (void)parse_pixel_aspect_ratio(importPixelAspect_); }
+			catch (const std::exception&) { valid = false; }
+			if (valid || aspectEdit.committed) {
+				Action a; a.kind = ActionKind::SetImportPixelAspectRatio; a.image = source_;
+				a.text = importPixelAspect_; actions_.push_back(a);
+			}
+		}
+		ui_.tooltip({178, 10, 160, 32}, "Pixel width:height for the selected source and subsequent imports. Valid ratios apply immediately. Use 4:3 for anamorphic pixels, 1:1 for square pixels, or auto to restore embedded metadata. Stored samples are unchanged; retained encodes keep their original interpretation.");
 		const auto *source = find_image(s, source_);
-		ui_.label({185, 10, std::max(0.f, bounds.w - 870), 32},
+		ui_.label({350, 10, std::max(0.f, bounds.w - 1035), 32},
 				  source ? source->displayName + "   /   " + std::to_string(source->width) + " × " +
 								   std::to_string(source->height) + "   " + format(source->pixelFormat)
 						 : "Image comparison workbench",
@@ -553,7 +578,7 @@ namespace codec_gui::gui {
 				choose(s, image->id);
 			ui_.label({r.x + 10, r.y + 36, r.w - 20, 24},
 					  std::to_string(image->width) + " × " + std::to_string(image->height) + "  " +
-							  format(image->pixelFormat),
+							  format(image->pixelFormat) + (image->decoded ? " · SAR " + std::to_string(image->decoded->pixelAspectRatio.width) + ":" + std::to_string(image->decoded->pixelAspectRatio.height) : ""),
 					  ui_.theme.muted, 13);
 			const Rect sizeRect{r.x + 10, r.y + 60, r.w - 20, 24};
 			ui_.label(sizeRect, "Uncompressed: " + uncompressed_size(image->decoded.get()), ui_.theme.text, 13);
@@ -751,7 +776,7 @@ namespace codec_gui::gui {
 							  imageArea_.y + float(p / 2) * imageArea_.h / (paneCount_ > 2 ? 2 : 1), half,
 							  imageArea_.h / (paneCount_ > 2 ? 2 : 1)};
 				const auto *image = find_image(s, pane_image(p));
-				auto        view  = fit_ && image        ? fit_transform(image->width, image->height, r, 1)
+				auto        view  = fit_ && image        ? fit_transform(image->width, image->height, r, 1, pixel_aspect_ratio(*image))
 									: p == 0 && !linked_ ? referenceTransform_
 									: p >= 2 && !linked_ ? extraTransforms_[p - 2]
 														 : transform_;
@@ -787,7 +812,7 @@ namespace codec_gui::gui {
 									   imageArea_.y + float(i / cols) * imageArea_.h / rows, imageArea_.w / cols,
 									   imageArea_.h / rows};
 				bool        ref     = images[i]->id == reference_;
-				auto        view    = fit_              ? fit_transform(images[i]->width, images[i]->height, r, 1)
+				auto        view    = fit_              ? fit_transform(images[i]->width, images[i]->height, r, 1, pixel_aspect_ratio(*images[i]))
 									  : ref && !linked_ ? referenceTransform_
 														: transform_;
 				std::string caption = ref ? "A · " : images[i]->id == candidate_ ? "B · " : "";
@@ -853,6 +878,11 @@ namespace codec_gui::gui {
 		if (!backend) {
 			paragraph(ui_, row(area, y, 80), "No encoder is available.");
 			return;
+		}
+		if (source && source->decoded && !source->decoded->pixelAspectRatio.square() &&
+			!backend_supports_pixel_aspect_ratio(backend->id)) {
+			paragraph(ui_, row(area, y, 90), "Warning: this encoder does not preserve pixel aspect ratio in its output. Exported pixels will be interpreted as square.");
+			y += 96;
 		}
 		ui_.text_input("parameters.search", {area.x + 14, y, area.w - 122, 32}, paramFilter_, true, "Search settings…");
 		ui_.checkbox("parameters.help", "Help", {area.x + area.w - 100, y, 88, 32}, showHelp_);

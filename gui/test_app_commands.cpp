@@ -67,6 +67,28 @@ int main(int argc,char** argv) {
 	const std::filesystem::path root = std::filesystem::temp_directory_path();
 	if(!metricsOnly) {
 	{
+		const bool realInput = argc == 2 && !metricsOnly;
+		const auto path = realInput ? std::filesystem::path(argv[1]) : root / "codec_vis_anamorphic_import.png";
+		if (!realInput) {
+			const auto encoded = encode_png_still_image(*make_image(100), {});
+			std::ofstream out(path, std::ios::binary); out.write(reinterpret_cast<const char*>(encoded.hevcAnnexB.data()), encoded.hevcAnnexB.size());
+		}
+		Command command; command.kind = CommandKind::LoadSourceImage; command.path = path;
+		const auto automatic = execute_command(command, AppState{}, CommandContext{});
+		command.importPixelAspectRatio = PixelAspectRatio(4, 3);
+		const auto anamorphic = execute_command(command, AppState{}, CommandContext{});
+		CODEC_VIS_CHECK(automatic.size() == 1 && anamorphic.size() == 1);
+		CODEC_VIS_CHECK(automatic[0].kind == ActionKind::SourceLoaded && anamorphic[0].kind == ActionKind::SourceLoaded);
+		const auto& a = *automatic[0].sourceLoaded.image;
+		const auto& b = *anamorphic[0].sourceLoaded.image;
+		CODEC_VIS_CHECK(a.pixelAspectRatio.square() && b.pixelAspectRatio == PixelAspectRatio(4, 3));
+		CODEC_VIS_CHECK(a.width == b.width && a.height == b.height && a.format == b.format);
+		for (int p = 0; p < 3; ++p) {
+			CODEC_VIS_CHECK(a.planes[p].strideBytes == b.planes[p].strideBytes);
+			CODEC_VIS_CHECK(a.planes[p].bytes == b.planes[p].bytes);
+		}
+	}
+	{
 		Command command;
 		command.kind = CommandKind::SaveBytesToFile;
 		command.path = root / "codec_vis_command_save_test.bin";

@@ -20,6 +20,20 @@ float distanceToShape(vec2 local,vec2 halfSize,vec4 shape){
     vec2 q=abs(local)-halfSize+radius;
     return length(max(q,0))+min(max(q.x,q.y),0)-radius;
 }
+// Compute shaders have no implicit derivatives. Use the full image rectangle
+// (not its clipped bounds), UV span and physical output scale for the footprint.
+vec4 sampleImage(sampler2D image, vec2 uv){
+    ivec2 size=textureSize(image,0);
+    vec2 footprint=abs(pc.uv.zw)*vec2(size)/(pc.rect.zw*pc.params.x);
+    float density=max(footprint.x,footprint.y);
+    // Magnification and 1:1 always show discrete original texels. This path
+    // intentionally bypasses interpolation and every mip level above zero.
+    if(density<=1.0){
+        ivec2 pixel=clamp(ivec2(floor(uv*vec2(size))),ivec2(0),size-1);
+        return texelFetch(image,pixel,0);
+    }
+    return textureLod(image,uv,log2(density));
+}
 void main(){
     ivec2 p=ivec2(gl_GlobalInvocationID.xy)+pc.bounds.xy;
     if(any(greaterThanEqual(p,pc.bounds.zw)))return;
@@ -28,8 +42,8 @@ void main(){
     if(pc.meta.z!=0){
         if(any(lessThan(position,pc.rect.xy))||any(greaterThanEqual(position,pc.rect.xy+pc.rect.zw)))return;
         vec2 uv=pc.uv.xy+(position-pc.rect.xy)/pc.rect.zw*pc.uv.zw;
-        vec4 value=textureLod(sourceImage,uv,0);
-        if(pc.meta.z==2){vec3 delta=abs(value.rgb-textureLod(referenceImage,uv,0).rgb);
+        vec4 value=sampleImage(sourceImage,uv);
+        if(pc.meta.z==2){vec3 delta=abs(value.rgb-sampleImage(referenceImage,uv).rgb);
             value=vec4(vec3(max(delta.r,max(delta.g,delta.b))*pc.params.y),1);}
         // No gamut conversion, tone map, transfer encoding, or RGB clamp.
         result=over(result,value*pc.color);

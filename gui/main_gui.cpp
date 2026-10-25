@@ -130,7 +130,16 @@ void collect_async_actions(std::vector<ActionFuture>& futures, std::vector<Actio
 
 } // namespace
 
+int codec_vis_energy_helper_main(int argc, char** argv);
 int main(int argc, char** argv) {
+    // Dispatch before font initialization, Vulkan probing, or GUI setup.
+    if (argc > 1 && std::string_view(argv[1]) == "--energy-helper")
+        return codec_vis_energy_helper_main(argc - 1, argv + 1);
+    if (argc > 1 && std::string_view(argv[1]) == "--help") {
+        std::cout << "codec_vis [--window-size W H] [--smoke-frames N] [--probe-image-pixels] [IMAGE ...]\n"
+                     "Single executable: software codecs, fonts, shaders and energy helper are built in.\n";
+        return 0;
+    }
 	print_runtime_probe();
 
 	bool smokeOnce = false;

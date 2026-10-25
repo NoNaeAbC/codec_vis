@@ -28,7 +28,8 @@ struct Child {
 };
 EnergyAccessResult authorize(std::stop_token stop, std::filesystem::path helper) {
 	try {
-		if (helper.empty()) helper = std::filesystem::read_symlink("/proc/self/exe").parent_path() / "codec_vis_energy_helper";
+		const bool embedded = helper.empty();
+		if (embedded) helper = std::filesystem::read_symlink("/proc/self/exe");
 		if (!std::filesystem::is_regular_file(helper))
 			return {{}, "Energy helper is missing. Rebuild or reinstall codec_vis."};
 		std::array<unsigned char, 16> random{};
@@ -45,7 +46,10 @@ EnergyAccessResult authorize(std::stop_token stop, std::filesystem::path helper)
 			throw std::runtime_error("Cannot listen for energy authorization");
 		std::string helperPath = helper.string(), socketName = name.str();
 		char program[] = "/usr/bin/pkexec", noAgent[] = "--disable-internal-agent";
-		char* args[] = {program, noAgent, helperPath.data(), socketName.data(), nullptr};
+		char helperMode[] = "--energy-helper";
+        char* embeddedArgs[] = {program, noAgent, helperPath.data(), helperMode, socketName.data(), nullptr};
+        char* externalArgs[] = {program, noAgent, helperPath.data(), socketName.data(), nullptr};
+        char** args = embedded ? embeddedArgs : externalArgs;
 		Child child;
 		if (::posix_spawn(&child.pid, program, nullptr, nullptr, args, environ) != 0) {
 			child.pid = -1;

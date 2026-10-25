@@ -27,6 +27,8 @@
 #include <jxl/decode.h>
 #include <openjpeg.h>
 #include <png.h>
+#define GST_USE_UNSTABLE_API
+#include <gst/codecparsers/gsth265parser.h>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -120,7 +122,7 @@ void store_preview_sample(ImagePlane& plane, std::size_t sample, uint16_t value,
 	}
 }
 
-std::shared_ptr<const RawImage> jxl_pixels_to_preview(
+std::shared_ptr<RawImage> jxl_pixels_to_preview(
 	const std::vector<uint8_t>& pixels,
 	int width,
 	int height,
@@ -315,8 +317,30 @@ PixelFormat hevc_pixel_format(const de265_image* picture) {
 	);
 }
 
-std::shared_ptr<const RawImage> copy_de265_picture(const de265_image* picture,const std::optional<ColorDescription>& context) {
+PixelAspectRatio hevc_pixel_aspect_ratio(const EncodedImage& encoded) {
+    std::unique_ptr<GstH265Parser, decltype(&gst_h265_parser_free)> parser(gst_h265_parser_new(), gst_h265_parser_free);
+    const auto* bytes = reinterpret_cast<const guint8*>(encoded.hevcAnnexB.data());
+    guint offset = 0;
+    while (offset < encoded.hevcAnnexB.size()) {
+        GstH265NalUnit nal{};
+        const auto status = gst_h265_parser_identify_nalu(parser.get(), bytes, offset, encoded.hevcAnnexB.size(), &nal);
+        if (status != GST_H265_PARSER_OK && status != GST_H265_PARSER_NO_NAL_END) break;
+        if (nal.type == GST_H265_NAL_SPS) {
+            GstH265SPS sps{};
+            if (gst_h265_parser_parse_sps(parser.get(), &nal, &sps, TRUE) == GST_H265_PARSER_OK &&
+                sps.vui_parameters_present_flag && sps.vui_params.par_n && sps.vui_params.par_d)
+                return PixelAspectRatio(sps.vui_params.par_n, sps.vui_params.par_d);
+        }
+        const auto next = nal.offset + nal.size;
+        if (next <= offset) break;
+        offset = next;
+    }
+    return {};
+}
+
+std::shared_ptr<const RawImage> copy_de265_picture(const de265_image* picture,const std::optional<ColorDescription>& context, PixelAspectRatio sar) {
 	auto image = std::make_shared<RawImage>();
+	image->pixelAspectRatio = sar;
 	image->width = de265_get_image_width(picture, 0);
 	image->height = de265_get_image_height(picture, 0);
 	image->format = hevc_pixel_format(picture);
@@ -497,6 +521,8 @@ std::shared_ptr<const RawImage> copy_vvdec_frame(const vvdecFrame* frame) {
 	image->format = vvc_pixel_format(frame);
 	if (frame->picAttributes != nullptr && frame->picAttributes->vui != nullptr) {
 		const vvdecVui& vui = *frame->picAttributes->vui;
+		if (vui.aspectRatioInfoPresentFlag && vui.sarWidth > 0 && vui.sarHeight > 0)
+            image->pixelAspectRatio = PixelAspectRatio(vui.sarWidth, vui.sarHeight);
 		if (vui.colourDescriptionPresentFlag) {
 			image->color.primaries = static_cast<ColorPrimaries>(vui.colourPrimaries);
 			image->color.transfer = static_cast<TransferCharacteristics>(vui.transferCharacteristics);
@@ -606,6 +632,7 @@ DecodeResult decode_jpeg_preview(const EncodedImage& encoded) {
 			static_cast<unsigned long>(encoded.hevcAnnexB.size())
 		);
 		jpeg_read_header(&cinfo, TRUE);
+		const PixelAspectRatio sar = cinfo.X_density && cinfo.Y_density ? PixelAspectRatio(cinfo.Y_density, cinfo.X_density) : PixelAspectRatio{};
 		const int bitDepth = cinfo.data_precision;
 		if (bitDepth != 8 && bitDepth != 12) throw std::runtime_error("unsupported JPEG preview precision");
 		cinfo.out_color_space = JCS_RGB;
@@ -629,10 +656,12 @@ DecodeResult decode_jpeg_preview(const EncodedImage& encoded) {
 		const int height = static_cast<int>(cinfo.output_height);
 		timer.measure([&] {jpeg_finish_decompress(&cinfo);});
 		jpeg_destroy_decompress(&cinfo);
-		return {.image=jxl_pixels_to_preview(
+		auto image = jxl_pixels_to_preview(
 			rgb, width, height, bitDepth, 3, rgb_preview_color(encoded),
 			static_cast<double>((1u << bitDepth) - 1u)
-		), .error={}, .codecSeconds=timer.seconds()};
+		);
+        image->pixelAspectRatio = sar;
+        return {.image=std::move(image), .error={}, .codecSeconds=timer.seconds()};
 	} catch (const std::exception& e) {
 		jpeg_destroy_decompress(&cinfo);
 		return {.image=nullptr, .error=e.what()};
@@ -659,6 +688,13 @@ DecodeResult decode_png_preview(const EncodedImage& encoded) {
 		png_set_read_fn(png, &reader, png_read_callback);
 		CodecTimer timer;
 		timer.measure([&] {png_read_info(png, info);});
+		png_uint_32 densityX = 0, densityY = 0; int unit = 0;
+		png_get_pHYs(png, info, &densityX, &densityY, &unit);
+		PixelAspectRatio sar;
+		if (densityX && densityY) {
+            const auto divisor = std::gcd(densityX, densityY);
+            if (densityX/divisor <= 65535 && densityY/divisor <= 65535) sar = PixelAspectRatio(densityY/divisor, densityX/divisor);
+        }
 		const int width = static_cast<int>(png_get_image_width(png, info));
 		const int height = static_cast<int>(png_get_image_height(png, info));
 		const int colorType = png_get_color_type(png, info);
@@ -679,10 +715,12 @@ DecodeResult decode_png_preview(const EncodedImage& encoded) {
 		}
 		timer.measure([&] {png_read_image(png, rows.data());});
 		png_destroy_read_struct(&png, &info, nullptr);
-		return {.image=jxl_pixels_to_preview(
+		auto image = jxl_pixels_to_preview(
 			rgb, width, height, bitDepth, 3, rgb_preview_color(encoded),
 			static_cast<double>((1u << bitDepth) - 1u)
-		), .error={}, .codecSeconds=timer.seconds()};
+		);
+        image->pixelAspectRatio = sar;
+        return {.image=std::move(image), .error={}, .codecSeconds=timer.seconds()};
 	} catch (const std::exception& e) {
 		png_destroy_read_struct(&png, &info, nullptr);
 		return {.image=nullptr, .error=e.what()};
@@ -1074,6 +1112,8 @@ static DecodeResult decode_ffmpeg_preview(const EncodedImage& encoded, AVCodecID
 		}
 		auto image = std::make_shared<RawImage>();
 		image->width = frame->width;
+        if (frame->sample_aspect_ratio.num > 0 && frame->sample_aspect_ratio.den > 0)
+            image->pixelAspectRatio = PixelAspectRatio(frame->sample_aspect_ratio.num, frame->sample_aspect_ratio.den);
 		image->height = frame->height;
 		image->format = format_for(static_cast<AVPixelFormat>(frame->format));
 		image->color.primaries = static_cast<ColorPrimaries>(frame->color_primaries);
@@ -1211,6 +1251,7 @@ DecodeResult decode_hevc_preview(const EncodedImage& encoded) {
 		// Large still images can legitimately contain a slice larger than the
 		// default 16 MiB NAL limit. Bound it by the bytes already supplied by
 		// the caller; keep the independent image-size and SEI limits intact.
+		const auto sar = hevc_pixel_aspect_ratio(encoded);
 		auto limits = *de265_get_security_limits(decoder.get());
 		limits.max_NAL_size_bytes = std::max(limits.max_NAL_size_bytes,
 			static_cast<uint32_t>(encoded.hevcAnnexB.size()));
@@ -1231,14 +1272,14 @@ DecodeResult decode_hevc_preview(const EncodedImage& encoded) {
 			if (err == DE265_ERROR_IMAGE_BUFFER_FULL) {
 				if (const de265_image* picture = de265_get_next_picture(decoder.get())) {
 					const double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-codecStart).count();
-					return {.image=copy_de265_picture(picture,encoded.codedColor), .error={}, .codecSeconds=seconds};
+					return {.image=copy_de265_picture(picture,encoded.codedColor,sar), .error={}, .codecSeconds=seconds};
 				}
 			} else {
 				checked_de265(err, "de265_decode");
 			}
 			if (const de265_image* picture = de265_get_next_picture(decoder.get())) {
 				const double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-codecStart).count();
-				return {.image=copy_de265_picture(picture,encoded.codedColor), .error={}, .codecSeconds=seconds};
+				return {.image=copy_de265_picture(picture,encoded.codedColor,sar), .error={}, .codecSeconds=seconds};
 			}
 			if (more == 0) {
 				break;

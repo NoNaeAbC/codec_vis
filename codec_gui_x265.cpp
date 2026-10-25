@@ -487,6 +487,9 @@ namespace codec_gui {
 		param->internalBitDepth = bitDepth;
 		param->fpsNum           = 1;
 		param->fpsDenom         = 1;
+		param->vui.aspectRatioIdc = 255;
+		param->vui.sarWidth = image.pixelAspectRatio.width;
+		param->vui.sarHeight = image.pixelAspectRatio.height;
 		param->vui.colorPrimaries = static_cast<int>(image.color.primaries);
 		param->vui.transferCharacteristics = static_cast<int>(image.color.transfer);
 		param->vui.matrixCoeffs = static_cast<int>(image.color.matrix);

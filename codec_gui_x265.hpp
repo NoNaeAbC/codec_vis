@@ -2,7 +2,9 @@
 #pragma once
 
 #include <cstdint>
+#include <charconv>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -175,12 +177,42 @@ namespace codec_gui {
 		int                        strideBytes = 0;
 	};
 
+	// Sample width / sample height; independent of the stored image dimensions.
+	struct PixelAspectRatio {
+		int width = 1, height = 1;
+		PixelAspectRatio() = default;
+		PixelAspectRatio(int w, int h) {
+			if (w <= 0 || h <= 0) throw std::invalid_argument("Pixel aspect ratio must be positive");
+			const int divisor = std::gcd(w, h);
+			width = w / divisor; height = h / divisor;
+			if (width > 65535 || height > 65535) throw std::invalid_argument("Pixel aspect ratio exceeds 16-bit signaling");
+		}
+		[[nodiscard]] double value() const { return double(width) / height; }
+		[[nodiscard]] bool square() const { return width == height; }
+		friend bool operator==(const PixelAspectRatio&, const PixelAspectRatio&) = default;
+	};
+
+	[[nodiscard]] inline std::optional<PixelAspectRatio> parse_pixel_aspect_ratio(std::string_view text) {
+		if (text == "auto") return std::nullopt;
+		const auto colon = text.find(':');
+		int width = 0, height = 0;
+		if (colon == std::string_view::npos) throw std::invalid_argument("Use auto or a pixel width:height ratio, e.g. 4:3");
+		const auto w = std::from_chars(text.data(), text.data() + colon, width);
+		const auto h = std::from_chars(text.data() + colon + 1, text.data() + text.size(), height);
+		if (w.ec != std::errc{} || h.ec != std::errc{} || w.ptr != text.data() + colon || h.ptr != text.data() + text.size())
+			throw std::invalid_argument("Use a whole-number width:height ratio");
+		return PixelAspectRatio(width, height);
+	}
+
 	struct EncodedImage;
 	struct RawImage {
 		int         width  = 0;
 		int         height = 0;
 		PixelFormat format = PixelFormat::YUV420P8;
 		ColorDescription color;
+		PixelAspectRatio pixelAspectRatio;
+		// Original interpretation retained when the user applies an external SAR.
+		std::optional<PixelAspectRatio> intrinsicPixelAspectRatio;
 		// HLG requires the nominal display peak to invert its system OOTF. This
 		// is image interpretation context, not an H.273 color-description field.
 		std::optional<double> nominalPeakNits;

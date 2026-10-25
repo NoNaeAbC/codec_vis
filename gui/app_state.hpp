@@ -336,6 +336,7 @@ namespace codec_gui::gui {
 		LivePreviewState livePreview;
 		// Application workflow state: encoded results are retained unless the user
 		// explicitly enables scratch replacement.
+		std::optional<PixelAspectRatio> importPixelAspectRatio;
 		bool scratchResults = false;
 		bool decoderInspector=false;
 		bool energyAccessPending=false, energyAccessEnabled=false;
@@ -344,6 +345,7 @@ namespace codec_gui::gui {
 	};
 
 	enum class ActionKind {
+		SetImportPixelAspectRatio,
 		RequestOpenSource,
 		OpenSourceCanceled,
 		SourcePathChosen,
@@ -481,6 +483,7 @@ namespace codec_gui::gui {
 	};
 
 	struct Command {
+		std::optional<PixelAspectRatio> importPixelAspectRatio;
 		CommandKind kind = CommandKind::RequestRedraw;
 		std::filesystem::path path;
 		ImageId image;

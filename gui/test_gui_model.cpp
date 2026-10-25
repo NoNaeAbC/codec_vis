@@ -250,6 +250,40 @@ int main() {
 	}
 
 	{
+		CODEC_VIS_CHECK(PixelAspectRatio(8, 6) == PixelAspectRatio(4, 3));
+		for (const auto ratio : {PixelAspectRatio(4, 3), PixelAspectRatio(3, 4)}) {
+			ImageObject image; image.width = 400; image.height = 300;
+			auto pixels = std::make_shared<RawImage>(); pixels->pixelAspectRatio = ratio;
+			image.decoded = pixels;
+			const Rect area{0, 0, 800, 600};
+			Pane pane; pane.transform = fit_transform(400, 300, area, 1, ratio);
+			const auto rect = image_rect_in_pane(pane, image, area);
+			CODEC_VIS_CHECK(std::abs(rect.w / rect.h - 400.0 / 300 * ratio.value()) < 0.001);
+			CODEC_VIS_CHECK(rect.w <= 800.01 && rect.h <= 600.01);
+			const Point pointer{430, 320};
+			const auto before = pane_to_image_coord(pane, image, area, pointer);
+			pane.transform = zoom_transform(pane.transform, image, area, pointer, 2);
+			const auto after = pane_to_image_coord(pane, image, area, pointer);
+			CODEC_VIS_CHECK(before && after && before->x == after->x && before->y == after->y);
+			const auto center = pane.transform.centerX;
+			const auto scale = pane.transform.scale;
+			pane.transform = pan_transform(pane.transform, image, area, 32, 0);
+			CODEC_VIS_CHECK(std::abs(pane.transform.centerX - (center - 32 / (scale * ratio.value()))) < 0.0001);
+		}
+		AppState state;
+		Action ratio; ratio.kind = ActionKind::SetImportPixelAspectRatio; ratio.text = "8:6";
+		state = update(state, ratio).state;
+		CODEC_VIS_CHECK(state.importPixelAspectRatio == PixelAspectRatio(4, 3));
+		Action path; path.kind = ActionKind::SourcePathChosen; path.path = "test.nef";
+		const auto requested = update(state, path);
+		CODEC_VIS_CHECK(requested.commands.front().importPixelAspectRatio == PixelAspectRatio(4, 3));
+		ratio.text = "4:0"; state = update(state, ratio).state;
+		CODEC_VIS_CHECK(state.importPixelAspectRatio == PixelAspectRatio(4, 3));
+		CODEC_VIS_CHECK(!state.errors.empty());
+		ratio.text = "auto"; state = update(state, ratio).state;
+		CODEC_VIS_CHECK(!state.importPixelAspectRatio);
+	}
+	{
 		ImageObject image;
 		image.width = 400;
 		image.height = 200;

@@ -2,11 +2,60 @@
 #include "test_check.hpp"
 #include "workbench.hpp"
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 using namespace codec_gui;
 using namespace codec_gui::gui;
 #define CHECK CODEC_VIS_CHECK
 int main() {
+	{
+		AppState state;
+		auto pixels = std::make_shared<RawImage>();
+		pixels->width = 4; pixels->height = 3;
+		pixels->planes[0].bytes = {1, 2, 3, 4};
+		Action loaded; loaded.kind = ActionKind::SourceLoaded; loaded.sourceLoaded.image = pixels;
+		state = update(state, loaded).state;
+		const auto source = state.images.front().id;
+		Workbench ui([](std::string_view text, float size, FontRole) { return float(text.size()) * size * .5f; });
+		auto frame = [&] {
+			for (const auto& action : ui.build(state, {0, 0, 1920, 1080}, 0)) state = update(state, action).state;
+		};
+		auto input = [&](Action a) {
+			for (const auto& action : ui.handle(a, state)) state = update(state, action).state;
+			frame();
+		};
+		frame();
+		const auto widgets = ui.context().widgets();
+		const auto field = std::ranges::find_if(widgets, [](const auto& w) { return w.id == "import.pixel-aspect"; });
+		CHECK(field != widgets.end());
+		Action click; click.kind = ActionKind::PointerPressed;
+		click.point = {field->rect.x + 10, field->rect.y + 10}; input(click);
+		click.kind = ActionKind::PointerReleased; input(click);
+		Action key; key.kind = ActionKind::KeyPressed; key.text = "a"; key.control = true; input(key);
+		key.control = false; key.text = "4:3"; input(key);
+		// No Enter or re-import: the visible source and future imports must agree.
+		CHECK(state.importPixelAspectRatio == PixelAspectRatio(4, 3));
+		CHECK(find_image(state, source)->decoded->pixelAspectRatio == PixelAspectRatio(4, 3));
+		CHECK(find_image(state, source)->decoded->width == 4 && find_image(state, source)->decoded->height == 3);
+		CHECK(find_image(state, source)->decoded->planes[0].bytes == pixels->planes[0].bytes);
+		CHECK(pixels->pixelAspectRatio.square()); // Immutable snapshots are preserved.
+		frame();
+		CHECK(std::ranges::any_of(ui.commands(), [](const auto& cmd) { return cmd.text.find("SAR 4:3") != std::string::npos; }));
+		CHECK(std::ranges::any_of(ui.commands(), [&](const auto& cmd) {
+			return cmd.kind == DrawCommandKind::Image && cmd.image == source &&
+				std::abs(cmd.rect.w / cmd.rect.h - 16.0 / 9.0) < 0.001;
+		}));
+		Action chosen; chosen.kind = ActionKind::SourcePathChosen; chosen.path = "another.nef";
+		CHECK(update(state, chosen).commands.front().importPixelAspectRatio == PixelAspectRatio(4, 3));
+		key.control = true; key.text = "a"; input(key);
+		key.control = false; key.text = "4:"; input(key);
+		CHECK(state.errors.empty());
+		CHECK(find_image(state, source)->decoded->pixelAspectRatio == PixelAspectRatio(4, 3));
+		key.control = true; key.text = "a"; input(key);
+		key.control = false; key.text = "auto"; input(key);
+		CHECK(find_image(state, source)->decoded->pixelAspectRatio.square());
+		CHECK(!state.importPixelAspectRatio);
+	}
 	AppState s;
 	auto     raw = std::make_shared<RawImage>();
 	raw->width   = 5600;

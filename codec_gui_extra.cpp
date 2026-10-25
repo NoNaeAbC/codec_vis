@@ -166,6 +166,8 @@ EncodedImage encode_kvazaar_still_image(const RawImage& image, std::span<const E
 	cfg->lossless=value<bool>(params,"lossless",false); cfg->add_encoder_info=0;
 	const char* sampling=is_gray(image.format) ? "P400" : is_444(image.format) ? "P444" : "P420";
 	if(!api->config_parse(cfg.get(),"input-format",sampling)) throw std::invalid_argument("Kvazaar input format unsupported");
+	cfg->vui.sar_width=image.pixelAspectRatio.width;
+	cfg->vui.sar_height=image.pixelAspectRatio.height;
 	cfg->vui.fullrange=image.color.range==ColorRange::Full;
 	cfg->vui.colorprim=static_cast<int>(image.color.primaries); cfg->vui.transfer=static_cast<int>(image.color.transfer);
 	cfg->vui.colormatrix=static_cast<int>(image.color.matrix);

@@ -59,6 +59,8 @@ namespace codec_gui::gui {
 		std::size_t gridPage_ = 0, gridCount_ = 1;
 		double      split_ = .5, gain_ = 1;
 		std::string filter_, paramFilter_;
+		std::string importPixelAspect_ = "auto";
+		ImageId aspectSource_;
 		std::map<std::string, bool> groups_;
 		struct SizeSliderRange {
 			double minimum, maximum;

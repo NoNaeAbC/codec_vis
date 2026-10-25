@@ -45,7 +45,7 @@ ViewportTransform clamp_transform(ViewportTransform transform, const ImageObject
 	if (image.width <= 0 || image.height <= 0 || paneRect.w <= 0 || paneRect.h <= 0 || transform.scale <= 0.0) {
 		return transform;
 	}
-	const double halfVisibleW = static_cast<double>(paneRect.w) * 0.5 / transform.scale;
+	const double halfVisibleW = static_cast<double>(paneRect.w) * 0.5 / (transform.scale * pixel_aspect_ratio(image).value());
 	const double halfVisibleH = static_cast<double>(paneRect.h) * 0.5 / transform.scale;
 	const double marginX = std::min(static_cast<double>(image.width) * 0.5, halfVisibleW);
 	const double marginY = std::min(static_cast<double>(image.height) * 0.5, halfVisibleH);
@@ -129,12 +129,12 @@ std::vector<PaneRect> compute_pane_rects(const ViewModeState& mode, std::span<co
 	return out;
 }
 
-ViewportTransform fit_transform(int imageWidth, int imageHeight, Rect paneRect, float outputScale) {
+ViewportTransform fit_transform(int imageWidth, int imageHeight, Rect paneRect, float outputScale, PixelAspectRatio pixelAspectRatio) {
 	ViewportTransform transform;
 	if (imageWidth <= 0 || imageHeight <= 0 || paneRect.w <= 0 || paneRect.h <= 0) {
 		return transform;
 	}
-	const double scaleX = static_cast<double>(paneRect.w) / static_cast<double>(imageWidth) / outputScale;
+	const double scaleX = static_cast<double>(paneRect.w) / (static_cast<double>(imageWidth) * pixelAspectRatio.value()) / outputScale;
 	const double scaleY = static_cast<double>(paneRect.h) / static_cast<double>(imageHeight) / outputScale;
 	transform.scale = std::min(scaleX, scaleY);
 	transform.centerX = static_cast<double>(imageWidth) * 0.5;
@@ -162,10 +162,10 @@ ViewportTransform zoom_transform(
 	}
 	const auto localX = static_cast<double>(pointer.x - (paneRect.x + paneRect.w * 0.5f));
 	const auto localY = static_cast<double>(pointer.y - (paneRect.y + paneRect.h * 0.5f));
-	const double imageX = transform.centerX + localX / transform.scale;
+	const double imageX = transform.centerX + localX / (transform.scale * pixel_aspect_ratio(image).value());
 	const double imageY = transform.centerY + localY / transform.scale;
 	transform.scale = std::clamp(transform.scale * zoomFactor, 0.01, 256.0);
-	transform.centerX = imageX - localX / transform.scale;
+	transform.centerX = imageX - localX / (transform.scale * pixel_aspect_ratio(image).value());
 	transform.centerY = imageY - localY / transform.scale;
 	return clamp_transform(transform, image, paneRect);
 }
@@ -180,7 +180,7 @@ ViewportTransform pan_transform(
 	if (transform.scale <= 0.0) {
 		return transform;
 	}
-	transform.centerX -= static_cast<double>(deltaX) / transform.scale;
+	transform.centerX -= static_cast<double>(deltaX) / (transform.scale * pixel_aspect_ratio(image).value());
 	transform.centerY -= static_cast<double>(deltaY) / transform.scale;
 	return clamp_transform(transform, image, paneRect);
 }
@@ -189,9 +189,9 @@ Rect image_rect_in_pane(const Pane& pane, const ImageObject& image, Rect paneRec
 	if (image.width <= 0 || image.height <= 0 || pane.transform.scale <= 0.0) {
 		return paneRect;
 	}
-	const auto w = static_cast<float>(static_cast<double>(image.width) * pane.transform.scale);
+	const auto w = static_cast<float>(static_cast<double>(image.width) * pane.transform.scale * pixel_aspect_ratio(image).value());
 	const auto h = static_cast<float>(static_cast<double>(image.height) * pane.transform.scale);
-	const float cx = paneRect.x + paneRect.w * 0.5f + static_cast<float>((static_cast<double>(image.width) * 0.5 - pane.transform.centerX) * pane.transform.scale);
+	const float cx = paneRect.x + paneRect.w * 0.5f + static_cast<float>((static_cast<double>(image.width) * 0.5 - pane.transform.centerX) * pane.transform.scale * pixel_aspect_ratio(image).value());
 	const float cy = paneRect.y + paneRect.h * 0.5f + static_cast<float>((static_cast<double>(image.height) * 0.5 - pane.transform.centerY) * pane.transform.scale);
 	return Rect{.x=cx - w * 0.5f, .y=cy - h * 0.5f, .w=w, .h=h};
 }
@@ -202,7 +202,7 @@ std::optional<ImagePixelCoord> pane_to_image_coord(const Pane& pane, const Image
 	}
 	const auto localX = static_cast<double>(pointer.x - (paneRect.x + paneRect.w * 0.5f));
 	const auto localY = static_cast<double>(pointer.y - (paneRect.y + paneRect.h * 0.5f));
-	const int imageX = static_cast<int>(std::floor(pane.transform.centerX + localX / pane.transform.scale));
+	const int imageX = static_cast<int>(std::floor(pane.transform.centerX + localX / (pane.transform.scale * pixel_aspect_ratio(image).value())));
 	const int imageY = static_cast<int>(std::floor(pane.transform.centerY + localY / pane.transform.scale));
 	if (imageX < 0 || imageY < 0 || imageX >= image.width || imageY >= image.height) {
 		return std::nullopt;

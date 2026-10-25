@@ -972,6 +972,10 @@ codec_gui::EncodedImage encode_vvenc_still_image(
     if (image.color.transfer != TransferCharacteristics::PQ && image.color.transfer != TransferCharacteristics::HLG)
         cfg.m_HdrMode = VVENC_HDR_OFF;
     cfg.m_vuiParametersPresent = 1;
+    cfg.m_aspectRatioInfoPresent = true;
+    cfg.m_aspectRatioIdc = 255;
+    cfg.m_sarWidth = image.pixelAspectRatio.width;
+    cfg.m_sarHeight = image.pixelAspectRatio.height;
     cfg.m_colourDescriptionPresent = true;
     cfg.m_colourPrimaries = static_cast<int>(image.color.primaries);
     cfg.m_transferCharacteristics = static_cast<int>(image.color.transfer);

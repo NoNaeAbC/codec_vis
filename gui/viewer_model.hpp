@@ -9,6 +9,10 @@
 
 namespace codec_gui::gui {
 
+	[[nodiscard]] inline PixelAspectRatio pixel_aspect_ratio(const ImageObject& image) {
+		return image.decoded ? image.decoded->pixelAspectRatio : PixelAspectRatio{};
+	}
+
 	struct PaneRect {
 		PaneId pane;
 		Rect rect;
@@ -35,7 +39,8 @@ namespace codec_gui::gui {
 		int imageWidth,
 		int imageHeight,
 		Rect paneRect,
-		float outputScale
+		float outputScale,
+		PixelAspectRatio pixelAspectRatio = {}
 	);
 
 	[[nodiscard]] ViewportTransform one_to_one_transform(

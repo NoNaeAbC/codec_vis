@@ -25,6 +25,10 @@ namespace codec_gui::gui {
 		std::vector<EncoderParamInfo> params;
 	};
 
+	[[nodiscard]] inline bool backend_supports_pixel_aspect_ratio(BackendId id) {
+		return id.value == 1 || id.value == 2 || id.value == 6 || id.value == 14 || id.value == 16 || id.value == 9 || id.value == 13;
+	}
+
 	enum class InputGeometryPolicy {
 		Preserve,
 		PadToChromaAlignment,

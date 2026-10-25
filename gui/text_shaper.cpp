@@ -1,4 +1,5 @@
 #include "text_shaper.hpp"
+#include "../build/embedded_fonts.hpp"
 #include "freetype/config/ftheader.h"
 #include "freetype/fttypes.h"
 
@@ -81,25 +82,23 @@ std::vector<std::filesystem::path> secondary_font_candidates() {
 }
 
 std::filesystem::path resolve_font_path(const std::filesystem::path& requested) {
-	if (!requested.empty() && std::filesystem::exists(requested)) {
+	if (requested == ":embedded-sans:" || requested == ":embedded-mono:" || (!requested.empty() && std::filesystem::exists(requested))) {
 		return requested;
 	}
 	const std::vector<std::filesystem::path> candidates = secondary_font_candidates();
 	if (!candidates.empty()) {
 		return candidates.front();
 	}
-	throw std::runtime_error("no usable UI font found");
+	return ":embedded-sans:";
 }
 
 } // namespace
 
 std::filesystem::path default_font_path() {
-    static const auto path = resolve_font_path({});
-    return path;
+    return ":embedded-sans:";
 }
 std::filesystem::path default_monospace_font_path() {
-    static const auto path = resolve_font_path(match_font_file("monospace"));
-    return path;
+    return ":embedded-mono:";
 }
 static std::atomic_uint64_t nextFontIdentity{1};
 
@@ -130,9 +129,13 @@ TextShaper::TextShaper(const std::filesystem::path& fontPath, float pixelSize) :
 	}
 	for (const std::filesystem::path& path : paths) {
 		FT_Face face = nullptr;
-		if (FT_New_Face(impl_->ft, path.c_str(), 0, &face) != 0) {
-			continue;
-		}
+        FT_Error error;
+        if (path == ":embedded-sans:")
+            error = FT_New_Memory_Face(impl_->ft, embedded::sans.data(), embedded::sans.size(), 0, &face);
+        else if (path == ":embedded-mono:")
+            error = FT_New_Memory_Face(impl_->ft, embedded::mono.data(), embedded::mono.size(), 0, &face);
+        else error = FT_New_Face(impl_->ft, path.c_str(), 0, &face);
+        if (error != 0) continue;
 		if (FT_Set_Char_Size(face, 0, static_cast<FT_F26Dot6>(std::lround(pixelSize * 64.0f)), 0, 0) != 0) {
 			FT_Done_Face(face);
 			continue;

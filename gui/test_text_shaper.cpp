@@ -9,7 +9,7 @@ using namespace codec_gui::gui;
 
 int main() {
 	const std::filesystem::path font = default_font_path();
-	CODEC_VIS_CHECK(std::filesystem::exists(font));
+	CODEC_VIS_CHECK(font == ":embedded-sans:");
 	TextShaper const shaper(font, 16.0f);
 	const ShapedText text = shaper.shape("codec_vis");
 	CODEC_VIS_CHECK(!text.glyphs.empty());

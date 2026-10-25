@@ -183,7 +183,13 @@ void write_uvg_vui(EncodedImage& encoded, const RawImage& image) {
     auto align = [](Bits& bits) {while (bits.size()%8) bits.push_back(0);};
     const bool chroma420=format_info(image.format).chromaFormat==UVG_CSP_420;
     Bits vui;
-    put(vui,1,1); put(vui,0,5); // progressive; no interlacing or geometry hints
+    put(vui,1,1); put(vui,0,3); // progressive, not interlaced/packed/projected
+    put(vui,1,1); // aspect_ratio_info_present_flag
+    put(vui,1,1); // aspect_ratio_constant_flag
+    put(vui,255,8); // Extended_SAR
+    put(vui,unsigned(image.pixelAspectRatio.width),16);
+    put(vui,unsigned(image.pixelAspectRatio.height),16);
+    put(vui,0,1); // overscan_info_present_flag
     put(vui,1,1); // colour_description_present
     put(vui,unsigned(image.color.primaries),8);
     put(vui,unsigned(image.color.transfer),8);

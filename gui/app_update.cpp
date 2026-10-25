@@ -50,6 +50,7 @@ void append_command(UpdateResult& result, CommandKind kind) {
 
 const char* action_name(ActionKind kind) {
 	switch (kind) {
+		case ActionKind::SetImportPixelAspectRatio: return "SetImportPixelAspectRatio";
 		case ActionKind::RequestOpenSource: return "RequestOpenSource";
         case ActionKind::SetLivePreviewEnabled:return "SetLivePreviewEnabled";
         case ActionKind::RequestLivePreview:return "RequestLivePreview";
@@ -570,6 +571,31 @@ UpdateResult update(AppState state, const Action& action) {
 	result.state = std::move(state);
 
 	switch (action.kind) {
+		case ActionKind::SetImportPixelAspectRatio: {
+			try {
+				const auto ratio = parse_pixel_aspect_ratio(action.text);
+				result.state.importPixelAspectRatio = ratio;
+				if (auto* source = find_image(result.state, action.image);
+					source && source->type == ImageObjectType::Source && source->decoded) {
+					const auto original = source->decoded->intrinsicPixelAspectRatio.value_or(source->decoded->pixelAspectRatio);
+					const auto desired = ratio.value_or(original);
+					if (desired != source->decoded->pixelAspectRatio) {
+						auto interpreted = std::make_shared<RawImage>(*source->decoded);
+						interpreted->intrinsicPixelAspectRatio = original;
+						interpreted->pixelAspectRatio = desired;
+						source->decoded = std::move(interpreted);
+						for (auto& pane : result.state.panes)
+							if (pane.image == source->id)
+								if (const auto rect = current_pane_rect(result.state, pane.id))
+									pane.transform = fit_transform(source->width, source->height, *rect, result.state.interaction.outputScale, desired);
+						append_command(result, CommandKind::RequestRedraw);
+					}
+				}
+			} catch (const std::exception& e) {
+				append_error(result.state, ErrorSeverity::Warning, "import pixel aspect ratio", "image", e.what());
+			}
+			break;
+		}
 		case ActionKind::RequestOpenSource:
 			result.state.interaction.importPending = true;
 			append_command(result, CommandKind::ShowOpenFilePortal);
@@ -583,6 +609,7 @@ UpdateResult update(AppState state, const Action& action) {
 			}
 			Command command;
 			command.kind = CommandKind::LoadSourceImage;
+			command.importPixelAspectRatio = result.state.importPixelAspectRatio;
 			command.path = action.path;
 			result.commands.push_back(std::move(command));
 			break;
@@ -615,7 +642,7 @@ UpdateResult update(AppState state, const Action& action) {
 			result.state.viewMode.paneOrder = {result.state.panes.front().id};
 			result.state.panes.front().image = source.id;
 			if (const std::optional<Rect> rect = current_pane_rect(result.state, result.state.panes.front().id)) {
-				result.state.panes.front().transform = fit_transform(source.width, source.height, *rect, result.state.interaction.outputScale);
+				result.state.panes.front().transform = fit_transform(source.width, source.height, *rect, result.state.interaction.outputScale, pixel_aspect_ratio(source));
 			}
 			result.state.selection.selectedImage = source.id;
             result.state.selection.selectedRun = {};
@@ -653,7 +680,7 @@ UpdateResult update(AppState state, const Action& action) {
 				set_pane_transform(
 					result.state,
 					action.pane,
-					fit_transform(image->width, image->height, fitRect, result.state.interaction.outputScale)
+					fit_transform(image->width, image->height, fitRect, result.state.interaction.outputScale, pixel_aspect_ratio(*image))
 				);
 			}
 			result.state.selection.activePane = action.pane;
@@ -782,7 +809,7 @@ UpdateResult update(AppState state, const Action& action) {
 						Rect const rect = current_pane_rect(result.state, action.pane).value_or(
 							Rect{.x=0, .y=0, .w=static_cast<float>(result.state.interaction.framebufferWidth), .h=static_cast<float>(result.state.interaction.framebufferHeight)}
 						);
-						set_pane_transform(result.state, action.pane, fit_transform(image->width, image->height, rect, result.state.interaction.outputScale));
+						set_pane_transform(result.state, action.pane, fit_transform(image->width, image->height, rect, result.state.interaction.outputScale, pixel_aspect_ratio(*image)));
 						append_command(result, CommandKind::RequestRedraw);
 					}
 				}
@@ -1445,7 +1472,7 @@ UpdateResult update(AppState state, const Action& action) {
 					if (const ImageObject* image = find_image(result.state, *pane->image)) {
 						if (action.text == "fit" || action.text == "f") {
 							const Rect rect = current_pane_rect(result.state, pane->id).value_or(Rect{});
-							set_pane_transform(result.state, pane->id, fit_transform(image->width, image->height, rect, result.state.interaction.outputScale));
+							set_pane_transform(result.state, pane->id, fit_transform(image->width, image->height, rect, result.state.interaction.outputScale, pixel_aspect_ratio(*image)));
 							append_command(result, CommandKind::RequestRedraw);
 						} else if (action.text == "100%" || action.text == "0") {
 							set_pane_transform(result.state, pane->id, one_to_one_transform(image->width, image->height));

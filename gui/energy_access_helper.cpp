@@ -5,7 +5,7 @@
 #include <cstdlib>
 #include <iostream>
 using namespace codec_gui::gui;
-int main(int argc, char** argv) {
+int codec_vis_energy_helper_main(int argc, char** argv) {
 	if (argc != 2 || ::geteuid() != 0) return 2;
 	const char* owner = std::getenv("PKEXEC_UID");
 	uint32_t uid = 0;
@@ -39,3 +39,7 @@ int main(int argc, char** argv) {
 		return sent ? 0 : 4;
 	} catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 5; }
 }
+
+#ifndef CODEC_VIS_EMBED_ENERGY_HELPER
+int main(int argc, char** argv) { return codec_vis_energy_helper_main(argc, argv); }
+#endif

@@ -266,6 +266,64 @@ static void verify_linear_presentation(VulkanRenderer& renderer){
     CHECK(sawHDR&&sawNegative);
     std::cout<<"FP16 presentation passed: BT.2020 primaries unchanged; values above 1 and negative components retained\n";
 }
+static void verify_mipmapping(VulkanRenderer& renderer, float outputScale) {
+    auto raw=std::make_shared<RawImage>();
+    raw->width=raw->height=64;raw->format=PixelFormat::RGBP16LE;
+    raw->color={.primaries=ColorPrimaries::BT2020,.transfer=TransferCharacteristics::Linear,
+        .matrix=MatrixCoefficients::Identity,.range=ColorRange::Full};
+    for(auto& plane:raw->planes){
+        plane.strideBytes=128;plane.bytes.resize(64*128);
+        for(int y=0;y<64;++y)for(int x=0;x<64;++x)put_sample(plane,x,y,2,((x+y)&1)?65535:0,65535);
+    }
+    ImageObject image;image.id={995};image.decoded=raw;
+    DrawCommand draw;draw.kind=DrawCommandKind::Image;draw.image=image.id;draw.color={1,1,1,1};
+    auto render=[&](float width,float height,std::span<const Point> physicalPoints){
+        draw.rect={0,0,width/outputScale,height/outputScale};
+        renderer.sync_images(std::span(&image,1),std::span(&draw,1));
+        std::vector<Point> logicalPoints;
+        for(auto point:physicalPoints)logicalPoints.push_back({point.x/outputScale,point.y/outputScale});
+        return renderer.render_draw_list_linear_samples({draw},nullptr,logicalPoints);
+    };
+    const Point small[]={{.5,.5},{1.5,2.5},{3.5,3.5},{6.5,5.5}};
+    for(float width:{8.f,20.f}){ // Integer and fractional mip levels.
+        const auto samples=render(width,width,small);
+        for(auto pixel:samples)for(int c=0;c<3;++c)CHECK(std::abs(pixel[c]-.5f)<.002f);
+    }
+    // A UV crop has a smaller footprint than the complete image.
+    draw.uvRect={.25f,0,.5f,1};
+    for(auto pixel:render(8,8,small))for(int c=0;c<3;++c)CHECK(std::abs(pixel[c]-.5f)<.002f);
+    draw.uvRect={0,0,1,1};
+    const Point edges[]={{.5,.5},{1.5,.5},{2.5,.5},{3.5,.5},{4.5,.5},{5.5,.5},{7.5,.5},{8.5,.5}};
+    for(float zoom:{1.f,4.f,3.3f}){
+        const auto samples=render(64*zoom,64*zoom,edges);
+        for(std::size_t i=0;i<samples.size();++i){
+            const float expected=int(std::floor(edges[i].x/zoom))&1;
+            for(int c=0;c<3;++c)CHECK(std::abs(samples[i][c]-expected)<.001f);
+        }
+    }
+    // Comparing the same image must use the same minification on both inputs.
+    draw.comparisonImage=image.id;
+    for(auto pixel:render(8,8,small))for(int c=0;c<3;++c)CHECK(std::abs(pixel[c])<.001f);
+    draw.comparisonImage={};
+    // Replacing a live preview must regenerate every mip, while level zero
+    // stays exact enough to inspect adjacent 16-bit codes.
+    raw=std::make_shared<RawImage>(*raw);
+    for(auto& plane:raw->planes)for(int y=0;y<64;++y)for(int x=0;x<64;++x)put_sample(plane,x,y,2,16384,65535);
+    image.decoded=raw;++image.previewRevision;
+    for(auto pixel:render(8,8,small))for(int c=0;c<3;++c)CHECK(std::abs(pixel[c]-.25f)<.002f);
+    const Point native[]={{0,0},{1,0},{63,63}};
+    for(auto pixel:renderer.read_image_samples(image.id,native))for(int c=0;c<3;++c)CHECK(std::abs(pixel[c]-16384.f/65535)<1e-7f);
+    for(const auto size:{std::pair{63,17},std::pair{63,1},std::pair{1,1}}){
+        auto thin=std::make_shared<RawImage>(*raw);thin->width=size.first;thin->height=size.second;
+        for(auto& plane:thin->planes){plane.strideBytes=thin->width*2;plane.bytes.resize(plane.strideBytes*thin->height);
+            for(int y=0;y<thin->height;++y)for(int x=0;x<thin->width;++x)put_sample(plane,x,y,2,16384,65535);}
+        image.decoded=thin;
+        const Point point[]={{.5,.5}};
+        for(auto pixel:render(1,1,point))for(int c=0;c<3;++c)CHECK(std::abs(pixel[c]-.25f)<.002f);
+    }
+    std::cout<<"Mipmap GPU readback passed: checkerboard minification, fractional LOD, UV crops, difference, live updates, odd/thin images; exact nearest texels at 1:1 and integer/fractional magnification\n";
+}
+
 static void verify_color_conversion(VulkanRenderer &renderer) {
 	const PixelFormat formats[] = {
 			PixelFormat::RGBP8,       PixelFormat::RGBP14LE,    PixelFormat::RGBP16LE,    PixelFormat::YUV420P8,
@@ -378,6 +436,7 @@ int main(int argc, char **argv) try {
 		verify_gpu_difference(renderer);
 		verify_color_conversion(renderer);
         verify_linear_presentation(renderer);
+        verify_mipmapping(renderer,window.output_scale());
 		return 0;
 	}
 	std::map<std::pair<int, FontRole>, std::unique_ptr<TextShaper>> fonts;

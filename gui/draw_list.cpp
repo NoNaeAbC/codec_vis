@@ -1223,7 +1223,7 @@ void draw_viewer(std::vector<DrawCommand>& out, const AppState& state, const Lay
 			Pane synthetic;
 			synthetic.id = PaneId{};
 			synthetic.image = image->id;
-			synthetic.transform = fit_transform(image->width, image->height, layout.viewer, state.interaction.outputScale);
+			synthetic.transform = fit_transform(image->width, image->height, layout.viewer, state.interaction.outputScale, pixel_aspect_ratio(*image));
 			DrawCommand command;
 			command.kind = DrawCommandKind::Image;
 			command.rect = image_rect_in_pane(synthetic, *image, layout.viewer);

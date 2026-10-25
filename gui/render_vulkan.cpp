@@ -11,6 +11,7 @@
 #include "raw_image_conversion.hpp"
 #include "raw_image_utils.hpp"
 #include "text_atlas.hpp"
+#include "../build/embedded_shaders.hpp"
 #include "ui_render_frame.hpp"
 
 #include <vulkan/vulkan_wayland.h>
@@ -78,13 +79,6 @@ VkSurfaceKHR create_wayland_surface(VkInstance instance, const WaylandWindow& wi
 	return out;
 }
 
-std::filesystem::path shader_path(const char* filename) {
-	if (const char* assetDir = std::getenv("CODEC_VIS_ASSET_DIR"); assetDir != nullptr && assetDir[0] != '\0') {
-		return std::filesystem::path{assetDir} / filename;
-	}
-	return std::filesystem::path{"build"} / filename;
-}
-
 std::vector<uint32_t> read_spirv(const std::filesystem::path& path) {
 	std::ifstream in(path, std::ios::binary | std::ios::ate);
 	if (!in) {
@@ -103,8 +97,15 @@ std::vector<uint32_t> read_spirv(const std::filesystem::path& path) {
 	return words;
 }
 
-VkShaderModule create_shader_module(VkDevice device, const std::filesystem::path& path) {
-	const std::vector<uint32_t> code = read_spirv(path);
+VkShaderModule create_shader_module(VkDevice device, const char* filename) {
+    std::vector<uint32_t> overrideCode;
+    std::span<const uint32_t> code;
+    if (const char* assetDir = std::getenv("CODEC_VIS_ASSET_DIR"); assetDir && *assetDir) {
+        overrideCode = read_spirv(std::filesystem::path(assetDir) / filename);
+        code = overrideCode;
+    } else if (std::string_view(filename) == "linearize.comp.spv") code = embedded::linearize;
+    else if (std::string_view(filename) == "compose.comp.spv") code = embedded::compose;
+    else throw std::invalid_argument("Unknown embedded shader");
 	VkShaderModuleCreateInfo info{};
 	info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
 	info.codeSize = code.size() * sizeof(uint32_t);
@@ -193,13 +194,14 @@ void create_image(
 	VkFormat format,
 	VkImageUsageFlags usage,
 	VkImage& image,
-	VkDeviceMemory& memory
+	VkDeviceMemory& memory,
+	uint32_t mipLevels = 1
 ) {
 	VkImageCreateInfo imageInfo{};
 	imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 	imageInfo.imageType = VK_IMAGE_TYPE_2D;
 	imageInfo.extent = {.width=width, .height=height, .depth=1};
-	imageInfo.mipLevels = 1;
+	imageInfo.mipLevels = mipLevels;
 	imageInfo.arrayLayers = 1;
 	imageInfo.format = format;
 	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -227,7 +229,9 @@ void image_barrier(
 	VkAccessFlags srcAccess,
 	VkAccessFlags dstAccess,
 	VkPipelineStageFlags srcStage,
-	VkPipelineStageFlags dstStage
+	VkPipelineStageFlags dstStage,
+	uint32_t baseMipLevel = 0,
+	uint32_t levelCount = 1
 ) {
 	VkImageMemoryBarrier barrier{};
 	barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -237,8 +241,8 @@ void image_barrier(
 	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barrier.image = image;
 	barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-	barrier.subresourceRange.baseMipLevel = 0;
-	barrier.subresourceRange.levelCount = 1;
+	barrier.subresourceRange.baseMipLevel = baseMipLevel;
+	barrier.subresourceRange.levelCount = levelCount;
 	barrier.subresourceRange.baseArrayLayer = 0;
 	barrier.subresourceRange.layerCount = 1;
 	barrier.srcAccessMask = srcAccess;
@@ -357,6 +361,8 @@ struct GpuImageResource {
 	VkImage image = VK_NULL_HANDLE;
 	VkDeviceMemory memory = VK_NULL_HANDLE;
 	VkImageView view = VK_NULL_HANDLE;
+	VkImageView storageView = VK_NULL_HANDLE;
+	uint32_t mipLevels = 1;
 	VkSampler sampler = VK_NULL_HANDLE;
 	VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
 };
@@ -476,6 +482,7 @@ void destroy_gpu_image(VkDevice device, VkDescriptorPool descriptorPool, GpuImag
 	if (resource.view != VK_NULL_HANDLE) {
 		vkDestroyImageView(device, resource.view, nullptr);
 	}
+	if (resource.storageView != VK_NULL_HANDLE) vkDestroyImageView(device, resource.storageView, nullptr);
 	if (resource.image != VK_NULL_HANDLE) {
 		vkDestroyImage(device, resource.image, nullptr);
 	}
@@ -821,7 +828,7 @@ VulkanRenderer VulkanRenderer::create(const WaylandWindow& window) {
         linearLayout.setLayoutCount=1;linearLayout.pSetLayouts=&impl->linearizeSetLayout;
         linearLayout.pushConstantRangeCount=1;linearLayout.pPushConstantRanges=&linearPush;
         vk_checked(vkCreatePipelineLayout(impl->device,&linearLayout,nullptr,&impl->linearizeLayout),"create linear conversion layout");
-        auto linearShader=create_shader_module(impl->device,shader_path("linearize.comp.spv"));
+        auto linearShader=create_shader_module(impl->device,"linearize.comp.spv");
         VkComputePipelineCreateInfo linearPipeline{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         linearPipeline.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,nullptr,0,VK_SHADER_STAGE_COMPUTE_BIT,linearShader,"main",nullptr};
         linearPipeline.layout=impl->linearizeLayout;
@@ -846,7 +853,7 @@ VulkanRenderer VulkanRenderer::create(const WaylandWindow& window) {
         VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout.setLayoutCount=3;layout.pSetLayouts=layouts;layout.pushConstantRangeCount=1;layout.pPushConstantRanges=&push;
         vk_checked(vkCreatePipelineLayout(impl->device,&layout,nullptr,&impl->composeLayout),"create compute compositor layout");
-        auto shader=create_shader_module(impl->device,shader_path("compose.comp.spv"));
+        auto shader=create_shader_module(impl->device,"compose.comp.spv");
         VkComputePipelineCreateInfo pipeline{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         pipeline.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,nullptr,0,VK_SHADER_STAGE_COMPUTE_BIT,shader,"main",nullptr};
         pipeline.layout=impl->composeLayout;
@@ -991,6 +998,22 @@ void VulkanRenderer::sync_images(std::span<const ImageObject> images,std::span<c
     impl_->requestedImages.reset();
 }
 
+static uint32_t image_mip_levels(int width, int height) {
+    uint32_t levels = 1;
+    for (int size = std::max(width, height); size > 1; size /= 2) ++levels;
+    return levels;
+}
+static std::size_t image_mip_bytes(int width, int height) {
+    if (width <= 0 || height <= 0) return 0;
+    std::size_t pixels = 0;
+    do {
+        pixels += std::size_t(width) * height;
+        if (width == 1 && height == 1) break;
+        width = std::max(1, width / 2); height = std::max(1, height / 2);
+    } while (true);
+    return pixels * sizeof(float) * 4;
+}
+
 void VulkanRenderer::sync_images(std::span<const ImageObject> images) {
 	if (!valid()) {
 		throw std::runtime_error("renderer is not initialized");
@@ -1015,7 +1038,7 @@ void VulkanRenderer::sync_images(std::span<const ImageObject> images) {
     std::size_t requiredBytes=0,requiredCount=0,residentBytes=0;
     for(auto& resource:impl_->images){residentBytes+=resource.bytes;if(wanted(resource.id))resource.lastUsed=impl_->imageTick;}
     for(const auto& image:images)if(wanted(image.id) && image.decoded && !find_gpu_image(impl_->images,image.id)) {
-        requiredBytes+=std::size_t(std::max(0,image.decoded->width))*std::size_t(std::max(0,image.decoded->height))*sizeof(float)*4;++requiredCount;
+        requiredBytes+=image_mip_bytes(image.decoded->width,image.decoded->height);++requiredCount;
     }
     constexpr std::size_t cacheBudget=512ull*1024*1024;
     while((residentBytes+requiredBytes>cacheBudget || impl_->images.size()+requiredCount>32) && !impl_->images.empty()) {
@@ -1068,10 +1091,16 @@ void VulkanRenderer::sync_images(std::span<const ImageObject> images) {
 		GpuImageResource resource;
         if(existing)resource=*existing;
 		resource.id = imageObject.id;
-		resource.previewRevision=imageObject.previewRevision;resource.source=imageObject.decoded;resource.lastUsed=impl_->imageTick;resource.bytes=pixels*4*sizeof(float);
+		resource.previewRevision=imageObject.previewRevision;resource.source=imageObject.decoded;resource.lastUsed=impl_->imageTick;resource.bytes=image_mip_bytes(raw.width,raw.height);
+        resource.mipLevels=image_mip_levels(raw.width,raw.height);
 		resource.width = raw.width;
 		resource.height = raw.height;
         if(!existing){
+        VkFormatProperties formatProperties{};
+        vkGetPhysicalDeviceFormatProperties(impl_->physicalDevice,VK_FORMAT_R32G32B32A32_SFLOAT,&formatProperties);
+        const auto mipFeatures=VK_FORMAT_FEATURE_BLIT_SRC_BIT|VK_FORMAT_FEATURE_BLIT_DST_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+        if((formatProperties.optimalTilingFeatures&mipFeatures)!=mipFeatures)
+            throw std::runtime_error("FP32 linear image mipmapping is not supported by this Vulkan device");
 		create_image(
 			impl_->device,
 			impl_->physicalDevice,
@@ -1080,7 +1109,8 @@ void VulkanRenderer::sync_images(std::span<const ImageObject> images) {
 			VK_FORMAT_R32G32B32A32_SFLOAT,
 			VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
 			resource.image,
-			resource.memory
+			resource.memory,
+            resource.mipLevels
 		);
 
 		VkImageViewCreateInfo viewInfo{};
@@ -1090,20 +1120,22 @@ void VulkanRenderer::sync_images(std::span<const ImageObject> images) {
 		viewInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
 		viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 		viewInfo.subresourceRange.baseMipLevel = 0;
-		viewInfo.subresourceRange.levelCount = 1;
+		viewInfo.subresourceRange.levelCount = resource.mipLevels;
 		viewInfo.subresourceRange.baseArrayLayer = 0;
 		viewInfo.subresourceRange.layerCount = 1;
 		vk_checked(vkCreateImageView(impl_->device, &viewInfo, nullptr, &resource.view), "vkCreateImageView");
+        viewInfo.subresourceRange.levelCount = 1;
+        vk_checked(vkCreateImageView(impl_->device, &viewInfo, nullptr, &resource.storageView), "create base-level storage view");
 
 		VkSamplerCreateInfo samplerInfo{};
 		samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
 		samplerInfo.magFilter = VK_FILTER_NEAREST;
-		samplerInfo.minFilter = VK_FILTER_NEAREST;
-		samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+		samplerInfo.minFilter = VK_FILTER_LINEAR;
+		samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
 		samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
 		samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
 		samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-		samplerInfo.maxLod = 0.0f;
+		samplerInfo.maxLod = float(resource.mipLevels - 1);
 		vk_checked(vkCreateSampler(impl_->device, &samplerInfo, nullptr, &resource.sampler), "vkCreateSampler");
 
 		VkDescriptorSetAllocateInfo descriptorInfo{};
@@ -1135,7 +1167,7 @@ void VulkanRenderer::sync_images(std::span<const ImageObject> images) {
         descriptorInfo.pSetLayouts=&impl_->linearizeSetLayout;
         vk_checked(vkAllocateDescriptorSets(impl_->device,&descriptorInfo,&convertSet),"allocate conversion descriptors");
         VkDescriptorBufferInfo sourceBuffer{impl_->linearSource,0,uploadSize};
-        VkDescriptorImageInfo destination{VK_NULL_HANDLE,resource.view,VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo destination{VK_NULL_HANDLE,resource.storageView,VK_IMAGE_LAYOUT_GENERAL};
         VkDescriptorBufferInfo statusBuffer{impl_->linearStatus,0,4};
         *impl_->linearInvalid=0;
         VkWriteDescriptorSet conversionWrites[3]{};
@@ -1175,16 +1207,32 @@ void VulkanRenderer::sync_images(std::span<const ImageObject> images) {
             copy.imageExtent={uint32_t(raw.width),uint32_t(raw.height),1};
             vkCmdCopyBufferToImage(impl_->commandBuffer,impl_->linearSource,resource.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&copy);
         }
-		image_barrier(
-			impl_->commandBuffer,
-			resource.image,
-			gpuConversion?VK_IMAGE_LAYOUT_GENERAL:VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-			VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-			gpuConversion?VK_ACCESS_SHADER_WRITE_BIT:VK_ACCESS_TRANSFER_WRITE_BIT,
-			VK_ACCESS_SHADER_READ_BIT,
-			gpuConversion?VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT:VK_PIPELINE_STAGE_TRANSFER_BIT,
-			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
-		);
+        // Build the pyramid from linear BT.2020 samples. Only lower levels are
+        // filtered; level zero remains the original full-precision conversion.
+        image_barrier(impl_->commandBuffer,resource.image,
+            gpuConversion?VK_IMAGE_LAYOUT_GENERAL:VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            gpuConversion?VK_ACCESS_SHADER_WRITE_BIT:VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_TRANSFER_READ_BIT,
+            gpuConversion?VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT:VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT);
+        int mipWidth=raw.width,mipHeight=raw.height;
+        for(uint32_t level=1;level<resource.mipLevels;++level){
+            const int nextWidth=std::max(1,mipWidth/2),nextHeight=std::max(1,mipHeight/2);
+            image_barrier(impl_->commandBuffer,resource.image,VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                0,VK_ACCESS_TRANSFER_WRITE_BIT,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,level);
+            VkImageBlit blit{};
+            blit.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,level-1,0,1};
+            blit.srcOffsets[1]={mipWidth,mipHeight,1};
+            blit.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,level,0,1};
+            blit.dstOffsets[1]={nextWidth,nextHeight,1};
+            vkCmdBlitImage(impl_->commandBuffer,resource.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                resource.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&blit,VK_FILTER_LINEAR);
+            image_barrier(impl_->commandBuffer,resource.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_TRANSFER_READ_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,level);
+            mipWidth=nextWidth;mipHeight=nextHeight;
+        }
+        image_barrier(impl_->commandBuffer,resource.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,resource.mipLevels);
 		vk_checked(vkEndCommandBuffer(impl_->commandBuffer), "vkEndCommandBuffer");
 		VkSubmitInfo submitInfo{};
 		submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;

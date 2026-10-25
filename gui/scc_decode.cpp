@@ -191,6 +191,7 @@ std::shared_ptr<const RawImage> decode(const EncodedImage& encoded,const std::st
     const auto& sps=parsed->decode_frames_.front().parameters_->sps_;
     if(sps.vui_parameters_present_flag && sps.vui_params.parsed) {
         const auto& vui=sps.vui_params;
+        if(vui.aspect_ratio_info_present_flag && vui.par_n && vui.par_d) raw->pixelAspectRatio=PixelAspectRatio(vui.par_n,vui.par_d);
         if(vui.colour_description_present_flag) {raw->color.primaries=ColorPrimaries(vui.colour_primaries);raw->color.transfer=TransferCharacteristics(vui.transfer_characteristics);raw->color.matrix=MatrixCoefficients(vui.matrix_coefficients);}
         raw->color.range=vui.video_full_range_flag?ColorRange::Full:ColorRange::Limited;
         if(is420 && vui.chroma_loc_info_present_flag) raw->color.chroma420Location=Chroma420SampleLocation(vui.chroma_sample_loc_type_top_field);

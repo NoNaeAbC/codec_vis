@@ -356,6 +356,9 @@ EncodedImage encode_jpeg_like(const RawImage& image, std::span<const EncoderPara
 	cinfo.input_components = rgb.channels;
 	cinfo.in_color_space = rgb.channels == 1 ? JCS_GRAYSCALE : JCS_RGB;
 	jpeg_set_defaults(&cinfo);
+	cinfo.density_unit = 0;
+	cinfo.X_density = image.pixelAspectRatio.height;
+	cinfo.Y_density = image.pixelAspectRatio.width;
 	cinfo.data_precision = rgb.bitDepth;
 	jpeg_set_quality(&cinfo, std::clamp(quality, 1, 100), rgb.bitDepth == 8 ? TRUE : FALSE);
 	cinfo.optimize_coding = param_value<bool>(params, "optimize", true) ? TRUE : FALSE;
@@ -907,6 +910,7 @@ EncodedImage encode_png_still_image(const RawImage& image, std::span<const Encod
 	else if (filters == "avg") png_set_filter(png, PNG_FILTER_TYPE_BASE, PNG_FILTER_AVG);
 	else if (filters == "paeth") png_set_filter(png, PNG_FILTER_TYPE_BASE, PNG_FILTER_PAETH);
 	else png_set_filter(png, PNG_FILTER_TYPE_BASE, PNG_ALL_FILTERS);
+	png_set_pHYs(png, info, image.pixelAspectRatio.height, image.pixelAspectRatio.width, PNG_RESOLUTION_UNKNOWN);
 	png_set_IHDR(png, info, image.width, image.height, rgb.bitDepth, rgb.channels == 1 ? PNG_COLOR_TYPE_GRAY : PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
 #ifdef PNG_cICP_SUPPORTED
 	png_set_cICP(
@@ -1024,6 +1028,8 @@ EncodedImage encode_x264_intra_still_image(const RawImage& image, std::span<cons
 	if (x264_param_apply_profile(&p, profile.c_str()) < 0) {
 		throw std::invalid_argument("x264: invalid profile " + profile);
 	}
+	p.vui.i_sar_width = image.pixelAspectRatio.width;
+	p.vui.i_sar_height = image.pixelAspectRatio.height;
 	std::unique_ptr<x264_t, decltype(&x264_encoder_close)> const enc(x264_encoder_open(&p), x264_encoder_close);
 	if (!enc) throw std::runtime_error("x264_encoder_open failed");
 	x264_picture_t picIn{};

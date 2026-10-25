@@ -155,6 +155,20 @@ build/color-management-v1-protocol.c: $(COLOR_MANAGEMENT_XML) | build
 	wayland-scanner private-code $< $@
 build/color-management-v1-protocol.o: build/color-management-v1-protocol.c build/color-management-v1-client-protocol.h | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(GUI_CFLAGS) -Ibuild $(DEPFLAGS) -c -o $@ $<
+# Raw fonts and SPIR-V are objcopy objects in read-only ELF sections.
+OBJCOPY ?= objcopy
+UI_FONT ?= $(shell fc-match -f '%{file}' 'DejaVu Sans')
+MONO_FONT ?= $(shell fc-match -f '%{file}' 'DejaVu Sans Mono')
+EMBEDDED_FONTS := build/embedded_sans.o build/embedded_mono.o
+EMBEDDED_SHADERS := build/embedded_compose.o build/embedded_linearize.o
+EMBEDDED_ASSETS := $(EMBEDDED_FONTS) $(EMBEDDED_SHADERS)
+build/embedded_fonts.hpp $(EMBEDDED_FONTS) &: scripts/embed_assets.py $(UI_FONT) $(MONO_FONT) | build
+	python3 scripts/embed_assets.py --objcopy $(OBJCOPY) --target-machine '$(shell $(CXX) -dumpmachine)' --output build/embedded_fonts.hpp sans=$(UI_FONT) mono=$(MONO_FONT)
+build/embedded_shaders.hpp $(EMBEDDED_SHADERS) &: scripts/embed_assets.py build/compose.comp.spv build/linearize.comp.spv | build
+	python3 scripts/embed_assets.py --objcopy $(OBJCOPY) --target-machine '$(shell $(CXX) -dumpmachine)' --word-size 4 --output build/embedded_shaders.hpp compose=build/compose.comp.spv linearize=build/linearize.comp.spv
+build/gui_render_vulkan.o: build/embedded_shaders.hpp
+build/gui_text_shaper.o: build/embedded_fonts.hpp
+
 build/compose.comp.spv: gui/shaders/compose.comp | build
 	glslc -fshader-stage=comp $< -o $@
 
@@ -167,8 +181,10 @@ build/test_gui_model: gui/test_gui_model.cpp $(MODEL_SRCS) codec_gui_x265.hpp | 
 test_draw_list: build/test_draw_list
 	./build/test_draw_list
 
+build/test_draw_list: build/embedded_fonts.hpp $(EMBEDDED_FONTS)
+
 build/test_draw_list: gui/test_draw_list.cpp gui/draw_list.cpp gui/ui_widgets.cpp gui/text_atlas.cpp gui/text_shaper.cpp $(METRIC_OBJS) $(MODEL_SRCS) codec_gui_x265.hpp | build
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(CODEC_CFLAGS) $(GUI_CFLAGS) -o $@ gui/test_draw_list.cpp gui/draw_list.cpp gui/ui_widgets.cpp gui/text_atlas.cpp gui/text_shaper.cpp $(METRIC_OBJS) $(MODEL_SRCS) $(CODEC_LIBS) $(GUI_LIBS) $(LDFLAGS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(CODEC_CFLAGS) $(GUI_CFLAGS) -o $@ gui/test_draw_list.cpp gui/draw_list.cpp gui/ui_widgets.cpp gui/text_atlas.cpp gui/text_shaper.cpp $(METRIC_OBJS) $(MODEL_SRCS) $(CODEC_LIBS) $(EMBEDDED_FONTS) $(GUI_LIBS) $(LDFLAGS)
 
 test_ui_interaction: build/test_ui_interaction
 	./build/test_ui_interaction
@@ -197,14 +213,18 @@ build/test_platform_portal: gui/test_platform_portal.cpp gui/platform_portal.cpp
 test_text_shaper: build/test_text_shaper
 	./build/test_text_shaper
 
+build/test_text_shaper: build/embedded_fonts.hpp $(EMBEDDED_FONTS)
+
 build/test_text_shaper: gui/test_text_shaper.cpp gui/text_shaper.cpp gui/text_shaper.hpp | build
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(GUI_CFLAGS) -o $@ gui/test_text_shaper.cpp gui/text_shaper.cpp $(GUI_LIBS) $(LDFLAGS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(GUI_CFLAGS) -o $@ gui/test_text_shaper.cpp gui/text_shaper.cpp $(EMBEDDED_FONTS) $(GUI_LIBS) $(LDFLAGS)
 
 test_text_atlas: build/test_text_atlas
 	./build/test_text_atlas
 
+build/test_text_atlas: build/embedded_fonts.hpp $(EMBEDDED_FONTS)
+
 build/test_text_atlas: gui/test_text_atlas.cpp gui/text_atlas.cpp gui/text_shaper.cpp gui/text_atlas.hpp gui/text_shaper.hpp | build
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(GUI_CFLAGS) $(CODEC_CFLAGS) -o $@ gui/test_text_atlas.cpp gui/text_atlas.cpp gui/text_shaper.cpp $(GUI_LIBS) $(CODEC_LIBS) $(LDFLAGS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(GUI_CFLAGS) $(CODEC_CFLAGS) -o $@ gui/test_text_atlas.cpp gui/text_atlas.cpp gui/text_shaper.cpp $(EMBEDDED_FONTS) $(GUI_LIBS) $(CODEC_LIBS) $(LDFLAGS)
 
 test_encoder_backends: build/test_encoder_backends
 	./build/test_encoder_backends
@@ -342,7 +362,10 @@ build/gui_main.o: gui/main_gui.cpp gui/app_state.hpp gui/app_commands.hpp gui/dr
 codec_vis_cli: main.cpp build/codec_gui_image_io.o build/gui_raw_image_conversion.o build/gui_preview_decoders.o $(DAV2D_BRIDGE_OBJ) $(SCC_DECODE_OBJS) $(ROUNDTRIP_CODEC_OBJS) codec_gui_x265.hpp | build
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(CODEC_CFLAGS) -o $@ $(filter-out %.hpp %.mk,$^) $(CODEC_LIBS) $(LDFLAGS)
 
-codec_vis_gui: build/gui_workbench.o build/gui_ui_framework.o build/gui_energy_access.o build/gui_decoder_registry.o build/gui_decoder_runner.o $(METRIC_NATIVE_OBJS) build/gui_main.o build/gui_app_state.o build/gui_app_commands.o build/gui_platform_portal.o build/gui_encode_runner.o build/gui_metrics.o build/gui_image_ops.o build/gui_raw_image_conversion.o build/gui_viewer_model.o build/gui_layout.o build/gui_draw_list.o build/gui_ui_interaction.o build/gui_ui_widgets.o build/gui_wayland_window.o build/gui_render_vulkan.o build/gui_text_shaper.o build/gui_text_atlas.o $(WAYLAND_PROTOCOL_OBJS) build/codec_gui_image_io.o build/gui_encoder_backends.o build/gui_preview_decoders.o $(DAV2D_BRIDGE_OBJ) $(SCC_DECODE_OBJS) $(ROUNDTRIP_CODEC_OBJS) | codec_vis_energy_helper build/linearize.comp.spv build/compose.comp.spv
+build/gui_embedded_energy_helper.o: gui/energy_access_helper.cpp gui/energy_access_protocol.hpp gui/energy_counter.hpp | build
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -DCODEC_VIS_EMBED_ENERGY_HELPER $(DEPFLAGS) -c -o $@ $<
+
+codec_vis_gui: $(EMBEDDED_ASSETS) build/gui_embedded_energy_helper.o build/gui_workbench.o build/gui_ui_framework.o build/gui_energy_access.o build/gui_decoder_registry.o build/gui_decoder_runner.o $(METRIC_NATIVE_OBJS) build/gui_main.o build/gui_app_state.o build/gui_app_commands.o build/gui_platform_portal.o build/gui_encode_runner.o build/gui_metrics.o build/gui_image_ops.o build/gui_raw_image_conversion.o build/gui_viewer_model.o build/gui_layout.o build/gui_draw_list.o build/gui_ui_interaction.o build/gui_ui_widgets.o build/gui_wayland_window.o build/gui_render_vulkan.o build/gui_text_shaper.o build/gui_text_atlas.o $(WAYLAND_PROTOCOL_OBJS) build/codec_gui_image_io.o build/gui_encoder_backends.o build/gui_preview_decoders.o $(DAV2D_BRIDGE_OBJ) $(SCC_DECODE_OBJS) $(ROUNDTRIP_CODEC_OBJS) | build/linearize.comp.spv build/compose.comp.spv
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(CODEC_CFLAGS) -o $@ $(filter-out %.mk,$^) $(CODEC_LIBS) $(GUI_LIBS) $(LDFLAGS)
 
 portable-bundle: codec_vis_cli codec_vis_gui
@@ -430,7 +453,7 @@ build/gui_ui_framework.o: gui/ui_framework.cpp gui/ui_framework.hpp gui/ui_geome
 build/test_ui_framework: gui/test_ui_framework.cpp gui/ui_framework.hpp gui/ui_render_frame.hpp gui/paint_scene.hpp build/gui_ui_framework.o | build
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ $(filter-out %.hpp,$^) $(LDFLAGS)
 
-build/gui_framework_lab: gui/framework_lab.cpp build/gui_ui_framework.o build/gui_render_vulkan.o build/gui_wayland_window.o build/gui_text_shaper.o build/gui_text_atlas.o build/gui_raw_image_conversion.o $(WAYLAND_PROTOCOL_OBJS) | build/linearize.comp.spv build/compose.comp.spv
+build/gui_framework_lab: $(EMBEDDED_ASSETS) gui/framework_lab.cpp build/gui_ui_framework.o build/gui_render_vulkan.o build/gui_wayland_window.o build/gui_text_shaper.o build/gui_text_atlas.o build/gui_raw_image_conversion.o $(WAYLAND_PROTOCOL_OBJS) | build/linearize.comp.spv build/compose.comp.spv
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(CODEC_CFLAGS) $(GUI_CFLAGS) -o $@ $^ $(CODEC_LIBS) $(GUI_LIBS) $(LDFLAGS)
 
 
@@ -475,3 +498,11 @@ build/test_scc_workflow: gui/test_scc_workflow.cpp build/gui_decoder_registry.o 
 .PHONY: test_scc_workflow
 test_scc_workflow: build/test_scc_workflow
 	./build/test_scc_workflow
+
+.PHONY: test_anamorphic
+test: test_anamorphic
+test_anamorphic: build/test_anamorphic
+	./build/test_anamorphic
+
+build/test_anamorphic: gui/test_anamorphic.cpp build/codec_gui_image_io.o build/gui_encoder_backends.o build/gui_preview_decoders.o build/gui_raw_image_conversion.o $(DAV2D_BRIDGE_OBJ) $(SCC_DECODE_OBJS) $(ROUNDTRIP_CODEC_OBJS) | build
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(CODEC_CFLAGS) -o $@ $^ $(CODEC_LIBS) $(LDFLAGS)

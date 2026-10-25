@@ -33,7 +33,7 @@ Run without a filename to import an image through the GUI, or pass multiple file
 ./codec_vis_gui reference.avif candidate.vvic
 ```
 
-Keep the working directory at the repository root so the executable can find the shaders in `build/`.
+The executable embeds its shaders, UI fonts, and energy helper. You can rename it and run it from any working directory.
 
 If the installed AVM library needs TensorFlow Lite archives from its source build, configure the matching link dependencies before building:
 
@@ -50,7 +50,19 @@ python3 scripts/configure_avm_runtime.py /path/to/avm/build
 
 Scroll over an image to zoom and drag it to pan. `0` fits the image, `1` selects actual pixels, `F` toggles focus mode, and holding Space temporarily shows A. Drag unused window space to move the window.
 
+Zooming out uses trilinear mipmapping of the linear BT.2020 image. At 1:1 and when zooming in, the viewer fetches original level-zero texels with nearest-neighbor sampling. Mipmaps are rebuilt when a preview changes and count toward the GPU image cache budget.
+
 Bit depth, chroma subsampling, and color conversion are part of the experiment. **Compare prepared input / decoded** in Metrics shows the application’s prepared image alongside the decoded result. The Metrics panel describes each score's reference and computation.
+
+## Anamorphic images
+
+Enter a sample width:height ratio in **Pixel AR** in the top bar. Valid ratios apply immediately to the selected source and subsequent imports. For example, use `4:3` for `image.nef`. Use `auto` to read embedded metadata (the default), or `1:1` to force square pixels. Existing encoded results retain their original interpretation; encode again to produce output with the changed SAR.
+
+The viewer displays rectangular pixels without resampling the imported image. Fit, actual-pixel view, zoom, pan, and pixel inspection account for the ratio; the stored width, height, and sample planes remain intact. Source cards show the applied SAR. Ratios are reduced to relatively prime integers and must fit 16-bit signaling fields.
+
+SAR is written and read back for x264 H.264, x265/kvazaar HEVC, VVenC/uvg266 VVC, JPEG (JFIF density), and PNG (pHYs). Both VVC paths signal H.274 clause 7 Extended_SAR with the aspect-ratio-present and constant flags set and `aspect_ratio_idc = 255`. Other encoder paths show a warning before encoding and record the loss of aspect-ratio signaling in the result configuration. This warning describes the current encoder implementation, including formats whose metadata support has not yet been implemented here.
+
+Run `make test_anamorphic` to check bitstream signaling and re-import, including the five explicit VVC VUI fields.
 
 ## Input formats
 

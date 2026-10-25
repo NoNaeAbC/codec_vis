@@ -66,6 +66,7 @@ struct RgbImage {
 	std::vector<unsigned char> rgb;
 	ColorDescription color{.primaries=ColorPrimaries::BT709, .transfer=TransferCharacteristics::SRGB, .matrix=MatrixCoefficients::Identity, .range=ColorRange::Full, .chroma420Location=std::nullopt};
 	std::optional<double> nominalPeakNits;
+	PixelAspectRatio pixelAspectRatio;
 };
 
 struct Rgb16Image {
@@ -74,9 +75,11 @@ struct Rgb16Image {
 	std::vector<unsigned short> rgb;
 	ColorDescription color{.primaries=ColorPrimaries::BT709, .transfer=TransferCharacteristics::SRGB, .matrix=MatrixCoefficients::Identity, .range=ColorRange::Full, .chroma420Location=std::nullopt};
 	std::optional<double> nominalPeakNits;
+	PixelAspectRatio pixelAspectRatio;
 };
 
 struct PngImage {
+	PixelAspectRatio pixelAspectRatio;
 	bool sixteenBit = false;
 	RgbImage rgb8;
 	Rgb16Image rgb16;
@@ -332,6 +335,8 @@ PngImage load_png_rgb(std::span<const unsigned char> bytes, double* codecSeconds
 	timer.measure([&] {png_read_info(png, info);});
 	const png_uint_32 width = png_get_image_width(png, info);
 	const png_uint_32 height = png_get_image_height(png, info);
+	png_uint_32 densityX = 0, densityY = 0; int densityUnit = 0;
+	png_get_pHYs(png, info, &densityX, &densityY, &densityUnit);
 	const int sourceBitDepth = png_get_bit_depth(png, info);
 	const int colorType = png_get_color_type(png, info);
 	if (width == 0 || height == 0 ||
@@ -380,6 +385,11 @@ PngImage load_png_rgb(std::span<const unsigned char> bytes, double* codecSeconds
 	std::free(allocations->rows);
 
 	PngImage image;
+	if (densityX && densityY) {
+        const auto divisor = std::gcd(densityX, densityY);
+        if (densityX/divisor <= 65535 && densityY/divisor <= 65535)
+            image.pixelAspectRatio = PixelAspectRatio(densityY/divisor, densityX/divisor);
+    }
 	if (colorMetadata.kind == PngColorKind::AssumedSrgb)
 		image.importNote = "No embedded color profile or PNG color description; assuming sRGB / BT.709, full-range RGB.";
 	else if (colorMetadata.kind == PngColorKind::Icc)
@@ -495,6 +505,7 @@ std::variant<RgbImage, Rgb16Image> load_jpeg_rgb(std::span<const unsigned char> 
 	if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
 		throw std::runtime_error("not a JPEG image");
 	}
+	const PixelAspectRatio jpegSar = cinfo.X_density && cinfo.Y_density ? PixelAspectRatio(cinfo.Y_density, cinfo.X_density) : PixelAspectRatio{};
 	std::vector<unsigned char> icc;
 	try {
 		icc = jpeg_icc_profile(cinfo);
@@ -515,6 +526,7 @@ std::variant<RgbImage, Rgb16Image> load_jpeg_rgb(std::span<const unsigned char> 
 	}
 
 	RgbImage image;
+	image.pixelAspectRatio = jpegSar;
 	image.width = static_cast<int>(cinfo.output_width);
 	image.height = static_cast<int>(cinfo.output_height);
 	image.rgb.resize(static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height) * 3);
@@ -534,6 +546,7 @@ std::variant<RgbImage, Rgb16Image> load_jpeg_rgb(std::span<const unsigned char> 
 		if (!sourceProfile) throw std::runtime_error("LittleCMS rejected the embedded JPEG ICC profile");
 		try {
 			Rgb16Image converted = convert_to_linear_bt2020(image.width, image.height, image.rgb.data(), TYPE_RGB_8, sourceProfile);
+			converted.pixelAspectRatio = image.pixelAspectRatio;
 			cmsCloseProfile(sourceProfile);
 			return converted;
 		} catch (...) {
@@ -831,6 +844,7 @@ RawImage rgb8_to_planar_source(const RgbImage& rgb) {
 	image.format = PixelFormat::RGBP8;
 	image.color = rgb.color;
 	image.nominalPeakNits = rgb.nominalPeakNits;
+	image.pixelAspectRatio = rgb.pixelAspectRatio;
 	for (ImagePlane& plane : image.planes) {
 		plane.strideBytes = image.width;
 		plane.bytes.resize(static_cast<std::size_t>(image.width) * image.height);
@@ -853,6 +867,7 @@ RawImage rgb16_to_planar_source(const Rgb16Image& rgb, int sourceBitDepth) {
 	image.format = sourceBitDepth == 14 ? PixelFormat::RGBP14LE : PixelFormat::RGBP16LE;
 	image.color = rgb.color;
 	image.nominalPeakNits = rgb.nominalPeakNits;
+	image.pixelAspectRatio = rgb.pixelAspectRatio;
 	for (ImagePlane& plane : image.planes) {
 		plane.strideBytes = image.width * 2;
 		plane.bytes.resize(static_cast<std::size_t>(image.width) * image.height * 2);
@@ -1100,6 +1115,7 @@ RawImage decode_input_image(std::span<const unsigned char> bytes, std::string_vi
 			? rgb16_to_planar_source(png.rgb16, 16)
 			: rgb8_to_planar_source(png.rgb8);
 		image.importNote = png.importNote;
+		image.pixelAspectRatio = png.pixelAspectRatio;
 		return retain(std::move(image));
 	}
 	if (format==Format::Jpeg) {

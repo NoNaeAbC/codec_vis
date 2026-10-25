@@ -1,0 +1,89 @@
+name: Linux single executable
+on:
+  push:
+    branches: [master, ci/single-executable]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a downloadable prerelease after validation
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: linux-executable-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: debian:unstable-slim
+    timeout-minutes: 180
+    steps:
+      - name: Bootstrap checkout tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install modern build tools and development libraries
+        run: bash packaging/ci/install-build-packages.sh
+      - name: Fingerprint toolchain and distribution libraries
+        id: toolchain
+        shell: bash
+        run: echo "key=$(dpkg-query -W | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - name: Cache pinned codec archives and real AVM runtime
+        id: deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            /opt/codec-vis
+            /opt/codec-vis-sources
+          key: linux-static-${{ steps.toolchain.outputs.key }}-${{ hashFiles('packaging/ci/dependencies.json', 'packaging/ci/build-dependencies.sh') }}
+      - name: Build pinned codec libraries
+        if: steps.deps.outputs.cache-hit != 'true'
+        run: bash packaging/ci/build-dependencies.sh
+      - name: Link and audit executable
+        run: bash packaging/ci/build-release.sh
+      - name: Test renamed executable outside the checkout
+        run: bash packaging/ci/test-release.sh
+      - name: Upload executable and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: codec_vis-linux-x86_64
+          path: dist/
+          if-no-files-found: ignore
+          compression-level: 0
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: codec_vis-linux-x86_64
+          path: dist
+      - name: Publish direct downloads
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BUILD_SHA: ${{ github.sha }}
+          TAG_REF: ${{ github.ref }}
+        shell: bash
+        run: |
+          if [[ "$TAG_REF" == refs/tags/v* ]]; then
+            tag=${TAG_REF#refs/tags/}
+            extra=()
+          else
+            tag="linux-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            extra=(--prerelease)
+          fi
+          gh release create "$tag" dist/codec_vis-linux-x86_64 dist/SHA256SUMS dist/build-info.txt \
+            --target "$BUILD_SHA" --title "Linux executable ($tag)" \
+            --notes 'Download codec_vis-linux-x86_64, make it executable, and run it from any directory. Software codecs, fonts, shaders, and the energy helper are built in. Modern Linux with Wayland, Vulkan and the matching GPU drivers is required; VA-API is optional for software encoding.' \
+            "${extra[@]}"

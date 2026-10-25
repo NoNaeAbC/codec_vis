@@ -17,6 +17,7 @@ source_package() {
   local dsc=("$download"/*.dsc)
   [[ ${#dsc[@]} == 1 ]]
   dpkg-source -x "${dsc[0]}" "$SOURCES/debian/$name"
+  printf "%s " "$name" >> "$SOURCES/debian/source-versions.txt"
   dpkg-parsechangelog -l "$SOURCES/debian/$name/debian/changelog" -SVersion >> "$SOURCES/debian/source-versions.txt"
 }
 cmake_static() {
@@ -50,7 +51,7 @@ meson_static xkbcommon -Denable-x11=false -Denable-wayland=false -Denable-docs=f
 source_package sdbus libsdbus-c++-dev
 cmake_static sdbus -DSDBUSCPP_BUILD_CODEGEN=OFF -DSDBUSCPP_BUILD_TESTS=OFF
 source_package de265 libde265-dev
-cmake_static de265 -DENABLE_DEC265=OFF -DENABLE_SHERLOCK265=OFF
+cmake_static de265 -DENABLE_DECODER=OFF -DENABLE_SHERLOCK265=OFF -DENABLE_SDL=OFF
 source_package dav1d libdav1d-dev
 meson_static dav1d -Denable_tests=false -Denable_tools=false
 source_package charls libcharls-dev
@@ -60,7 +61,9 @@ cmake_static highway -DHWY_ENABLE_TESTS=OFF -DHWY_ENABLE_EXAMPLES=OFF -DHWY_ENAB
 source_package jxl libjxl-dev
 cmake_static jxl -DJPEGXL_ENABLE_TOOLS=OFF -DJPEGXL_ENABLE_DOXYGEN=OFF \
   -DJPEGXL_ENABLE_MANPAGES=OFF -DJPEGXL_ENABLE_JPEGLI=OFF -DJPEGXL_FORCE_SYSTEM_BROTLI=ON \
-  -DJPEGXL_FORCE_SYSTEM_HWY=ON -DJPEGXL_ENABLE_BENCHMARK=OFF
+  -DJPEGXL_FORCE_SYSTEM_HWY=ON -DJPEGXL_ENABLE_BENCHMARK=OFF \
+  -DJPEGXL_ENABLE_SKCMS=OFF -DJPEGXL_FORCE_SYSTEM_LCMS2=ON -DJPEGXL_ENABLE_SJPEG=OFF \
+  -DJPEGXL_BUNDLE_LIBPNG=OFF -DJPEGXL_ENABLE_PLUGINS=OFF -DJPEGXL_ENABLE_VIEWERS=OFF
 source_package x264 libx264-dev
 (cd "$SOURCES/debian/x264"; ./configure --prefix="$PREFIX" --enable-static --disable-shared --disable-cli; make -j "$JOBS"; make install)
 source_package svt-av1 libsvtav1enc-dev

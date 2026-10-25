@@ -15,6 +15,8 @@ result = ['-Wl,--start-group']
 for flag in flags:
     if flag == '-lstdc++':
         continue  # The compiler supplies it via -static-libstdc++.
+    if flag == '-fopenmp':
+        flag = '-l:libgomp.a'
     if flag == '-latomic_asneeded':
         flag = '-latomic'
     if flag.startswith('-l') and not flag.startswith('-l:') and flag[2:] not in dynamic:

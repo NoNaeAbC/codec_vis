@@ -36,15 +36,23 @@ jobs:
         run: echo "key=$(dpkg-query -W | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - name: Cache pinned codec archives and real AVM runtime
         id: deps
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             /opt/codec-vis
             /opt/codec-vis-sources
-          key: linux-static-${{ steps.toolchain.outputs.key }}-${{ hashFiles('packaging/ci/dependencies.json', 'packaging/ci/build-dependencies.sh') }}
+          key: linux-static-${{ steps.toolchain.outputs.key }}-${{ hashFiles('packaging/ci/dependencies.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: linux-static-${{ steps.toolchain.outputs.key }}-${{ hashFiles('packaging/ci/dependencies.json') }}-
       - name: Build pinned codec libraries
-        if: steps.deps.outputs.cache-hit != 'true'
         run: bash packaging/ci/build-dependencies.sh
+      - name: Save incremental SDK, including partial builds
+        if: always() && steps.deps.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /opt/codec-vis
+            /opt/codec-vis-sources
+          key: ${{ steps.deps.outputs.cache-primary-key }}
       - name: Link and audit executable
         run: bash packaging/ci/build-release.sh
       - name: Test renamed executable outside the checkout

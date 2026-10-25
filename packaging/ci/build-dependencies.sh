@@ -23,17 +23,20 @@ cmake_install() {
   shift
   cmake -S "$SOURCES/$name" -B "$SOURCES/$name/build-ci" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib \
-    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DBUILD_SHARED_LIBS=OFF \
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=OFF \
     -DCMAKE_C_FLAGS_RELEASE='-O3 -DNDEBUG' -DCMAKE_CXX_FLAGS_RELEASE='-O3 -DNDEBUG' "$@"
   cmake --build "$SOURCES/$name/build-ci" -j "$JOBS"
   cmake --install "$SOURCES/$name/build-ci"
 }
 cmake_install vvenc -DVVENC_ENABLE_WERROR=OFF -DVVENC_ENABLE_LINK_TIME_OPT=OFF
 cmake_install vvdec -DVVDEC_ENABLE_WERROR=OFF -DVVDEC_ENABLE_LINK_TIME_OPT=OFF -DVVDEC_LIBRARY_ONLY=ON
-cmake_install uvg266 -DUVG_BUILD_SHARED=OFF -DUVG_BIT_DEPTH=10
+cmake_install uvg266 -DUVG_BUILD_SHARED=OFF -DUVG_BIT_DEPTH=10 -DUVG_BUILD_TESTS=OFF -DUVG_BUILD_EXECUTABLE=OFF
 cmake_install svt-jpeg-xs -DBUILD_APPS=OFF -DBUILD_TESTING=OFF
 cmake_install svt-vp9
-meson setup "$SOURCES/dav2d/build-ci" "$SOURCES/dav2d" --prefix="$PREFIX" --libdir=lib \
+bash packaging/ci/build-static-libraries.sh
+meson_mode=()
+[[ ! -f "$SOURCES/dav2d/build-ci/meson-private/coredata.dat" ]] || meson_mode=(--reconfigure)
+meson setup "${meson_mode[@]}" "$SOURCES/dav2d/build-ci" "$SOURCES/dav2d" --prefix="$PREFIX" --libdir=lib \
   --buildtype=release --default-library=static -Denable_tests=false -Denable_tools=false
 meson compile -C "$SOURCES/dav2d/build-ci" -j "$JOBS"
 meson install -C "$SOURCES/dav2d/build-ci"
@@ -42,8 +45,8 @@ meson install -C "$SOURCES/dav2d/build-ci"
 cmake -S "$SOURCES/avm" -B "$SOURCES/avm/build-ci" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib \
   -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DBUILD_SHARED_LIBS=OFF -DENABLE_TESTS=OFF \
-  -DENABLE_DOCS=OFF -DENABLE_TESTDATA=OFF -DENABLE_TOOLS=OFF
-cmake --build "$SOURCES/avm/build-ci" --target avmenc -j "$JOBS"
+  -DENABLE_DOCS=OFF -DENABLE_TESTDATA=OFF -DENABLE_TOOLS=OFF -DENABLE_EXAMPLES=OFF
+cmake --build "$SOURCES/avm/build-ci" -j "$JOBS"
 cmake --install "$SOURCES/avm/build-ci"
 python3 scripts/configure_avm_runtime.py "$SOURCES/avm/build-ci"
 # A deliberately small FFmpeg avoids pulling in every desktop audio/video stack

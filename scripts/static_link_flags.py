@@ -10,7 +10,7 @@ import sys
 
 packages = sys.argv[1:]
 flags = shlex.split(subprocess.check_output(['pkg-config', '--static', '--libs', *packages], text=True))
-dynamic = {'vulkan', 'va', 'va-drm', 'drm', 'wayland-client', 'systemd'}
+dynamic = {'vulkan', 'va', 'va-drm', 'drm'}
 result = ['-Wl,--start-group']
 for flag in flags:
     if flag == '-lstdc++':

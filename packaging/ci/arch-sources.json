@@ -1,0 +1,323 @@
+{
+  "brotli": {
+    "commit": "db24a98aed38a16de78cc05ca15cdd8dc2a0d92d",
+    "git": "https://github.com/google/brotli",
+    "package": "brotli",
+    "recipe_commit": "cf4771d3b49f2967e558ba7b9b2e77c649436340",
+    "version": "1.2.1-1"
+  },
+  "bzip2": {
+    "hash": "sha256:ab5a03176ee106d3f0fa90e381da478ddae405918153cca248e682cd0c4a2269",
+    "package": "bzip2",
+    "recipe_commit": "da697b2bf804ea350c9cfd0286bb4b78ee4df702",
+    "url": "https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz",
+    "version": "1.0.8-6"
+  },
+  "charls": {
+    "hash": "blake2b:a5601ae40c24fa0469957805f00613424f4efb036004f32f8555f92f8285c88c8dc147557248d31b91cf56ca58a27c2ac51764042f36c6e4db2de09848d5b7cd",
+    "package": "charls",
+    "recipe_commit": "23d8f373d2ddeebda6d8c83cd6a2e043220ce539",
+    "url": "https://github.com/team-charls/charls/archive/refs/tags/2.4.5.tar.gz",
+    "version": "2.4.5-1"
+  },
+  "dav1d": {
+    "hash": "sha512:75ab7c922bc9647d73534c9f6c95a514748557adbf7a4debf95eee52ef1db681012cbaad165a46141d904cdd01c1e6319cdea33d254afb5c6b3d968679e55b98",
+    "package": "dav1d",
+    "recipe_commit": "8ac0d527c3094dee7f27a8a68e8d76258f875a4d",
+    "url": "https://downloads.videolan.org/pub/videolan/dav1d/1.5.4/dav1d-1.5.4.tar.xz",
+    "version": "1.5.4-1"
+  },
+  "expat": {
+    "commit": "a76b1174c1ea52abb639a4c69d52b630a8a106a2",
+    "git": "https://github.com/libexpat/libexpat",
+    "package": "expat",
+    "recipe_commit": "dd89fa2ab694bf689f81fc8037d26a150a9514e8",
+    "version": "2.9.0-1"
+  },
+  "fontconfig": {
+    "commit": "0f236723a3c26bd9745e32ba2b3ee21e5f809295",
+    "git": "https://gitlab.freedesktop.org/fontconfig/fontconfig.git",
+    "package": "fontconfig",
+    "patches": [
+      {
+        "hash": "blake2b:7c94748ae8c7d548587fab457bfb4134376ba7fe57cba3a57b247f9cf72ee580e9b22ed3bafa31057fcbdade678beb9ae946f06290f39a82fdc283eef3419dd1",
+        "url": "https://gitlab.archlinux.org/archlinux/packaging/packages/fontconfig/-/raw/706dab9d404cc2286b8397fe1560de80d0e48463/0001-Remove-extra-Segoe-UI-fonts-from-system-ui.patch"
+      }
+    ],
+    "recipe_commit": "706dab9d404cc2286b8397fe1560de80d0e48463",
+    "version": "2:2.18.3-2"
+  },
+  "freetype2": {
+    "hash": "blake2b:b49bbcf6eae90159b8c3f315a8175d23a0c6a8f8574361aaff1b05d19984b31c000c1d637ba128e6f2f09d984d583f36cc7dd84e196152214f6fc8bed20e810d",
+    "package": "freetype2",
+    "patches": [
+      {
+        "hash": "blake2b:ae576f598fd98d2088e8b9f7a964c18a7395f48c687c5c47381accf65c49760de798f0956e22f3671b8bfc85fd0ed8dbeaf2c8ccab0c3e2f812b4c4451b18f01",
+        "url": "https://gitlab.archlinux.org/archlinux/packaging/packages/freetype2/-/raw/5971d6d2e6e7434aa193dee3e715c093b52b510e/0001-Enable-table-validation-modules.patch"
+      },
+      {
+        "hash": "blake2b:a09b1de5c8890aeff5d020194ffd1b23ca1fa7ea0d63f840fe600194fec78b837460e312db0503d3d76896d7ef25fdf8eb28a35a1c7e70ce60359ca802ac6672",
+        "url": "https://gitlab.archlinux.org/archlinux/packaging/packages/freetype2/-/raw/5971d6d2e6e7434aa193dee3e715c093b52b510e/0002-Enable-subpixel-rendering.patch"
+      },
+      {
+        "hash": "blake2b:45a3103bb0a26486b37926c253551c2840c2ea606ccb940aefbd0df8362a47d6d46ea343c20a38aa70b28f889e92625f84d7cee575cf6fa7e1302da5ba69890f",
+        "url": "https://gitlab.archlinux.org/archlinux/packaging/packages/freetype2/-/raw/5971d6d2e6e7434aa193dee3e715c093b52b510e/0003-Enable-long-PCF-family-names.patch"
+      }
+    ],
+    "recipe_commit": "5971d6d2e6e7434aa193dee3e715c093b52b510e",
+    "url": "https://download-mirror.savannah.gnu.org/releases/freetype/freetype-2.15.0.tar.xz",
+    "version": "2.15.0-1"
+  },
+  "gstreamer": {
+    "commit": "1b2a95a1b72787cda146b46df9605b168e5b683b",
+    "git": "https://gitlab.freedesktop.org/gstreamer/gstreamer.git",
+    "package": "gstreamer",
+    "patches": [
+      {
+        "hash": "blake2b:30f18e98863644c66ed39e54caaedb17a96e3294e5e260b01cd93c6373d120079af9bd92512b25b09f9228e880a2b032da4374a4a85062642dcaf070112408cd",
+        "url": "https://gitlab.archlinux.org/archlinux/packaging/packages/gstreamer/-/raw/8914c0e55e95579cc247b6cb712dcd50eeb4347f/0001-HACK-meson-Disable-broken-tests.patch"
+      },
+      {
+        "hash": "blake2b:4e425222d8fd1fc3c49750ad4920433e3b298698e96e714fb9d6f887ac62509f2b187a131fa31da53dcedd2a150ca59d3bd7d7519b7df91a0cff90c65094edbc",
+        "url": "https://gitlab.archlinux.org/archlinux/packaging/packages/gstreamer/-/raw/8914c0e55e95579cc247b6cb712dcd50eeb4347f/0002-faac-support-faac-2.0-faac_-API.patch"
+      }
+    ],
+    "recipe_commit": "8914c0e55e95579cc247b6cb712dcd50eeb4347f",
+    "version": "1.28.8-1"
+  },
+  "harfbuzz": {
+    "commit": "c7a7457b7385f33178e8cf87615ca077a810bbe7",
+    "git": "https://github.com/harfbuzz/harfbuzz",
+    "package": "harfbuzz",
+    "recipe_commit": "ace1e3f70d694634a499be56802bb498c8fac88f",
+    "version": "14.6.0-1"
+  },
+  "highway": {
+    "hash": "sha256:e72241ac9524bb653ae52ced768b508045d4438726a303f10181a38f764a453c",
+    "package": "highway",
+    "recipe_commit": "9adff36b0e076c3a868215618a426c63bf13995f",
+    "url": "https://github.com/google/highway/archive/1.4.0/highway-1.4.0.tar.gz",
+    "version": "1.4.0-1"
+  },
+  "jxrlib": {
+    "commit": "ddda911f389362fc33ba3babf223ce912f3cc909",
+    "git": "https://github.com/mircomir/jxrlib",
+    "package": "jxrlib",
+    "recipe_commit": "87eb5612e77b3d504b09c5ca70ac47edffaee39e",
+    "version": "1.4.4-3"
+  },
+  "kvazaar": {
+    "commit": "6040962bed5cc68c5ad01234c38c08b8b2822068",
+    "git": "https://github.com/ultravideo/kvazaar.git",
+    "package": "kvazaar",
+    "recipe_commit": "48870e93a940aec1653ab943cf181f0410abc114",
+    "version": "2.3.2-2"
+  },
+  "lcms2": {
+    "hash": "sha256:bfc54f7bab59fbc921012014a8032e4cba4abd46db47d46b76416a8c0b2815c8",
+    "package": "lcms2",
+    "recipe_commit": "4c1b2ecc48244412625c8efd1f809c339c8630f8",
+    "url": "https://github.com/mm2/Little-CMS/releases/download/lcms2.19.1/lcms2-2.19.1.tar.gz",
+    "version": "2.19.1-1"
+  },
+  "libcap": {
+    "commit": "a1fef85d27d0ee12729a64d1c9b2183c6007e56a",
+    "git": "https://git.kernel.org/pub/scm/libs/libcap/libcap.git",
+    "package": "libcap",
+    "patches": [
+      {
+        "hash": "sha512:4feb12bad6c0b37168f67f599155157e2537cb8cd35d906a758ba4405ec916f0504b9f52405a53d5c573232883034c740d0d65c756d9d9722029ef5bc9875fa7",
+        "url": "https://gitlab.archlinux.org/archlinux/packaging/packages/libcap/-/raw/1af5a8bd3ca74002d3422c1dfe0710d3f567502b/libcap-2.73-cgo-flags.patch"
+      }
+    ],
+    "recipe_commit": "1af5a8bd3ca74002d3422c1dfe0710d3f567502b",
+    "version": "2.78-1"
+  },
+  "libde265": {
+    "commit": "ba62bf4cfb3242f3bf0a45617ff09e35236e4d82",
+    "git": "https://github.com/strukturag/libde265",
+    "package": "libde265",
+    "recipe_commit": "c45bea146c65109648c141407674307a2c643c07",
+    "version": "1.1.3-1"
+  },
+  "libffi": {
+    "hash": "sha256:bf40d752d8f5fd4505bcd1c7d4208ea87fd12c91f087e359651c776748352dc0",
+    "package": "libffi",
+    "recipe_commit": "1aa204da4e1541bdcec3e80ae8f274fc01f0ab29",
+    "url": "https://github.com/libffi/libffi/archive/refs/tags/v3.8.0.tar.gz",
+    "version": "3.8.0-1"
+  },
+  "libheif": {
+    "commit": "f81f28ac014b1c28dee483ac45b72c6b05bc421a",
+    "git": "https://github.com/strukturag/libheif",
+    "package": "libheif",
+    "recipe_commit": "61d1de6eb2450359ef575d9d74e8031a5e41e181",
+    "version": "1.23.6-1"
+  },
+  "libjpeg-turbo": {
+    "hash": "sha512:13536db56c16e5364690ae2d31343a203e3b653c853c1f5314d36c8eb06700e92342737f1381f0171b3eb0223384c5fbcde91b55a46576952c4e75dc049cd045",
+    "package": "libjpeg-turbo",
+    "recipe_commit": "c26b61b4b450d9ff606d695a5ab4b0d96dcf7cc9",
+    "url": "https://github.com/libjpeg-turbo/libjpeg-turbo//releases/download/3.2.0/libjpeg-turbo-3.2.0.tar.gz",
+    "version": "3.2.0-2"
+  },
+  "libjxl": {
+    "commit": "a7a9c787341cf703dede03c2009fa460cae5e5df",
+    "git": "https://github.com/libjxl/libjxl.git",
+    "package": "libjxl",
+    "recipe_commit": "7b2ccad3c0b900f1189ccf7aca490700356302ec",
+    "version": "0.12.0-1"
+  },
+  "libpng": {
+    "commit": "cd952f49f95bb27154ae77dbb103032d95f6e580",
+    "git": "https://github.com/pnggroup/libpng.git",
+    "package": "libpng",
+    "recipe_commit": "015cbc9960e56b5aff5884bac8470ba3351dbd83",
+    "version": "1.6.59-1"
+  },
+  "libraw": {
+    "commit": "b93f6e45c194f5df9b02a43b1af9a54b4f41f33f",
+    "git": "https://github.com/LibRaw/LibRaw",
+    "package": "libraw",
+    "recipe_commit": "1f6026867d2099c3aea747ecfb1c5afa3c81be13",
+    "version": "0.22.2-1"
+  },
+  "libunwind": {
+    "hash": "blake2b:13ac888e72c080b9e2588024578740971f721497864c5f2eb930227cbc5bb040551db6280048b0b6f2dde193d5d1719f546088618ebd2e19f96524c2b767fda1",
+    "package": "libunwind",
+    "patches": [
+      {
+        "hash": "blake2b:756ced55c34a33d55cc11f61c32230de820aede55d562aa94143c2f5adb7f408ed2f2d5c48642b035ec4d3ebc59175e6f4b889f712db2556b80a8002d91aa036",
+        "url": "https://github.com/libunwind/libunwind/commit/b67d508a.patch"
+      }
+    ],
+    "recipe_commit": "08f489d8eb5cffac8b267f66a901c714e0d1b36d",
+    "url": "https://github.com/libunwind/libunwind/releases/download/v1.8.3/libunwind-1.8.3.tar.gz",
+    "version": "1.8.3-1"
+  },
+  "libvpx": {
+    "commit": "82615ff0733cd4063838c352bc2e2ab225f37ade",
+    "git": "https://chromium.googlesource.com/webm/libvpx",
+    "package": "libvpx",
+    "recipe_commit": "28be8494b11288186721bc0e0af4c54ff3af4afe",
+    "version": "1.17.0-1"
+  },
+  "libwebp": {
+    "hash": "sha256:e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564",
+    "package": "libwebp",
+    "patches": [
+      {
+        "hash": "sha256:72128445371887c81046ad19cdbd1688e6b180e6428aec579cac0df756c2af35",
+        "url": "https://gitlab.archlinux.org/archlinux/packaging/packages/libwebp/-/raw/c1ea3f970b0d15e39edb20d38fc651ddbf036b7f/0001-cmake-Install-anim-utils.patch"
+      }
+    ],
+    "recipe_commit": "c1ea3f970b0d15e39edb20d38fc651ddbf036b7f",
+    "url": "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0.tar.gz",
+    "version": "1.6.0-2"
+  },
+  "libxkbcommon": {
+    "commit": "d1442aaa6b635551182e83c3b55037f4c118c962",
+    "git": "https://github.com/xkbcommon/libxkbcommon",
+    "package": "libxkbcommon",
+    "recipe_commit": "292da933d36a1b42fb78f1e34f027b2e0c373bd5",
+    "version": "1.13.2-1"
+  },
+  "openjpeg2": {
+    "hash": "sha256:a695fbe19c0165f295a8531b1e4e855cd94d0875d2f88ec4b61080677e27188a",
+    "package": "openjpeg2",
+    "recipe_commit": "385b15d039a9a9659d30b9e3261943726222257e",
+    "url": "https://github.com/uclouvain/openjpeg/archive/v2.5.4.tar.gz",
+    "version": "2.5.4-1"
+  },
+  "sdbus-cpp": {
+    "hash": "sha256:3a289eded586c26d06c1387de72c7bf7c809527a70d51ba6401fe61059b19626",
+    "package": "sdbus-cpp",
+    "recipe_commit": "56b2b996a5604cfe2dff1604f047f437934d6b65",
+    "url": "https://github.com/Kistler-Group/sdbus-cpp/archive/v2.3.1/sdbus-cpp-2.3.1.tar.gz",
+    "version": "2.3.1-1"
+  },
+  "svt-av1": {
+    "commit": "9292ec8e32bce26f781f277ec8739b53426c4300",
+    "git": "https://gitlab.com/AOMediaCodec/SVT-AV1.git",
+    "package": "svt-av1",
+    "recipe_commit": "7e873464e6928f387ee08e289a2012bc97f5950f",
+    "version": "4.2.0-1"
+  },
+  "systemd": {
+    "commit": "73612ea502d53baf9b0df4336cfc296a7ee0d524",
+    "git": "https://github.com/systemd/systemd",
+    "package": "systemd-libs",
+    "patches": [
+      {
+        "hash": "sha512:ddb9401e47d0bf01874f255803a4b2167ec631484189d29d03694101fd9c77724e735f16d99c5f4ffd8061ae78839b2826ff0e0a925a6f0dbca25f2cfb271a82",
+        "url": "https://gitlab.archlinux.org/archlinux/packaging/packages/systemd/-/raw/83e49870f69d70cce91321b165a69ef788c869be/0001-Use-Arch-Linux-device-access-groups.patch"
+      }
+    ],
+    "recipe_commit": "83e49870f69d70cce91321b165a69ef788c869be",
+    "version": "262.1-1"
+  },
+  "wayland": {
+    "hash": "sha256:64176eaa46e4969903e286f8e5ef8331affc17fdf03ac9b58381d2b23162b7a3",
+    "package": "wayland",
+    "recipe_commit": "2be98971506ae32d9e5087dc8382a2a707df6005",
+    "url": "https://gitlab.freedesktop.org/wayland/wayland/-/releases/1.26.0/downloads/wayland-1.26.0.tar.xz",
+    "version": "1.26.0-1"
+  },
+  "x264": {
+    "commit": "b35605ace3ddf7c1a5d67a2eb553f034aef41d55",
+    "git": "https://code.videolan.org/videolan/x264.git",
+    "package": "x264",
+    "recipe_commit": "9376684b3d0ed6dfbfd56271ae09f3a02ede796a",
+    "version": "3:0.165.r3222.b35605a-2"
+  },
+  "x265": {
+    "commit": "e9b88125dc21393b3fd8d68e98083bdfb89778a8",
+    "git": "https://github.com/Multicorewareinc/x265.git",
+    "package": "x265",
+    "patches": [
+      {
+        "hash": "blake2b:af2ee0460c0c2f6f36e4f124a9ac16610e3884001262a6f08043fa1de4a85e2b5fd4fb12c64b8c94cfb59c3031bb7a1324e307fa2049e3378e2add9a58f5bd9e",
+        "url": "https://gitlab.archlinux.org/archlinux/packaging/packages/x265/-/raw/345d39bc9b5e66f7078109c7fc0daae3d2c66317/0001-Fix-build-with-GCC-15.patch"
+      }
+    ],
+    "recipe_commit": "345d39bc9b5e66f7078109c7fc0daae3d2c66317",
+    "version": "4.3-1"
+  },
+  "xz": {
+    "commit": "d3e650e63c110e830fd5391e7f8b45df0b91d3da",
+    "git": "https://github.com/tukaani-project/xz",
+    "package": "xz",
+    "recipe_commit": "0b7981c3f32e7b899aa1f887d8fd44622f76b1b3",
+    "version": "5.8.4-1"
+  },
+  "zlib": {
+    "hash": "sha512:cf3d49fbabddc57cca99858feeca8f910e9de42a16014cddd406814d2d24ee33fee2af3805d7efbb1b04b05f55818092b000daf82502b675df65f2512c353f73",
+    "package": "zlib",
+    "patches": [
+      {
+        "hash": "sha512:39a4ad7f473e4c170fb91a2e14860eaa6e728e9b710185bf9dbb23b949064fe7e51e36a15ec5ea110760ca8af15f8d2450e02e1a442af66516fe3e8b2debda0d",
+        "url": "https://github.com/madler/zlib/commit/36ff1be48ef696cc67b0855f7c8537ce0276210d.patch"
+      },
+      {
+        "hash": "sha512:a8cca9039ff9f09f92fa7fbcf5c6744615e8cd71a033784c0b996ee931af0dfa69f5b6efb67243693d418b9b3e1f7dadc178335bd407b72b0d72bdc4679da9ff",
+        "url": "https://github.com/madler/zlib/commit/df84af25dc1942490e1d1c899a07619152a46148.patch?full_index=1"
+      }
+    ],
+    "recipe_commit": "ed4883aa0e2df429b3ca5c3980846ae6d32df862",
+    "url": "https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.xz",
+    "version": "1:1.3.2-4"
+  },
+  "zstd": {
+    "hash": "sha256:5b331d961d6989dc21bb03397fc7a2a4d86bc65a14adc5ffbbce050354e30fd2",
+    "package": "zstd",
+    "patches": [
+      {
+        "hash": "sha256:7c07be222d45718b81fb16f97e611adfeb24efa0712ca77fb1e08f4c67803ec3",
+        "url": "https://github.com/facebook/zstd/commit/6af3842118ea5325480b403213b2a9fbed3d3d74.patch"
+      }
+    ],
+    "recipe_commit": "954700db664044388cabc818d703bcfae97bfa1c",
+    "url": "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.zst",
+    "version": "1.5.7-3"
+  }
+}

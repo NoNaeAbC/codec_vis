@@ -24,6 +24,7 @@ make -j "${JOBS:-2}" codec_vis_gui build/test_codec_roundtrips \
 install -m755 codec_vis_gui dist/codec_vis-linux-x86_64
 strip --strip-unneeded dist/codec_vis-linux-x86_64
 readelf -d dist/codec_vis-linux-x86_64 > dist/elf-dependencies.txt
+readelf --version-info dist/codec_vis-linux-x86_64 > dist/elf-symbol-versions.txt
 python3 - <<'PY'
 import re
 from pathlib import Path
@@ -39,7 +40,13 @@ PY
 {
   git rev-parse HEAD
   g++ --version
-  dpkg-query -W
+  pacman -Q
+  python3 - <<'PY'
+import re
+from pathlib import Path
+versions = set(re.findall(r'\bGLIBC_(\d+(?:\.\d+)+)\b', Path('dist/elf-symbol-versions.txt').read_text()))
+print('Required glibc symbol version:', max(versions, key=lambda v: tuple(map(int, v.split('.')))))
+PY
   for repo in "$SOURCES"/*; do
     if [[ -d "$repo/.git" ]]; then printf '%s ' "$(basename "$repo")"; git -C "$repo" rev-parse HEAD; fi
   done

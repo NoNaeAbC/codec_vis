@@ -13,7 +13,7 @@ flags = shlex.split(subprocess.check_output(['pkg-config', '--static', '--libs',
 dynamic = {'vulkan', 'va', 'va-drm', 'drm'}
 result = ['-Wl,--start-group']
 for flag in flags:
-    if flag == '-lstdc++':
+    if flag in {'-lstdc++', '-lgcc', '-lgcc_s'}:
         continue  # The compiler supplies it via -static-libstdc++.
     if flag == '-fopenmp':
         flag = '-l:libgomp.a'

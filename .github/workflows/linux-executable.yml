@@ -18,13 +18,15 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: debian:unstable-slim
+    container: archlinux@sha256:dfb01267da058e5d08ffdc543bf484c9b404655b0bac1d0201d972bf950cdfd0
+    env:
+      ARCH_SNAPSHOT: 2026/10/24
     timeout-minutes: 180
     steps:
       - name: Bootstrap checkout tools
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends git ca-certificates
+          printf 'Server = https://archive.archlinux.org/repos/%s/$repo/os/$arch\n' "$ARCH_SNAPSHOT" > /etc/pacman.d/mirrorlist
+          pacman -Syyu --noconfirm git ca-certificates
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
@@ -33,7 +35,7 @@ jobs:
       - name: Fingerprint toolchain and distribution libraries
         id: toolchain
         shell: bash
-        run: echo "key=$(dpkg-query -W | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+        run: echo "key=$(pacman -Q | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - name: Cache pinned codec archives and real AVM runtime
         id: deps
         uses: actions/cache/restore@v4
@@ -41,9 +43,9 @@ jobs:
           path: |
             /opt/codec-vis
             /opt/codec-vis-sources
-          key: linux-static-${{ steps.toolchain.outputs.key }}-${{ hashFiles('packaging/ci/dependencies.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: linux-static-${{ steps.toolchain.outputs.key }}-${{ hashFiles('packaging/ci/*sources.json', 'packaging/ci/dependencies.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            linux-static-${{ steps.toolchain.outputs.key }}-${{ hashFiles('packaging/ci/dependencies.json') }}-
+            linux-static-${{ steps.toolchain.outputs.key }}-${{ hashFiles('packaging/ci/*sources.json', 'packaging/ci/dependencies.json') }}-
             linux-static-${{ steps.toolchain.outputs.key }}-
       - name: Build pinned codec libraries
         run: bash packaging/ci/build-dependencies.sh

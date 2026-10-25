@@ -96,7 +96,7 @@ Some integration tests require compatible hardware and drivers. Individual test 
 
 ## Downloadable single executable
 
-The [Linux executable workflow](https://github.com/NoNaeAbC/codec_vis/actions/workflows/linux-executable.yml) builds on current Debian unstable with a C++26-capable compiler. It targets modern x86-64 Linux; there is no legacy distro build. Validated preview builds and tagged releases provide a direct `codec_vis-linux-x86_64` download on [Releases](https://github.com/NoNaeAbC/codec_vis/releases).
+The [Linux executable workflow](https://github.com/NoNaeAbC/codec_vis/actions/workflows/linux-executable.yml) builds in a digest-pinned Arch image using the regular-repository snapshot from 2026-10-24 and a C++26-capable compiler. It targets modern x86-64 Linux; there is no legacy distro build. Validated preview builds and tagged releases provide a direct `codec_vis-linux-x86_64` download on [Releases](https://github.com/NoNaeAbC/codec_vis/releases).
 
 Download that file, make it executable, and run it from any directory. No compiler, build tree, launcher, extraction step, sibling libraries, or external asset files are needed. Rename it freely. `--check-assets` verifies the embedded shaders and fonts without a display.
 
@@ -106,7 +106,7 @@ CI audits ELF dependencies and rejects a codec shared library or an RPATH/RUNPAT
 
 The [tested development versions](packaging/ci/tested-system-versions.txt) are the reference for dependency selection. In particular, CI uses FFmpeg 9.0.2 to match the tested system and pins the tested AVM revision. Local builds continue to discover installed dependencies through `pkg-config`; the CI manifest does not override them.
 
-To reproduce the CI build in a disposable modern Debian environment:
+To reproduce the CI build in a disposable Arch environment with the same pinned image and snapshot:
 
 ```sh
 bash packaging/ci/install-build-packages.sh

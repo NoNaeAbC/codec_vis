@@ -1,19 +1,28 @@
 #!/bin/bash
 set -euo pipefail
-export DEBIAN_FRONTEND=noninteractive
-sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources
-apt-get update
-apt-get install -y --no-install-recommends \
-  build-essential g++ cmake ninja-build meson pkg-config python3 git ca-certificates \
-  curl rustc cargo cargo-c bison flex nasm yasm autoconf automake libtool gettext patch patchelf file binutils \
-  libvulkan-dev libva-dev libdrm-dev libwayland-dev wayland-protocols \
-  libharfbuzz-dev libfreetype-dev libfontconfig-dev libxkbcommon-dev libsdbus-c++-dev \
-  libsystemd-dev libjpeg62-turbo-dev libraw-dev liblcms2-dev libde265-dev \
-  libdav1d-dev libcharls-dev libpng-dev libjxl-dev libopenjp2-7-dev libx264-dev \
-  libx265-dev libkvazaar-dev libwebp-dev libvpx-dev libsvtav1enc-dev librav1e-dev libjxr-dev \
-  libheif-dev libnuma-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libglib2.0-dev \
-  libssl-dev zlib1g-dev libbz2-dev liblzma-dev libzstd-dev liblz4-dev \
-  libbrotli-dev libexpat1-dev libffi-dev libpcre2-dev libcap-dev \
-  glslc fonts-dejavu-core weston mesa-vulkan-drivers gh
-# CI intentionally requires a modern C++26-capable toolchain.
+# Fixed regular-repository snapshot matching the tested development system.
+ARCH_SNAPSHOT=${ARCH_SNAPSHOT:-2026/10/24}
+printf 'Server = https://archive.archlinux.org/repos/%s/$repo/os/$arch\n' "$ARCH_SNAPSHOT" > /etc/pacman.d/mirrorlist
+pacman -Syyu --noconfirm --needed \
+  base-devel cmake ninja meson pkgconf python git ca-certificates curl \
+  rust cargo-c nasm yasm autoconf automake libtool gettext patchelf file binutils \
+  vulkan-headers vulkan-icd-loader libva libdrm wayland wayland-protocols \
+  harfbuzz freetype2 fontconfig libxkbcommon sdbus-cpp systemd \
+  libjpeg-turbo libraw lcms2 libde265 dav1d charls libpng libjxl openjpeg2 \
+  x264 x265 kvazaar libwebp libvpx svt-av1 rav1e jxrlib libheif numactl \
+  gstreamer gst-plugins-base-libs glib2 libunwind \
+  openssl zlib bzip2 xz zstd lz4 brotli expat libffi pcre2 libcap \
+  shaderc ttf-dejavu github-cli gperf python-jinja python-pyelftools texinfo
 printf 'int main() {}\n' | g++ -std=c++2c -x c++ -fsyntax-only -
+python3 - <<'PY'
+import json
+import subprocess
+expected = {'gcc': '16.2.1+r23+gd564253eb6c8-1', 'glibc': '2.44+r50+g1848099f063e-1'}
+for entry in json.load(open('packaging/ci/arch-sources.json')).values():
+    expected[entry['package']] = entry['version']
+for name, version in expected.items():
+    actual = subprocess.check_output(['pacman', '-Q', name], text=True).strip().split(' ', 1)[1]
+    if actual != version:
+        raise SystemExit(f'{name}: expected tested version {version}, found {actual}')
+print('Compiler, libc, and source-library package versions match the locked baseline')
+PY

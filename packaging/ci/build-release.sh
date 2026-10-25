@@ -28,14 +28,14 @@ python3 - <<'PY'
 import re
 from pathlib import Path
 text=Path('dist/elf-dependencies.txt').read_text()
-allowed={'libvulkan.so.1','libva.so.2','libva-drm.so.2','libdrm.so.2','libwayland-client.so.0','libsystemd.so.0',
+allowed={'libvulkan.so.1','libva.so.2','libva-drm.so.2','libdrm.so.2',
          'libc.so.6','libm.so.6','libdl.so.2','libpthread.so.0','librt.so.1','ld-linux-x86-64.so.2'}
 needed=set(re.findall(r'\(NEEDED\).*\[([^]]+)\]',text))
 if needed-allowed: raise SystemExit('Unexpected dynamic dependencies: '+', '.join(sorted(needed-allowed)))
 if 'RPATH' in text or 'RUNPATH' in text: raise SystemExit('Release must not contain an RPATH/RUNPATH')
 print('Dynamic dependency audit passed:',', '.join(sorted(needed)))
 PY
-sha256sum dist/codec_vis-linux-x86_64 > dist/SHA256SUMS
+(cd dist; sha256sum codec_vis-linux-x86_64 > SHA256SUMS)
 {
   git rev-parse HEAD
   g++ --version

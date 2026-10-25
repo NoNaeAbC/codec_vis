@@ -1,10 +1,10 @@
 {
-  "avm": ["https://github.com/AOMediaCodec/avm.git", "e0e3aa88112d9852cd18443c693148b73fb3fdf7"],
+  "avm": ["https://github.com/AOMediaCodec/avm.git", "6aaac43d42405a0ebc2b45eb96d4f5e8ec3443ef"],
   "vvenc": ["https://github.com/fraunhoferhhi/vvenc.git", "0e7508b811bbea3cd510956ddb3193f3a4c93684"],
   "vvdec": ["https://github.com/fraunhoferhhi/vvdec.git", "6f6bb29e375b6fdfd326ff1473e19c6ada7caaf0"],
   "uvg266": ["https://github.com/ultravideo/uvg266.git", "48dfc4932c6ba2ac741a07137b9ce2961cf95105"],
   "dav2d": ["https://code.videolan.org/videolan/dav2d.git", "f4fb14f868ac4197bb24ca0e428ada732c340d99"],
   "svt-jpeg-xs": ["https://github.com/OpenVisualCloud/SVT-JPEG-XS.git", "f4720203534d6f5ea90f828a58814af5597461d7"],
   "svt-vp9": ["https://github.com/OpenVisualCloud/SVT-VP9.git", "7917f95c3849768ab569ccc4a5adecb8854b65f6"],
-  "ffmpeg": ["https://github.com/FFmpeg/FFmpeg.git", "46f23be8b1976ed4c8ec85584daabcf0e57a7b9e"]
+  "ffmpeg": ["https://github.com/FFmpeg/FFmpeg.git", "n9.0.2"]
 }

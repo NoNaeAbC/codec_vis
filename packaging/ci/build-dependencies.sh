@@ -42,10 +42,18 @@ meson compile -C "$SOURCES/dav2d/build-ci" -j "$JOBS"
 meson install -C "$SOURCES/dav2d/build-ci"
 # Keep real AVM inference enabled. The release must never silently ship the
 # compatibility shims in place of TFLite. configure_avm_runtime verifies hashes.
-cmake -S "$SOURCES/avm" -B "$SOURCES/avm/build-ci" -G Ninja \
+avm_config=(cmake -S "$SOURCES/avm" -B "$SOURCES/avm/build-ci" -G Ninja
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib \
   -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DBUILD_SHARED_LIBS=OFF -DENABLE_TESTS=OFF \
-  -DENABLE_DOCS=OFF -DENABLE_TESTDATA=OFF -DENABLE_TOOLS=OFF -DENABLE_EXAMPLES=OFF
+  -DENABLE_DOCS=OFF -DENABLE_TESTDATA=OFF -DENABLE_TOOLS=OFF -DENABLE_EXAMPLES=OFF)
+# AVM re-extracts its bundled TFLite sources on each configure, invalidating
+# otherwise reusable objects. Reconfigure when the revision or options change.
+avm_signature=$({ git -C "$SOURCES/avm" rev-parse HEAD; printf '%s\n' "${avm_config[@]}"; } | sha256sum)
+avm_stamp="$SOURCES/avm/build-ci/codec-vis-config.txt"
+if [[ ! -f "$avm_stamp" ]] || [[ $(cat "$avm_stamp") != "$avm_signature" ]]; then
+  "${avm_config[@]}"
+  printf '%s\n' "$avm_signature" > "$avm_stamp"
+fi
 cmake --build "$SOURCES/avm/build-ci" -j "$JOBS"
 cmake --install "$SOURCES/avm/build-ci"
 python3 scripts/configure_avm_runtime.py "$SOURCES/avm/build-ci"

@@ -104,6 +104,8 @@ Software codecs and their runtimes are linked from static archives, including re
 
 CI audits ELF dependencies and rejects a codec shared library or an RPATH/RUNPATH. It tests the renamed executable outside the checkout with system fonts disabled, and runs real VVC/AV2 encode/decode round-trips. The build manifest records the compiler, distro packages, source revisions, and checksum. Dependency source builds are cached incrementally. The publishing job runs only after those checks pass.
 
+The [tested development versions](packaging/ci/tested-system-versions.txt) are the reference for dependency selection. In particular, CI uses FFmpeg 9.0.2 to match the tested system and pins the tested AVM revision. Local builds continue to discover installed dependencies through `pkg-config`; the CI manifest does not override them.
+
 To reproduce the CI build in a disposable modern Debian environment:
 
 ```sh

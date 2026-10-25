@@ -44,7 +44,7 @@ meson install -C "$SOURCES/dav2d/build-ci"
 # compatibility shims in place of TFLite. configure_avm_runtime verifies hashes.
 avm_config=(cmake -S "$SOURCES/avm" -B "$SOURCES/avm/build-ci" -G Ninja
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib \
-  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DBUILD_SHARED_LIBS=OFF -DENABLE_TESTS=OFF \
+  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=OFF -DENABLE_TESTS=OFF \
   -DENABLE_DOCS=OFF -DENABLE_TESTDATA=OFF -DENABLE_TOOLS=OFF -DENABLE_EXAMPLES=OFF)
 # AVM re-extracts its bundled TFLite sources on each configure, invalidating
 # otherwise reusable objects. Reconfigure when the revision or options change.

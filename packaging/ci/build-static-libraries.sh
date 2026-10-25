@@ -7,6 +7,8 @@ SOURCES=${CODEC_VIS_SOURCES:-/opt/codec-vis-sources}
 JOBS=${JOBS:-2}
 export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/lib/x86_64-linux-gnu/pkgconfig"
 export CMAKE_PREFIX_PATH="$PREFIX"
+export CFLAGS="${CFLAGS:--O2 -g0 -fPIC}"
+export CXXFLAGS="${CXXFLAGS:--O2 -g0 -fPIC}"
 mkdir -p "$SOURCES/arch" "$PREFIX/lib"
 source_package() {
   local name=$1 package=${2:-$1}
@@ -18,7 +20,7 @@ cmake_static() {
   local name=$1; shift
   cmake -S "$SOURCES/arch/$name" -B "$SOURCES/arch/$name/build-static" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib \
-    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF "$@"
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF "$@"
   cmake --build "$SOURCES/arch/$name/build-static" -j "$JOBS"
   cmake --install "$SOURCES/arch/$name/build-static"
 }
@@ -45,7 +47,7 @@ source_package xz
 autotools_static xz --disable-doc
 source_package zstd
 cmake -S "$SOURCES/arch/zstd/build/cmake" -B "$SOURCES/arch/zstd/build-static" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
   -DZSTD_BUILD_PROGRAMS=OFF -DZSTD_BUILD_SHARED=OFF -DZSTD_BUILD_TESTS=OFF
 cmake --build "$SOURCES/arch/zstd/build-static" -j "$JOBS"
 cmake --install "$SOURCES/arch/zstd/build-static"
@@ -53,7 +55,7 @@ source_package brotli
 cmake_static brotli -DBROTLI_DISABLE_TESTS=ON
 source_package expat
 cmake -S "$SOURCES/arch/expat/expat" -B "$SOURCES/arch/expat/build-static" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
   -DEXPAT_SHARED_LIBS=OFF -DEXPAT_BUILD_TOOLS=OFF -DEXPAT_BUILD_TESTS=OFF -DEXPAT_BUILD_DOCS=OFF
 cmake --build "$SOURCES/arch/expat/build-static" -j "$JOBS"
 cmake --install "$SOURCES/arch/expat/build-static"
@@ -80,8 +82,6 @@ source_package vpx libvpx
   --disable-examples --disable-tools --disable-docs --disable-unit-tests --enable-vp9-highbitdepth; make -j "$JOBS"; make install)
 source_package raw libraw
 autotools_static raw --disable-examples
-source_package libunwind
-autotools_static libunwind --disable-tests --disable-documentation
 source_package libcap
 make -C "$SOURCES/arch/libcap/libcap" -j "$JOBS" lib=lib
 make -C "$SOURCES/arch/libcap/libcap" prefix="$PREFIX" lib=lib install

@@ -72,16 +72,6 @@
     "commit": "1b2a95a1b72787cda146b46df9605b168e5b683b",
     "git": "https://gitlab.freedesktop.org/gstreamer/gstreamer.git",
     "package": "gstreamer",
-    "patches": [
-      {
-        "hash": "blake2b:30f18e98863644c66ed39e54caaedb17a96e3294e5e260b01cd93c6373d120079af9bd92512b25b09f9228e880a2b032da4374a4a85062642dcaf070112408cd",
-        "url": "https://gitlab.archlinux.org/archlinux/packaging/packages/gstreamer/-/raw/8914c0e55e95579cc247b6cb712dcd50eeb4347f/0001-HACK-meson-Disable-broken-tests.patch"
-      },
-      {
-        "hash": "blake2b:4e425222d8fd1fc3c49750ad4920433e3b298698e96e714fb9d6f887ac62509f2b187a131fa31da53dcedd2a150ca59d3bd7d7519b7df91a0cff90c65094edbc",
-        "url": "https://gitlab.archlinux.org/archlinux/packaging/packages/gstreamer/-/raw/8914c0e55e95579cc247b6cb712dcd50eeb4347f/0002-faac-support-faac-2.0-faac_-API.patch"
-      }
-    ],
     "recipe_commit": "8914c0e55e95579cc247b6cb712dcd50eeb4347f",
     "version": "1.28.8-1"
   },
@@ -124,12 +114,6 @@
     "commit": "a1fef85d27d0ee12729a64d1c9b2183c6007e56a",
     "git": "https://git.kernel.org/pub/scm/libs/libcap/libcap.git",
     "package": "libcap",
-    "patches": [
-      {
-        "hash": "sha512:4feb12bad6c0b37168f67f599155157e2537cb8cd35d906a758ba4405ec916f0504b9f52405a53d5c573232883034c740d0d65c756d9d9722029ef5bc9875fa7",
-        "url": "https://gitlab.archlinux.org/archlinux/packaging/packages/libcap/-/raw/1af5a8bd3ca74002d3422c1dfe0710d3f567502b/libcap-2.73-cgo-flags.patch"
-      }
-    ],
     "recipe_commit": "1af5a8bd3ca74002d3422c1dfe0710d3f567502b",
     "version": "2.78-1"
   },
@@ -182,19 +166,6 @@
     "recipe_commit": "1f6026867d2099c3aea747ecfb1c5afa3c81be13",
     "version": "0.22.2-1"
   },
-  "libunwind": {
-    "hash": "blake2b:13ac888e72c080b9e2588024578740971f721497864c5f2eb930227cbc5bb040551db6280048b0b6f2dde193d5d1719f546088618ebd2e19f96524c2b767fda1",
-    "package": "libunwind",
-    "patches": [
-      {
-        "hash": "blake2b:756ced55c34a33d55cc11f61c32230de820aede55d562aa94143c2f5adb7f408ed2f2d5c48642b035ec4d3ebc59175e6f4b889f712db2556b80a8002d91aa036",
-        "url": "https://github.com/libunwind/libunwind/commit/b67d508a.patch"
-      }
-    ],
-    "recipe_commit": "08f489d8eb5cffac8b267f66a901c714e0d1b36d",
-    "url": "https://github.com/libunwind/libunwind/releases/download/v1.8.3/libunwind-1.8.3.tar.gz",
-    "version": "1.8.3-1"
-  },
   "libvpx": {
     "commit": "82615ff0733cd4063838c352bc2e2ab225f37ade",
     "git": "https://chromium.googlesource.com/webm/libvpx",
@@ -205,12 +176,6 @@
   "libwebp": {
     "hash": "sha256:e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564",
     "package": "libwebp",
-    "patches": [
-      {
-        "hash": "sha256:72128445371887c81046ad19cdbd1688e6b180e6428aec579cac0df756c2af35",
-        "url": "https://gitlab.archlinux.org/archlinux/packaging/packages/libwebp/-/raw/c1ea3f970b0d15e39edb20d38fc651ddbf036b7f/0001-cmake-Install-anim-utils.patch"
-      }
-    ],
     "recipe_commit": "c1ea3f970b0d15e39edb20d38fc651ddbf036b7f",
     "url": "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0.tar.gz",
     "version": "1.6.0-2"
@@ -295,10 +260,6 @@
     "package": "zlib",
     "patches": [
       {
-        "hash": "sha512:39a4ad7f473e4c170fb91a2e14860eaa6e728e9b710185bf9dbb23b949064fe7e51e36a15ec5ea110760ca8af15f8d2450e02e1a442af66516fe3e8b2debda0d",
-        "url": "https://github.com/madler/zlib/commit/36ff1be48ef696cc67b0855f7c8537ce0276210d.patch"
-      },
-      {
         "hash": "sha512:a8cca9039ff9f09f92fa7fbcf5c6744615e8cd71a033784c0b996ee931af0dfa69f5b6efb67243693d418b9b3e1f7dadc178335bd407b72b0d72bdc4679da9ff",
         "url": "https://github.com/madler/zlib/commit/df84af25dc1942490e1d1c899a07619152a46148.patch?full_index=1"
       }
@@ -310,12 +271,6 @@
   "zstd": {
     "hash": "sha256:5b331d961d6989dc21bb03397fc7a2a4d86bc65a14adc5ffbbce050354e30fd2",
     "package": "zstd",
-    "patches": [
-      {
-        "hash": "sha256:7c07be222d45718b81fb16f97e611adfeb24efa0712ca77fb1e08f4c67803ec3",
-        "url": "https://github.com/facebook/zstd/commit/6af3842118ea5325480b403213b2a9fbed3d3d74.patch"
-      }
-    ],
     "recipe_commit": "954700db664044388cabc818d703bcfae97bfa1c",
     "url": "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.zst",
     "version": "1.5.7-3"

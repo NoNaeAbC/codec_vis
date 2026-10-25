@@ -94,7 +94,28 @@ make -j4 test
 
 Some integration tests require compatible hardware and drivers. Individual test targets are listed in the Makefile.
 
-## Portable bundle
+## Downloadable single executable
+
+The [Linux executable workflow](https://github.com/NoNaeAbC/codec_vis/actions/workflows/linux-executable.yml) builds on current Debian unstable with a C++26-capable compiler. It targets modern x86-64 Linux; there is no legacy distro build. Validated preview builds and tagged releases provide a direct `codec_vis-linux-x86_64` download on [Releases](https://github.com/NoNaeAbC/codec_vis/releases).
+
+Download that file, make it executable, and run it from any directory. No compiler, build tree, launcher, extraction step, sibling libraries, or external asset files are needed. Rename it freely. `--check-assets` verifies the embedded shaders and fonts without a display.
+
+Software codecs and their runtimes are linked from static archives, including real AVM/TFLite and VVdeC. Fonts and SPIR-V are embedded with `objcopy` in aligned, read-only ELF sections. Energy authorization dispatches to a helper mode in the same executable. Vulkan, VA-API, libdrm, glibc, and the matching GPU drivers come from the host. The GUI retains its requirement for color-management-v1 and FP16 pass-through presentation on Wayland. Polkit is optional for privileged energy measurements.
+
+CI audits ELF dependencies and rejects a codec shared library or an RPATH/RUNPATH. It tests the renamed executable outside the checkout with system fonts disabled, and runs real VVC/AV2 encode/decode round-trips. The build manifest records the compiler, distro packages, source revisions, and checksum. Dependency source builds are cached incrementally. The publishing job runs only after those checks pass.
+
+To reproduce the CI build in a disposable modern Debian environment:
+
+```sh
+bash packaging/ci/install-build-packages.sh
+bash packaging/ci/build-dependencies.sh
+bash packaging/ci/build-release.sh
+bash packaging/ci/test-release.sh
+```
+
+The install step modifies the build environment, so use a container rather than running it on your workstation. The resulting file is `dist/codec_vis-linux-x86_64`.
+
+## Directory bundle (development alternative)
 
 ```sh
 make portable-bundle

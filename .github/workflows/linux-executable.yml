@@ -66,7 +66,7 @@ jobs:
           if-no-files-found: ignore
           compression-level: 0
   publish:
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    if: github.ref == 'refs/heads/ci/single-executable' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
     needs: build
     runs-on: ubuntu-latest
     permissions:

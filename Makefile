@@ -166,7 +166,7 @@ build/embedded_fonts.hpp $(EMBEDDED_FONTS) &: scripts/embed_assets.py $(UI_FONT)
 	python3 scripts/embed_assets.py --objcopy $(OBJCOPY) --target-machine '$(shell $(CXX) -dumpmachine)' --output build/embedded_fonts.hpp sans=$(UI_FONT) mono=$(MONO_FONT)
 build/embedded_shaders.hpp $(EMBEDDED_SHADERS) &: scripts/embed_assets.py build/compose.comp.spv build/linearize.comp.spv | build
 	python3 scripts/embed_assets.py --objcopy $(OBJCOPY) --target-machine '$(shell $(CXX) -dumpmachine)' --word-size 4 --output build/embedded_shaders.hpp compose=build/compose.comp.spv linearize=build/linearize.comp.spv
-build/gui_render_vulkan.o: build/embedded_shaders.hpp
+build/gui_render_vulkan.o build/gui_main.o: build/embedded_shaders.hpp
 build/gui_text_shaper.o: build/embedded_fonts.hpp
 
 build/compose.comp.spv: gui/shaders/compose.comp | build

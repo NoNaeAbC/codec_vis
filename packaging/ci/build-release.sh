@@ -13,7 +13,7 @@ flags=$(cat build/static-link.flags)
 # Keep the literal make variable reference: Make imports the matching real
 # AVM/TFLite archives from build/avm-runtime.mk (never the inference shims).
 flags+=' $(AVM_TFLITE_LIBS)'
-make -j "${JOBS:-2}" codec_vis_gui \
+make -j "${JOBS:-2}" codec_vis_gui build/test_codec_roundtrips \
   CXXFLAGS='-std=c++2c -O2 -g0 -DNDEBUG -Wall -Wextra -Wpedantic' \
   LOCAL_RUNPATH= GUI_LIBS= CODEC_LIBS="$flags"
 install -m755 codec_vis_gui dist/codec_vis-linux-x86_64

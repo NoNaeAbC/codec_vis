@@ -50,7 +50,7 @@ meson_static xkbcommon -Denable-x11=false -Denable-wayland=false -Denable-docs=f
 source_package sdbus libsdbus-c++-dev
 cmake_static sdbus -DSDBUSCPP_BUILD_CODEGEN=OFF -DSDBUSCPP_BUILD_TESTS=OFF
 source_package de265 libde265-dev
-autotools_static de265 --disable-dec265 --disable-sherlock265
+cmake_static de265 -DENABLE_DEC265=OFF -DENABLE_SHERLOCK265=OFF
 source_package dav1d libdav1d-dev
 meson_static dav1d -Denable_tests=false -Denable_tools=false
 source_package charls libcharls-dev

@@ -16,6 +16,7 @@
 #include "viewer_model.hpp"
 
 #include "../codec_gui_image_io.hpp"
+#include "../build/embedded_shaders.hpp"
 
 #include <cstddef>
 #include <hb.h>
@@ -135,8 +136,18 @@ int main(int argc, char** argv) {
     // Dispatch before font initialization, Vulkan probing, or GUI setup.
     if (argc > 1 && std::string_view(argv[1]) == "--energy-helper")
         return codec_vis_energy_helper_main(argc - 1, argv + 1);
+    if (argc > 1 && std::string_view(argv[1]) == "--check-assets") {
+        for (const auto shader : {embedded::compose, embedded::linearize})
+            if (shader.size() < 5 || shader.front() != 0x07230203) return 1;
+        for (const auto font : {default_font_path(), default_monospace_font_path()}) {
+            const TextShaper shaper(font, 16);
+            if (shaper.shape("codec_vis AV2 VVC 0123456789").glyphs.empty()) return 1;
+        }
+        std::cout << "Embedded shaders and fonts verified\n";
+        return 0;
+    }
     if (argc > 1 && std::string_view(argv[1]) == "--help") {
-        std::cout << "codec_vis [--window-size W H] [--smoke-frames N] [--probe-image-pixels] [IMAGE ...]\n"
+        std::cout << "codec_vis [--window-size W H] [--smoke-frames N] [--probe-image-pixels] [--check-assets] [IMAGE ...]\n"
                      "Single executable: software codecs, fonts, shaders and energy helper are built in.\n";
         return 0;
     }
